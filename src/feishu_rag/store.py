@@ -6,7 +6,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Collection, Iterable
 
 from .models import Chunk, SearchResult
 
@@ -149,6 +149,34 @@ class IndexStore:
 
     def count_documents(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+
+    def prune_documents(self, prefix: str, retained: Collection[str]) -> int:
+        """删除指定 source_id 前缀下未保留的文档及其检索索引。"""
+        if re.fullmatch(r"feishu:[^:]+:", prefix) is None:
+            raise ValueError("prefix must identify one Feishu space")
+        if any(not source_id.startswith(prefix) for source_id in retained):
+            raise ValueError("all retained source_ids must start with prefix")
+
+        with self.connection:
+            source_rows = self.connection.execute(
+                "SELECT source_id FROM documents WHERE substr(source_id, 1, ?) = ?",
+                (len(prefix), prefix),
+            ).fetchall()
+            stale_ids = [row[0] for row in source_rows if row[0] not in retained]
+            if not stale_ids:
+                return 0
+
+            for source_id in stale_ids:
+                if self._fts_available:
+                    chunk_rows = self.connection.execute(
+                        "SELECT id FROM chunks WHERE source_id = ?", (source_id,)
+                    ).fetchall()
+                    self.connection.executemany(
+                        "DELETE FROM chunks_fts WHERE chunk_id = ?",
+                        ((row[0],) for row in chunk_rows),
+                    )
+                self.connection.execute("DELETE FROM documents WHERE source_id = ?", (source_id,))
+        return len(stale_ids)
 
     def document_checksum(self, source_id: str) -> str | None:
         row = self.connection.execute(
