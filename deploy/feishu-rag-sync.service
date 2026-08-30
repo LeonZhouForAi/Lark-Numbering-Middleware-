@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Feishu RAG knowledge index
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/data-assistant/feishu-rag
+ExecStart=/usr/bin/docker compose exec -T rag python -m feishu_rag.sync --space-id 7678686555778583752 --db /app/data/rag.sqlite3
+ExecStart=/usr/bin/docker compose exec -T rag python -m feishu_rag.sync --space-id 7678686754827685162 --db /app/data/rag.sqlite3
+ExecStart=/usr/bin/docker compose exec -T rag python -m feishu_rag.sync --space-id 7678687286343273653 --db /app/data/rag.sqlite3

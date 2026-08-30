@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh Feishu RAG knowledge index every hour
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+Unit=feishu-rag-sync.service
+
+[Install]
+WantedBy=timers.target

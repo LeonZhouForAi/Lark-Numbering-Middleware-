@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feishu-rag-bot"
+version = "0.1.0"
+description = "飞书机器人 + DeepSeek 的轻量 RAG 服务"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "lark-oapi>=1.4,<2",
+  "pypdf>=5,<7",
+  "pdf2image>=1.17,<2",
+  "pytesseract>=0.3.13,<1",
+  "Pillow>=10,<13",
+  "python-docx>=1.1,<2",
+  "python-dotenv>=1,<2",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9", "pytest-asyncio>=0.24,<1", "httpx>=0.27,<1"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
