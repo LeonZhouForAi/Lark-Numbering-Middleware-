@@ -32,7 +32,13 @@ RAGcode/
 │   ├── test_ingest.py
 │   ├── test_rag.py
 │   ├── test_webhook.py
-│   └── test_feishu_sync.py
+│   ├── test_feishu_sync.py
+│   ├── test_evaluation.py
+│   ├── test_evaluate_chunking.py
+│   ├── test_index_local_documents.py
+│   ├── test_llm_json.py
+│   ├── test_long_connection.py
+│   └── test_semantic_chunker.py
 ├── scripts/
 │   ├── index_local_documents.py
 │   ├── evaluate_chunking.py
@@ -52,7 +58,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -e ".[test]"
 cp .env.example .env
-python -m unittest discover -s tests -v
+python -m pytest -q
 ```
 
 ### 准备 DeepSeek
@@ -66,7 +72,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_CHUNK_MODEL=deepseek-v4-flash
 DEEPSEEK_CHUNK_BATCH_CHARS=12000
 RAG_SEMANTIC_CHUNKING=true
-RAG_CHUNK_STRATEGY_VERSION=hybrid-v3
+RAG_CHUNK_STRATEGY_VERSION=hybrid-v4
 ```
 
 DeepSeek 使用 OpenAI 兼容的 `/chat/completions` 接口，模型和价格以官方文档为准：
@@ -92,7 +98,9 @@ DeepSeek 使用 OpenAI 兼容的 `/chat/completions` 接口，模型和价格以
 python scripts/index_local_documents.py documents --db data/rag.sqlite3
 ```
 
-索引过程在服务器本地解析和 OCR，先按结构初切，再将文档正文按批次发送给 DeepSeek 做语义分组。模型只返回段落编号和检索元数据，程序用原文重组切片。重复运行同一个文件会按内容、模型和策略签名跳过，不会产生重复片段；模型失败时自动退回本地切片。
+索引过程在服务器本地解析和 OCR，先按结构初切，再将文档正文按批次发送给 DeepSeek 做语义分组。模型只返回段落编号和检索元数据，程序用原文重组切片。DOCX 会按文档顺序提取父页正文、表格和嵌套可见文本；混合 PDF 仅对没有原生文本的页面逐页 OCR。重复运行同一个文件会按内容、模型和策略签名跳过，不会产生重复片段；模型失败时自动退回本地切片。
+
+飞书同步只有在整个空间成功完成完整快照后，才会清理本次快照中已失效的索引；分页异常或同步失败不会触发删除。质量可用 `scripts/evaluate_chunking.py` 配合不含制度正文的金标 JSON/报告脱敏 CLI 验收（支持 `--cases`、`--retrieval-only` 和阈值参数）。v0.3.0 当前仅完成代码与测试，尚未部署到生产环境。
 
 ### 启动服务
 
@@ -155,7 +163,7 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 
 ## 验收清单
 
-- `python -m unittest discover -s tests -v` 全部通过。
+- `python -m pytest -q` 全部通过。
 - `/healthz` 返回 `{"status":"ok"}`。
 - 飞书 URL verification 返回 challenge。
 - 错误签名返回 HTTP 403。

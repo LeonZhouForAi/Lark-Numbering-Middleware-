@@ -7,7 +7,7 @@ from scripts import index_local_documents
 
 
 def test_chunk_strategy_version_defaults_when_missing():
-    assert index_local_documents._chunk_strategy_version({}) == "hybrid-v3"
+    assert index_local_documents._chunk_strategy_version({}) == "hybrid-v4"
 
 
 def test_chunk_strategy_version_trims_explicit_value():
@@ -31,7 +31,7 @@ def test_main_passes_chunk_strategy_version_to_index_directory():
     store = MagicMock()
     with (
         patch.object(sys, "argv", ["index_local_documents.py", "docs"]),
-        patch.dict(os.environ, {"RAG_CHUNK_STRATEGY_VERSION": "hybrid-v3"}),
+        patch.dict(os.environ, {"RAG_CHUNK_STRATEGY_VERSION": "hybrid-v4"}),
         patch.object(index_local_documents, "IndexStore", return_value=store),
         patch.object(index_local_documents, "index_directory", return_value=0) as index,
     ):
@@ -42,5 +42,5 @@ def test_main_passes_chunk_strategy_version_to_index_directory():
         store,
         max_chars=900,
         enable_ocr=True,
-        chunk_strategy_version="hybrid-v3",
+        chunk_strategy_version="hybrid-v4",
     )

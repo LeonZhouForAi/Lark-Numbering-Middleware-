@@ -13,7 +13,7 @@ from feishu_rag.store import IndexStore
 def _chunk_strategy_version(environ=os.environ) -> str:
     raw_value = environ.get("RAG_CHUNK_STRATEGY_VERSION")
     if raw_value is None:
-        return "hybrid-v3"
+        return "hybrid-v4"
     value = raw_value.strip()
     if not value:
         raise SystemExit("RAG_CHUNK_STRATEGY_VERSION 不能为空")
