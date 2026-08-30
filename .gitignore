@@ -11,3 +11,6 @@ documents/*
 *.log
 .gstack/
 .worktrees/
+handover-private/
+output/pdf/
+tmp/pdfs/
