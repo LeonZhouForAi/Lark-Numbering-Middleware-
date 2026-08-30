@@ -52,17 +52,7 @@ class DeepSeekClient:
     def __repr__(self) -> str:
         return f"DeepSeekClient(base_url={self.base_url!r}, model={self.model!r})"
 
-    def complete(self, system_prompt: str, user_prompt: str) -> str:
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "stream": False,
-            "temperature": 0.1,
-            "max_tokens": 1200,
-        }
+    def _chat_completion(self, payload: dict[str, Any]) -> str:
         status, raw = self._transport(
             f"{self.base_url}/chat/completions",
             {
@@ -88,3 +78,39 @@ class DeepSeekClient:
         if not isinstance(content, str) or not content.strip():
             raise DeepSeekError("DeepSeek 返回了空答案")
         return content.strip()
+
+    def complete(self, system_prompt: str, user_prompt: str) -> str:
+        return self._chat_completion(
+            {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "stream": False,
+                "temperature": 0.1,
+                "max_tokens": 1200,
+            }
+        )
+
+    def complete_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        content = self._chat_completion(
+            {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "stream": False,
+                "temperature": 0,
+                "max_tokens": 2000,
+                "response_format": {"type": "json_object"},
+            }
+        )
+        try:
+            result = json.loads(content)
+        except (TypeError, ValueError) as exc:
+            raise DeepSeekError("DeepSeek 返回了无法解析的 JSON") from exc
+        if not isinstance(result, dict):
+            raise DeepSeekError("DeepSeek JSON 输出必须是对象")
+        return result
