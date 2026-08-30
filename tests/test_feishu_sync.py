@@ -1,8 +1,13 @@
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from feishu_rag.logging_utils import configure_logging
+from feishu_rag.ingest import index_file
 from feishu_rag.store import IndexStore
 from feishu_rag.sync import sync_wiki_space
 
@@ -112,9 +117,81 @@ class FeishuSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
             try:
-                result = sync_wiki_space("space-1", client, store, semantic_planner=FailingPlanner())
+                with self.assertLogs("feishu_rag.sync", level="WARNING") as logs:
+                    result = sync_wiki_space("space-1", client, store, semantic_planner=FailingPlanner())
                 self.assertEqual(result.indexed, 1)
                 self.assertTrue(store.search("财务报销制度要求提交发票。"))
+                output = "\n".join(logs.output)
+                self.assertIn("semantic_chunk_fallback", output)
+                self.assertIn("feishu:space-1:node-1", output)
+                self.assertIn("RuntimeError", output)
+                self.assertNotIn(client.content, output)
+            finally:
+                store.close()
+
+    def test_configure_logging_uses_safe_default_for_unknown_level(self):
+        with patch("feishu_rag.logging_utils.logging.basicConfig") as basic_config:
+            configure_logging("not-a-level")
+
+        kwargs = basic_config.call_args.kwargs
+        self.assertEqual(kwargs["level"], "INFO")
+        self.assertIn("%(asctime)s", kwargs["format"])
+        self.assertIn("%(levelname)s", kwargs["format"])
+        self.assertIn("%(name)s", kwargs["format"])
+        self.assertIn("%(message)s", kwargs["format"])
+        self.assertTrue(kwargs["force"])
+
+    def test_configure_logging_applies_the_latest_level(self):
+        project_root = Path(__file__).resolve().parents[1]
+        environment = os.environ | {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(project_root / "src"),
+        }
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import logging; from feishu_rag.logging_utils import configure_logging; "
+                "configure_logging('INFO'); configure_logging('DEBUG'); "
+                "print(logging.getLogger().getEffectiveLevel())",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(result.stdout.strip(), "10")
+
+    def test_local_indexing_without_planner_does_not_log_semantic_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "policy.txt"
+            path.write_text("本地模式的正文", encoding="utf-8")
+            store = IndexStore(root / "rag.sqlite3")
+            try:
+                with self.assertNoLogs("feishu_rag.ingest", level="WARNING"):
+                    indexed = index_file(path, root, store)
+                self.assertTrue(indexed)
+            finally:
+                store.close()
+
+    def test_local_indexing_logs_redacted_fallback_for_failing_planner(self):
+        content = "不应写入日志的本地正文"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "policy.txt"
+            path.write_text(content, encoding="utf-8")
+            store = IndexStore(root / "rag.sqlite3")
+            try:
+                with self.assertLogs("feishu_rag.ingest", level="WARNING") as logs:
+                    indexed = index_file(path, root, store, semantic_planner=FailingPlanner())
+                self.assertTrue(indexed)
+                output = "\n".join(logs.output)
+                self.assertIn("semantic_chunk_fallback", output)
+                self.assertIn("policy.txt", output)
+                self.assertIn("RuntimeError", output)
+                self.assertNotIn(content, output)
             finally:
                 store.close()
 

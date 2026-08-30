@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from .chunker import chunk_text
+from .logging_utils import configure_logging
 from .store import IndexStore
 from .semantic_chunker import AtomicUnit, SemanticPlanner, semantic_chunks
+
+
+logger = logging.getLogger(__name__)
 
 
 class UnsupportedFileError(ValueError):
@@ -110,16 +116,8 @@ def index_file(
     if store.document_checksum(source_id) == checksum:
         return False
     overlap = max(0, min(120, max_chars // 5))
-    try:
-        if semantic_planner is None:
-            raise ValueError("semantic planner not configured")
-        units = []
-        for section in sections:
-            paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", section.text) if part.strip()]
-            for paragraph in paragraphs:
-                units.append(AtomicUnit(f"{source_id}:unit-{len(units)}", paragraph, section.page, section.section))
-        chunks = semantic_chunks(units, source_id, title, semantic_planner, max_chars)
-    except Exception:
+
+    def local_chunks() -> list:
         chunks = []
         for section in sections:
             chunks.extend(
@@ -133,6 +131,25 @@ def index_file(
                     section=section.section,
                 )
             )
+        return chunks
+
+    if semantic_planner is None:
+        chunks = local_chunks()
+    else:
+        try:
+            units = []
+            for section in sections:
+                paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", section.text) if part.strip()]
+                for paragraph in paragraphs:
+                    units.append(AtomicUnit(f"{source_id}:unit-{len(units)}", paragraph, section.page, section.section))
+            chunks = semantic_chunks(units, source_id, title, semantic_planner, max_chars)
+        except Exception as exc:
+            logger.warning(
+                "semantic_chunk_fallback source_id=%s error_type=%s",
+                source_id,
+                type(exc).__name__,
+            )
+            chunks = local_chunks()
     if not chunks:
         return False
     store.upsert_document(source_id, title, source_id, checksum, chunks)
@@ -176,6 +193,7 @@ def main() -> None:
     parser.add_argument("--max-chars", type=int, default=900)
     parser.add_argument("--no-ocr", action="store_true", help="禁用扫描 PDF OCR")
     args = parser.parse_args()
+    configure_logging(os.getenv("LOG_LEVEL", "INFO"))
     store = IndexStore(args.db)
     try:
         count = index_directory(args.root, store, max_chars=args.max_chars, enable_ocr=not args.no_ocr)

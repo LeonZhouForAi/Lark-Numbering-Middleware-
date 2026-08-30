@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import logging
 import re
 import tempfile
 from dataclasses import dataclass
@@ -16,9 +17,13 @@ from .feishu_client import FeishuClient
 from .chunker import chunk_text
 from .ingest import SUPPORTED_SUFFIXES, Section, extract_sections
 from .llm import DeepSeekClient
+from .logging_utils import configure_logging
 from .models import Chunk
 from .semantic_chunker import AtomicUnit, DeepSeekPlanner, SemanticPlanner, semantic_chunks
 from .store import IndexStore
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -156,7 +161,12 @@ def sync_wiki_space(
                         sections = extract_sections(downloaded)
                     try:
                         chunks = _hybrid_chunks(sections, source_id, title, max_chars, semantic_planner)
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning(
+                            "semantic_chunk_fallback source_id=%s error_type=%s",
+                            source_id,
+                            type(exc).__name__,
+                        )
                         chunks = _local_chunks(sections, source_id, title, max_chars)
                     if not chunks:
                         skipped += 1
@@ -182,7 +192,12 @@ def sync_wiki_space(
                 sections = [Section(text=text)]
                 try:
                     chunks = _hybrid_chunks(sections, source_id, title, max_chars, semantic_planner)
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "semantic_chunk_fallback source_id=%s error_type=%s",
+                        source_id,
+                        type(exc).__name__,
+                    )
                     chunks = _local_chunks(sections, source_id, title, max_chars)
                 if not chunks:
                     skipped += 1
@@ -204,6 +219,7 @@ def main() -> None:
     parser.add_argument("--max-chars", type=int, default=900)
     args = parser.parse_args()
     settings = Settings.from_env()
+    configure_logging(settings.log_level)
     space_id = args.space_id or settings.feishu_space_id
     if not space_id:
         raise SystemExit("请提供 --space-id 或设置 FEISHU_SPACE_ID")
@@ -224,6 +240,12 @@ def main() -> None:
             semantic_planner=semantic_planner,
             chunk_strategy_version=settings.rag_chunk_strategy_version,
             chunk_model=settings.deepseek_chunk_model if semantic_planner else "",
+        )
+        logger.info(
+            "sync_completed nodes_seen=%d indexed=%d skipped=%d",
+            result.nodes_seen,
+            result.indexed,
+            result.skipped,
         )
         print(f"nodes_seen={result.nodes_seen} indexed={result.indexed} skipped={result.skipped}")
     finally:
