@@ -8,12 +8,21 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any
 
+from .retry import RetryPolicy, run_with_retry
+
+
+_SQLITE_INT_MAX = 2**63 - 1
+
 
 class DeepSeekError(RuntimeError):
     """模型调用失败，错误信息不包含密钥。"""
 
 
 Transport = Callable[[str, dict[str, str], dict[str, Any], float], tuple[int, bytes]]
+
+
+class _DeepSeekNetworkError(RuntimeError):
+    pass
 
 
 def _urllib_transport(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: float) -> tuple[int, bytes]:
@@ -29,7 +38,7 @@ def _urllib_transport(url: str, headers: dict[str, str], payload: dict[str, Any]
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise DeepSeekError("无法连接 DeepSeek API，请检查服务器网络") from exc
+        raise _DeepSeekNetworkError from exc
 
 
 class DeepSeekClient:
@@ -40,6 +49,8 @@ class DeepSeekClient:
         model: str = "deepseek-v4-flash",
         transport: Transport | None = None,
         timeout: float = 30.0,
+        retry_policy: RetryPolicy | None = None,
+        usage_sink: Any | None = None,
     ):
         if not api_key.strip():
             raise DeepSeekError("缺少 DeepSeek API Key")
@@ -48,20 +59,73 @@ class DeepSeekClient:
         self.model = model
         self.timeout = timeout
         self._transport = transport or _urllib_transport
+        self.retry_policy = retry_policy or RetryPolicy()
+        self._usage_sink = usage_sink
 
     def __repr__(self) -> str:
         return f"DeepSeekClient(base_url={self.base_url!r}, model={self.model!r})"
 
-    def _chat_completion(self, payload: dict[str, Any]) -> str:
-        status, raw = self._transport(
-            f"{self.base_url}/chat/completions",
-            {
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            payload,
-            self.timeout,
+    @staticmethod
+    def _retryable_exception(exc: Exception) -> bool:
+        return isinstance(
+            exc,
+            (_DeepSeekNetworkError, urllib.error.URLError, TimeoutError, OSError),
         )
+
+    @staticmethod
+    def _token_count(value: Any) -> int:
+        return (
+            value
+            if type(value) is int and 0 <= value <= _SQLITE_INT_MAX
+            else 0
+        )
+
+    def _record_usage(self, data: dict[str, Any], purpose: str) -> None:
+        if self._usage_sink is None:
+            return
+        usage = data.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        prompt_tokens = self._token_count(usage.get("prompt_tokens"))
+        completion_tokens = self._token_count(usage.get("completion_tokens"))
+        total_value = usage.get("total_tokens")
+        total_tokens = (
+            self._token_count(total_value)
+            if total_value is not None
+            else min(prompt_tokens + completion_tokens, _SQLITE_INT_MAX)
+        )
+        recorder = getattr(self._usage_sink, "record_llm_usage", self._usage_sink)
+        recorder(
+            self.model,
+            purpose,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        )
+
+    def _chat_completion(self, payload: dict[str, Any], purpose: str) -> str:
+        def request() -> tuple[int, bytes]:
+            return self._transport(
+                f"{self.base_url}/chat/completions",
+                {
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                payload,
+                self.timeout,
+            )
+
+        try:
+            status, raw = run_with_retry(
+                request,
+                self.retry_policy,
+                retry_result=lambda result: result[0] == 429
+                or 500 <= result[0] < 600,
+                retry_exception=self._retryable_exception,
+            )
+        except Exception as exc:
+            if self._retryable_exception(exc):
+                raise DeepSeekError("无法连接 DeepSeek API，请检查服务器网络") from exc
+            raise
         if status == 401:
             raise DeepSeekError("DeepSeek API Key 无效或已过期")
         if status == 429:
@@ -72,6 +136,9 @@ class DeepSeekClient:
             raise DeepSeekError(f"DeepSeek API 请求失败（HTTP {status}）")
         try:
             data = json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise TypeError
+            self._record_usage(data, purpose)
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise DeepSeekError("DeepSeek 返回了无法解析的结果") from exc
@@ -79,7 +146,9 @@ class DeepSeekClient:
             raise DeepSeekError("DeepSeek 返回了空答案")
         return content.strip()
 
-    def complete(self, system_prompt: str, user_prompt: str) -> str:
+    def complete(
+        self, system_prompt: str, user_prompt: str, *, purpose: str = "answer"
+    ) -> str:
         return self._chat_completion(
             {
                 "model": self.model,
@@ -90,7 +159,8 @@ class DeepSeekClient:
                 "stream": False,
                 "temperature": 0.1,
                 "max_tokens": 1200,
-            }
+            },
+            purpose,
         )
 
     def complete_json(
@@ -112,7 +182,8 @@ class DeepSeekClient:
                 "max_tokens": 2000,
                 "thinking": {"type": "disabled"},
                 "response_format": {"type": "json_object"},
-            }
+            },
+            purpose,
         )
         try:
             result = json.loads(content)

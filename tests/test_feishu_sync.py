@@ -785,6 +785,8 @@ class FeishuSyncTests(unittest.TestCase):
             rag_enable_ocr=False,
             rag_chunk_strategy_version="local-v1",
             deepseek_chunk_model="",
+            api_retry_max_attempts=3,
+            api_retry_base_delay=0.5,
             log_level="INFO",
         )
         stdout = StringIO()

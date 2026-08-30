@@ -19,6 +19,7 @@ from .ingest import SUPPORTED_SUFFIXES, Section, extract_sections
 from .llm import DeepSeekClient
 from .logging_utils import configure_logging
 from .models import Chunk
+from .retry import RetryPolicy
 from .semantic_chunker import AtomicUnit, DeepSeekPlanner, SemanticPlanner, semantic_chunks
 from .store import IndexStore
 
@@ -285,12 +286,26 @@ def main() -> None:
     space_id = args.space_id or settings.feishu_space_id
     if not space_id:
         raise SystemExit("请提供 --space-id 或设置 FEISHU_SPACE_ID")
-    client = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
     store = IndexStore(args.db)
+    retry_policy = RetryPolicy(
+        max_attempts=settings.api_retry_max_attempts,
+        base_delay=settings.api_retry_base_delay,
+    )
+    client = FeishuClient(
+        settings.feishu_app_id,
+        settings.feishu_app_secret,
+        retry_policy=retry_policy,
+    )
     semantic_planner = None
     if settings.rag_semantic_chunking:
         semantic_planner = DeepSeekPlanner(
-            DeepSeekClient(settings.deepseek_api_key, settings.deepseek_base_url, settings.deepseek_chunk_model),
+            DeepSeekClient(
+                settings.deepseek_api_key,
+                settings.deepseek_base_url,
+                settings.deepseek_chunk_model,
+                retry_policy=retry_policy,
+                usage_sink=store,
+            ),
             batch_chars=settings.deepseek_chunk_batch_chars,
         )
     try:

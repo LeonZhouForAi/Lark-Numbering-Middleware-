@@ -12,6 +12,7 @@ from feishu_rag.config import Settings
 from feishu_rag.evaluation import _is_insufficient, evaluate_cases, load_cases
 from feishu_rag.llm import DeepSeekClient
 from feishu_rag.rag import RagService
+from feishu_rag.retry import RetryPolicy
 from feishu_rag.store import IndexStore
 
 
@@ -114,6 +115,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         settings.deepseek_api_key,
                         settings.deepseek_base_url,
                         settings.deepseek_model,
+                        retry_policy=RetryPolicy(
+                            max_attempts=settings.api_retry_max_attempts,
+                            base_delay=settings.api_retry_base_delay,
+                        ),
+                        usage_sink=store,
                     ),
                     top_k=settings.rag_top_k,
                     min_relevance=min_relevance,
@@ -140,6 +146,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     settings.deepseek_api_key,
                     settings.deepseek_base_url,
                     settings.deepseek_model,
+                    retry_policy=RetryPolicy(
+                        max_attempts=settings.api_retry_max_attempts,
+                        base_delay=settings.api_retry_base_delay,
+                    ),
+                    usage_sink=store,
                 ),
                 top_k=top_k,
                 min_relevance=min_relevance,

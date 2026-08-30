@@ -12,6 +12,7 @@ from .feishu_client import FeishuClient
 from .llm import DeepSeekClient
 from .logging_utils import configure_logging
 from .rag import RagService
+from .retry import RetryPolicy
 from .store import IndexStore
 from .web import handle_event
 
@@ -59,14 +60,28 @@ def run() -> None:
     settings = Settings.from_env()
     configure_logging(settings.log_level)
     store = IndexStore(settings.rag_db_path)
+    retry_policy = RetryPolicy(
+        max_attempts=settings.api_retry_max_attempts,
+        base_delay=settings.api_retry_base_delay,
+    )
     rag = RagService(
         store,
-        DeepSeekClient(settings.deepseek_api_key, settings.deepseek_base_url, settings.deepseek_model),
+        DeepSeekClient(
+            settings.deepseek_api_key,
+            settings.deepseek_base_url,
+            settings.deepseek_model,
+            retry_policy=retry_policy,
+            usage_sink=store,
+        ),
         top_k=settings.rag_top_k,
         min_relevance=settings.rag_min_relevance,
         question_max_chars=settings.rag_question_max_chars,
     )
-    feishu = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
+    feishu = FeishuClient(
+        settings.feishu_app_id,
+        settings.feishu_app_secret,
+        retry_policy=retry_policy,
+    )
 
     def on_message(data: Any) -> None:
         _safe_handle_raw_message(data, rag, feishu, lark.JSON.marshal)

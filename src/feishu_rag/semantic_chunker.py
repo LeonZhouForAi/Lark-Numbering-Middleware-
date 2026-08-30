@@ -131,5 +131,7 @@ class DeepSeekPlanner:
             "你是制度文档切片规划器。只能把输入段落按连续编号分组，不能改写正文。"
             "每个编号必须恰好出现一次。只返回 JSON 对象，字段为 groups；每组包含 unit_ids、title、keywords、summary。"
         )
-        result = self.llm.complete_json(system, f"输入段落：\n{payload}")
+        result = self.llm.complete_json(
+            system, f"输入段落：\n{payload}", purpose="chunking"
+        )
         return _validate_groups(result, units)

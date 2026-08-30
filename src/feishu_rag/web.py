@@ -8,9 +8,10 @@ import json
 from typing import Any
 
 from .config import ConfigError, Settings
-from .feishu_client import FeishuClient
+from .feishu_client import FeishuClient, FeishuReplyNotSentError
 from .llm import DeepSeekClient
 from .rag import RagService
+from .retry import RetryPolicy
 from .store import IndexStore
 
 try:
@@ -75,8 +76,13 @@ def handle_event(
         claimed = True
     try:
         answer = rag.answer(question)
-        feishu.reply_text(message_id, answer.text)
     except Exception:
+        if claimed and callable(release_message):
+            release_message(message_id)
+        raise
+    try:
+        feishu.reply_text(message_id, answer.text)
+    except FeishuReplyNotSentError:
         if claimed and callable(release_message):
             release_message(message_id)
         raise
@@ -96,7 +102,17 @@ def create_app(
         try:
             settings = settings or Settings.from_env()
             store = IndexStore(settings.rag_db_path)
-            llm = DeepSeekClient(settings.deepseek_api_key, settings.deepseek_base_url, settings.deepseek_model)
+            retry_policy = RetryPolicy(
+                max_attempts=settings.api_retry_max_attempts,
+                base_delay=settings.api_retry_base_delay,
+            )
+            llm = DeepSeekClient(
+                settings.deepseek_api_key,
+                settings.deepseek_base_url,
+                settings.deepseek_model,
+                retry_policy=retry_policy,
+                usage_sink=store,
+            )
             rag = rag or RagService(
                 store,
                 llm,
@@ -104,7 +120,11 @@ def create_app(
                 min_relevance=settings.rag_min_relevance,
                 question_max_chars=settings.rag_question_max_chars,
             )
-            feishu = feishu or FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
+            feishu = feishu or FeishuClient(
+                settings.feishu_app_id,
+                settings.feishu_app_secret,
+                retry_policy=retry_policy,
+            )
         except ConfigError as exc:
             configured_error = exc
     verification_token = settings.feishu_verification_token if settings else ""

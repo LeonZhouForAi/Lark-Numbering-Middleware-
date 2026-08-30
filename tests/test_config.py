@@ -86,6 +86,42 @@ class SettingsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, "RAG_QUESTION_MAX_CHARS"):
                     Settings.from_env()
 
+    def test_api_retry_defaults(self):
+        with patch.dict(os.environ, self._base_env(), clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.api_retry_max_attempts, 3)
+        self.assertEqual(settings.api_retry_base_delay, 0.5)
+
+    def test_api_retry_accepts_documented_bounds(self):
+        for attempts in ("1", "5"):
+            env = self._base_env()
+            env["API_RETRY_MAX_ATTEMPTS"] = attempts
+            env["API_RETRY_BASE_DELAY"] = "0"
+            with self.subTest(attempts=attempts), patch.dict(os.environ, env, clear=True):
+                settings = Settings.from_env()
+            self.assertEqual(settings.api_retry_max_attempts, int(attempts))
+            self.assertEqual(settings.api_retry_base_delay, 0.0)
+
+    def test_api_retry_rejects_invalid_values(self):
+        cases = [
+            ("0", "0.5"),
+            ("6", "0.5"),
+            ("1.5", "0.5"),
+            ("3", "-0.1"),
+            ("3", "nan"),
+            ("3", "inf"),
+            ("3", "not-a-number"),
+        ]
+        for attempts, delay in cases:
+            env = self._base_env()
+            env["API_RETRY_MAX_ATTEMPTS"] = attempts
+            env["API_RETRY_BASE_DELAY"] = delay
+            with self.subTest(attempts=attempts, delay=delay), patch.dict(
+                os.environ, env, clear=True
+            ):
+                with self.assertRaisesRegex(ConfigError, "API_RETRY"):
+                    Settings.from_env()
+
 
 if __name__ == "__main__":
     unittest.main()

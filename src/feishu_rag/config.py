@@ -50,6 +50,8 @@ class Settings:
     deepseek_chunk_model: str = "deepseek-v4-flash"
     deepseek_chunk_batch_chars: int = 12000
     rag_chunk_strategy_version: str = "hybrid-v4"
+    api_retry_max_attempts: int = 3
+    api_retry_base_delay: float = 0.5
     log_level: str = "INFO"
 
     @classmethod
@@ -72,6 +74,18 @@ class Settings:
                 "RAG_TOP_K、RAG_QUESTION_MAX_CHARS、RAG_MAX_CHARS 和 "
                 "DEEPSEEK_CHUNK_BATCH_CHARS 必须是整数"
             ) from exc
+        try:
+            retry_max_attempts = int(env.get("API_RETRY_MAX_ATTEMPTS", "3"))
+        except ValueError as exc:
+            raise ConfigError("API_RETRY_MAX_ATTEMPTS 必须是 1 到 5 的整数") from exc
+        if not 1 <= retry_max_attempts <= 5:
+            raise ConfigError("API_RETRY_MAX_ATTEMPTS 必须在 1 到 5 之间")
+        try:
+            retry_base_delay = float(env.get("API_RETRY_BASE_DELAY", "0.5"))
+        except ValueError as exc:
+            raise ConfigError("API_RETRY_BASE_DELAY 必须是有限非负数") from exc
+        if not math.isfinite(retry_base_delay) or retry_base_delay < 0:
+            raise ConfigError("API_RETRY_BASE_DELAY 必须是有限非负数")
         if question_max_chars < 1:
             raise ConfigError("RAG_QUESTION_MAX_CHARS 必须是正整数")
         if top_k < 1 or max_chars < 100:
@@ -108,6 +122,8 @@ class Settings:
             deepseek_chunk_model=env.get("DEEPSEEK_CHUNK_MODEL", "deepseek-v4-flash").strip(),
             deepseek_chunk_batch_chars=chunk_batch_chars,
             rag_chunk_strategy_version=strategy_version,
+            api_retry_max_attempts=retry_max_attempts,
+            api_retry_base_delay=retry_base_delay,
             log_level=env.get("LOG_LEVEL", "INFO").upper(),
         )
 
@@ -125,5 +141,7 @@ class Settings:
             f"rag_semantic_chunking={self.rag_semantic_chunking!r}, "
             f"deepseek_chunk_model={self.deepseek_chunk_model!r}, "
             f"rag_chunk_strategy_version={self.rag_chunk_strategy_version!r}, "
+            f"api_retry_max_attempts={self.api_retry_max_attempts!r}, "
+            f"api_retry_base_delay={self.api_retry_base_delay!r}, "
             f"log_level={self.log_level!r})"
         )

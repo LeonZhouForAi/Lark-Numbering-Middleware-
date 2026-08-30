@@ -8,6 +8,7 @@ import time
 import unicodedata
 from collections import Counter
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Collection, Iterable
 
 from .models import Chunk, RetrievalScope, SearchResult
@@ -27,6 +28,7 @@ _QUESTION_SHELLS = (
 )
 _GENERIC_TERMS = ("流程", "制度", "规定", "办法")
 _QUERY_STOP_WORDS = frozenset({"and", "or", "not", "near"})
+_SQLITE_INT_MAX = 2**63 - 1
 
 
 def _normalize(text: str) -> str:
@@ -108,6 +110,16 @@ class IndexStore:
             CREATE TABLE IF NOT EXISTS processed_messages (
                 message_id TEXT PRIMARY KEY,
                 processed_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS llm_usage_daily (
+                day TEXT NOT NULL,
+                model TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                requests INTEGER NOT NULL,
+                prompt_tokens INTEGER NOT NULL,
+                completion_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL,
+                PRIMARY KEY(day, model, purpose)
             );
             """
         )
@@ -334,6 +346,65 @@ class IndexStore:
 
     def count_documents(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+
+    def record_llm_usage(
+        self,
+        model: str,
+        purpose: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        *,
+        day: str | None = None,
+    ) -> None:
+        token_counts = (prompt_tokens, completion_tokens, total_tokens)
+        if any(
+            type(value) is not int or not 0 <= value <= _SQLITE_INT_MAX
+            for value in token_counts
+        ):
+            raise ValueError("token counts must fit a non-negative SQLite integer")
+        if not model or not purpose:
+            raise ValueError("model and purpose must not be empty")
+        usage_day = day or datetime.now(timezone.utc).date().isoformat()
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO llm_usage_daily("
+                "day,model,purpose,requests,prompt_tokens,completion_tokens,total_tokens"
+                ") VALUES(?,?,?,1,?,?,?) "
+                "ON CONFLICT(day,model,purpose) DO UPDATE SET "
+                "requests=CASE WHEN requests > 9223372036854775807-excluded.requests "
+                "THEN 9223372036854775807 ELSE requests+excluded.requests END,"
+                "prompt_tokens=CASE WHEN prompt_tokens > "
+                "9223372036854775807-excluded.prompt_tokens "
+                "THEN 9223372036854775807 ELSE prompt_tokens+excluded.prompt_tokens END,"
+                "completion_tokens=CASE WHEN completion_tokens > "
+                "9223372036854775807-excluded.completion_tokens "
+                "THEN 9223372036854775807 "
+                "ELSE completion_tokens+excluded.completion_tokens END,"
+                "total_tokens=CASE WHEN total_tokens > "
+                "9223372036854775807-excluded.total_tokens "
+                "THEN 9223372036854775807 ELSE total_tokens+excluded.total_tokens END",
+                (
+                    usage_day,
+                    model,
+                    purpose,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                ),
+            )
+
+    def query_llm_usage(self, *, day: str | None = None) -> list[dict[str, object]]:
+        sql = (
+            "SELECT day,model,purpose,requests,prompt_tokens,completion_tokens,total_tokens "
+            "FROM llm_usage_daily"
+        )
+        parameters: tuple[str, ...] = ()
+        if day is not None:
+            sql += " WHERE day = ?"
+            parameters = (day,)
+        sql += " ORDER BY day,model,purpose"
+        return [dict(row) for row in self.connection.execute(sql, parameters).fetchall()]
 
     def prune_documents(self, prefix: str, retained: Collection[str]) -> int:
         """删除指定 source_id 前缀下未保留的文档及其检索索引。"""

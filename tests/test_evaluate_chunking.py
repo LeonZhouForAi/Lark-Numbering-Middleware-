@@ -97,6 +97,8 @@ def test_non_retrieval_cli_passes_settings_min_relevance_everywhere(monkeypatch)
         rag_top_k=5,
         rag_min_relevance=0.73,
         rag_question_max_chars=321,
+        api_retry_max_attempts=3,
+        api_retry_base_delay=0.5,
     )
 
     class FakeSettings:
@@ -118,7 +120,7 @@ def test_non_retrieval_cli_passes_settings_min_relevance_everywhere(monkeypatch)
 
     monkeypatch.setattr(evaluation_script, "IndexStore", RecordingStore)
     monkeypatch.setattr(evaluation_script, "Settings", FakeSettings)
-    monkeypatch.setattr(evaluation_script, "DeepSeekClient", lambda *args: object())
+    monkeypatch.setattr(evaluation_script, "DeepSeekClient", lambda *args, **kwargs: object())
     monkeypatch.setattr(evaluation_script, "RagService", FakeRagService)
     monkeypatch.setattr(evaluation_script, "load_cases", lambda path: [])
     monkeypatch.setattr(evaluation_script, "evaluate_cases", fake_evaluate_cases)
@@ -136,6 +138,8 @@ def test_explicit_cli_min_relevance_overrides_settings_everywhere(monkeypatch) -
         rag_top_k=5,
         rag_min_relevance=0.73,
         rag_question_max_chars=321,
+        api_retry_max_attempts=3,
+        api_retry_base_delay=0.5,
     )
 
     class FakeSettings:
@@ -166,7 +170,7 @@ def test_explicit_cli_min_relevance_overrides_settings_everywhere(monkeypatch) -
 
     monkeypatch.setattr(evaluation_script, "IndexStore", RecordingStore)
     monkeypatch.setattr(evaluation_script, "Settings", FakeSettings)
-    monkeypatch.setattr(evaluation_script, "DeepSeekClient", lambda *args: object())
+    monkeypatch.setattr(evaluation_script, "DeepSeekClient", lambda *args, **kwargs: object())
     monkeypatch.setattr(evaluation_script, "RagService", FakeRagService)
     monkeypatch.setattr(evaluation_script, "load_cases", lambda path: [])
     monkeypatch.setattr(evaluation_script, "evaluate_cases", fake_evaluate_cases)
