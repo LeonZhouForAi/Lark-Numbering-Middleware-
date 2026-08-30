@@ -1,6 +1,6 @@
 # 飞书 + DeepSeek RAG 机器人
 
-这是一个部署在公司 Ubuntu 服务器上的轻量 RAG MVP：文档在本地切片和检索，DeepSeek 负责生成答案，飞书自建应用负责接收员工问题并回复。
+这是一个部署在公司 Ubuntu 服务器上的轻量 RAG 服务：文档先在本地解析，再由 DeepSeek 可选地优化语义切片，飞书自建应用负责接收员工问题并回复。
 
 ## 目录
 
@@ -21,6 +21,7 @@ RAGcode/
 │   ├── ingest.py
 │   ├── llm.py
 │   ├── rag.py
+│   ├── semantic_chunker.py
 │   ├── feishu_client.py
 │   ├── sync.py
 │   └── web.py
@@ -34,6 +35,7 @@ RAGcode/
 │   └── test_feishu_sync.py
 ├── scripts/
 │   ├── index_local_documents.py
+│   ├── evaluate_chunking.py
 │   └── smoke_test.py
 ├── data/                         # 运行时 SQLite，已加入 gitignore
 └── documents/                    # Ubuntu 上的待索引文档，已加入 gitignore
@@ -61,6 +63,10 @@ python -m unittest discover -s tests -v
 DEEPSEEK_API_KEY=你的密钥
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_CHUNK_MODEL=deepseek-v4-flash
+DEEPSEEK_CHUNK_BATCH_CHARS=12000
+RAG_SEMANTIC_CHUNKING=true
+RAG_CHUNK_STRATEGY_VERSION=hybrid-v1
 ```
 
 DeepSeek 使用 OpenAI 兼容的 `/chat/completions` 接口，模型和价格以官方文档为准：
@@ -86,7 +92,7 @@ DeepSeek 使用 OpenAI 兼容的 `/chat/completions` 接口，模型和价格以
 python scripts/index_local_documents.py documents --db data/rag.sqlite3
 ```
 
-索引过程只在服务器本地解析、OCR 和切片，不打印文档正文。重复运行同一个文件会按校验和更新，不会产生重复片段。若服务器暂时未安装 OCR，可加 `--no-ocr`，但扫描型 PDF 会被跳过。
+索引过程在服务器本地解析和 OCR，先按结构初切，再将文档正文按批次发送给 DeepSeek 做语义分组。模型只返回段落编号和检索元数据，程序用原文重组切片。重复运行同一个文件会按内容、模型和策略签名跳过，不会产生重复片段；模型失败时自动退回本地切片。
 
 ### 启动服务
 
@@ -106,13 +112,15 @@ docker compose run --rm rag python scripts/index_local_documents.py /app/documen
 docker compose ps
 ```
 
+生产环境可启用 `deploy/feishu-rag-sync.timer`，每小时递归同步三个知识库并刷新索引。
+
 飞书 Webhook 必须通过 HTTPS 暴露。建议在服务前放置公司网关、Caddy 或 Nginx，只开放 443。容器内部使用 8000，Docker 默认映射为服务器的 8010 端口（可通过 `RAG_HOST_PORT` 修改）。
 
 长连接模式由 `rag-events` 服务运行：在飞书后台选择“使用长连接接收事件”，订阅 `im.message.receive_v1` 后，该服务会主动连接飞书，不需要公网域名或开放 443 端口。
 
 ### 从飞书知识库同步
 
-在 `.env` 设置 `FEISHU_SPACE_ID` 后，可按计划任务周期性同步 DOCX 类型节点：
+在 `.env` 设置 `FEISHU_SPACE_ID` 后，可手动同步知识库节点和附件：
 
 ```bash
 python -m feishu_rag.sync --db data/rag.sqlite3
@@ -126,22 +134,23 @@ python -m feishu_rag.sync --space-id 7678686754827685162 --db data/rag.sqlite3  
 python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  # 行政人事内部库
 ```
 
-同步使用飞书应用的只读权限；扫描型 PDF/附件节点若没有可读文本，会在统计中标记为 `skipped`，可继续使用本地目录索引或 OCR。
+同步使用飞书应用的只读权限；PDF 和支持的附件会自动下载到内存临时文件并在服务器本地解析，不保留额外副本。
 
 ## 当前 RAG 行为
 
 - 先使用 SQLite 本地关键词检索，针对中文制度文档无需额外嵌入 API。
-- 命中片段会以 `[1]`、`[2]` 形式附上文档标题和页码/章节。
+- 命中片段会用于生成回答，但员工不会看到来源列表或 `[1]`、`[2]` 引用编号。
 - 无命中时不会调用 DeepSeek，直接返回“知识库中暂无依据”。
 - 提示词要求模型只依据召回资料回答，不补造金额、日期、审批人或制度条款。
-- 目前支持服务器本地目录索引和飞书 Wiki DOCX 节点同步；PDF/附件仍建议走本地 OCR 索引。
+- `RAG_SEMANTIC_CHUNKING=true` 时使用本地结构切片加 DeepSeek 语义分组；失败自动回退本地切片。
+- 模型生成的标题、关键词和摘要只参与检索，最终回答上下文只包含原始正文。
 
 ## 密钥和数据安全
 
 - `.env`、SQLite 数据库和 `documents/` 均不提交 Git。
 - API Key 和 App Secret 只从环境变量读取，日志和对象 repr 不包含密钥。
 - Webhook 开启 Encrypt Key 后强制校验签名。
-- 发送给 DeepSeek 的只有检索到的必要片段，不发送整个数据库。
+- 语义切片开启时，完整文档会在索引阶段按批次发送给 DeepSeek；回答阶段只发送命中的原始片段。
 - 当前飞书知识库按你的要求设置为企业全员可读；如果以后改为分部门权限，Webhook 需要增加按用户过滤召回结果的逻辑。
 
 ## 验收清单
@@ -150,5 +159,5 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 - `/healthz` 返回 `{"status":"ok"}`。
 - 飞书 URL verification 返回 challenge。
 - 错误签名返回 HTTP 403。
-- 员工发送“报销怎么走”能收到带来源的回答。
+- 员工发送“报销怎么走”能收到不带来源区块的回答。
 - 缺少 API Key 时服务健康检查报配置不完整，且不会发起外部请求。
