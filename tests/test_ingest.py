@@ -9,6 +9,35 @@ from feishu_rag.store import IndexStore
 
 
 class IngestTests(unittest.TestCase):
+    def test_index_file_can_use_semantic_planner_metadata(self):
+        class Planner:
+            def plan(self, units):
+                return {
+                    "groups": [
+                        {
+                            "unit_ids": [unit.unit_id for unit in units],
+                            "title": "付款语义标题",
+                            "keywords": ["付款关键词"],
+                            "summary": "付款语义摘要",
+                        }
+                    ]
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / "docs"
+            docs.mkdir()
+            path = docs / "policy.txt"
+            path.write_text("付款申请应由主管审批。", encoding="utf-8")
+            store = IndexStore(root / "rag.sqlite3")
+            try:
+                count = index_directory(docs, store, semantic_planner=Planner())
+                self.assertEqual(count, 1)
+                result = store.search("付款关键词")[0].chunk
+                self.assertEqual(result.content, "付款申请应由主管审批。")
+            finally:
+                store.close()
+
     def test_extracts_text_and_docx_sections(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

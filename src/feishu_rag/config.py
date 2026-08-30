@@ -43,6 +43,10 @@ class Settings:
     rag_top_k: int = 6
     rag_max_chars: int = 900
     rag_enable_ocr: bool = True
+    rag_semantic_chunking: bool = True
+    deepseek_chunk_model: str = "deepseek-v4-flash"
+    deepseek_chunk_batch_chars: int = 12000
+    rag_chunk_strategy_version: str = "hybrid-v1"
     log_level: str = "INFO"
 
     @classmethod
@@ -58,10 +62,16 @@ class Settings:
         try:
             top_k = int(env.get("RAG_TOP_K", "6"))
             max_chars = int(env.get("RAG_MAX_CHARS", "900"))
+            chunk_batch_chars = int(env.get("DEEPSEEK_CHUNK_BATCH_CHARS", "12000"))
         except ValueError as exc:
-            raise ConfigError("RAG_TOP_K 和 RAG_MAX_CHARS 必须是整数") from exc
+            raise ConfigError("RAG_TOP_K、RAG_MAX_CHARS 和 DEEPSEEK_CHUNK_BATCH_CHARS 必须是整数") from exc
         if top_k < 1 or max_chars < 100:
             raise ConfigError("RAG_TOP_K 必须大于 0，RAG_MAX_CHARS 必须不小于 100")
+        if chunk_batch_chars < 2000:
+            raise ConfigError("DEEPSEEK_CHUNK_BATCH_CHARS 必须至少为 2000")
+        strategy_version = env.get("RAG_CHUNK_STRATEGY_VERSION", "hybrid-v1").strip()
+        if not strategy_version:
+            raise ConfigError("RAG_CHUNK_STRATEGY_VERSION 不能为空")
         return cls(
             deepseek_api_key=_required(env, "DEEPSEEK_API_KEY"),
             feishu_app_id=_required(env, "FEISHU_APP_ID"),
@@ -75,6 +85,12 @@ class Settings:
             rag_top_k=top_k,
             rag_max_chars=max_chars,
             rag_enable_ocr=_as_bool(env.get("RAG_ENABLE_OCR", "true"), "RAG_ENABLE_OCR"),
+            rag_semantic_chunking=_as_bool(
+                env.get("RAG_SEMANTIC_CHUNKING", "true"), "RAG_SEMANTIC_CHUNKING"
+            ),
+            deepseek_chunk_model=env.get("DEEPSEEK_CHUNK_MODEL", "deepseek-v4-flash").strip(),
+            deepseek_chunk_batch_chars=chunk_batch_chars,
+            rag_chunk_strategy_version=strategy_version,
             log_level=env.get("LOG_LEVEL", "INFO").upper(),
         )
 
@@ -87,5 +103,8 @@ class Settings:
             f"feishu_space_id={self.feishu_space_id!r}, "
             f"rag_db_path={self.rag_db_path!r}, "
             f"rag_top_k={self.rag_top_k!r}, rag_max_chars={self.rag_max_chars!r}, "
+            f"rag_semantic_chunking={self.rag_semantic_chunking!r}, "
+            f"deepseek_chunk_model={self.deepseek_chunk_model!r}, "
+            f"rag_chunk_strategy_version={self.rag_chunk_strategy_version!r}, "
             f"log_level={self.log_level!r})"
         )

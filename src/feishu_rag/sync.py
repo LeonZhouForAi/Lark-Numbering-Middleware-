@@ -14,7 +14,10 @@ from typing import Any
 from .config import Settings
 from .feishu_client import FeishuClient
 from .chunker import chunk_text
-from .ingest import SUPPORTED_SUFFIXES, extract_sections
+from .ingest import SUPPORTED_SUFFIXES, Section, extract_sections
+from .llm import DeepSeekClient
+from .models import Chunk
+from .semantic_chunker import AtomicUnit, DeepSeekPlanner, SemanticPlanner, semantic_chunks
 from .store import IndexStore
 
 
@@ -42,7 +45,62 @@ def _extract_text(response: dict[str, Any]) -> str:
     return html.unescape(re.sub(r"<[^>]+>", " ", candidate)).strip()
 
 
-def sync_wiki_space(space_id: str, client: FeishuClient, store: IndexStore, max_chars: int = 900) -> SyncResult:
+def _sections_to_units(sections: list[Section], source_id: str, max_unit_chars: int = 600) -> list[AtomicUnit]:
+    units: list[AtomicUnit] = []
+    for section in sections:
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", section.text) if part.strip()]
+        for paragraph in paragraphs:
+            if len(paragraph) <= max_unit_chars:
+                pieces = [paragraph]
+            else:
+                pieces = [paragraph[index : index + max_unit_chars] for index in range(0, len(paragraph), max_unit_chars)]
+            for piece in pieces:
+                units.append(AtomicUnit(f"{source_id}:unit-{len(units)}", piece, section.page, section.section))
+    return units
+
+
+def _local_chunks(sections: list[Section], source_id: str, title: str, max_chars: int) -> list[Chunk]:
+    overlap = max(0, min(120, max_chars // 5))
+    chunks = []
+    for section in sections:
+        chunks.extend(
+            chunk_text(
+                section.text,
+                source_id=source_id,
+                title=title,
+                max_chars=max_chars,
+                overlap=overlap,
+                page=section.page,
+                section=section.section,
+            )
+        )
+    return chunks
+
+
+def _hybrid_chunks(
+    sections: list[Section],
+    source_id: str,
+    title: str,
+    max_chars: int,
+    semantic_planner: SemanticPlanner | None,
+) -> list[Chunk]:
+    if semantic_planner is None:
+        return _local_chunks(sections, source_id, title, max_chars)
+    units = _sections_to_units(sections, source_id)
+    if not units:
+        return []
+    return semantic_chunks(units, source_id, title, semantic_planner, max_chars)
+
+
+def sync_wiki_space(
+    space_id: str,
+    client: FeishuClient,
+    store: IndexStore,
+    max_chars: int = 900,
+    semantic_planner: SemanticPlanner | None = None,
+    chunk_strategy_version: str = "local-v1",
+    chunk_model: str = "",
+) -> SyncResult:
     nodes_seen = indexed = skipped = 0
     pending_parents: list[str | None] = [None]
     seen_nodes: set[str] = set()
@@ -85,7 +143,10 @@ def sync_wiki_space(space_id: str, client: FeishuClient, store: IndexStore, max_
                         continue
                     raw_file = client.download_file(object_token)
                     source_id = f"feishu:{space_id}:{node_token}"
-                    checksum = hashlib.sha256(raw_file).hexdigest()
+                    content_checksum = hashlib.sha256(raw_file).hexdigest()
+                    checksum = hashlib.sha256(
+                        f"{content_checksum}:{chunk_strategy_version}:{chunk_model}".encode("utf-8")
+                    ).hexdigest()
                     if store.document_checksum(source_id) == checksum:
                         skipped += 1
                         continue
@@ -93,20 +154,10 @@ def sync_wiki_space(space_id: str, client: FeishuClient, store: IndexStore, max_
                         downloaded = Path(tmp) / f"downloaded{suffix}"
                         downloaded.write_bytes(raw_file)
                         sections = extract_sections(downloaded)
-                    overlap = max(0, min(120, max_chars // 5))
-                    chunks = []
-                    for section in sections:
-                        chunks.extend(
-                            chunk_text(
-                                section.text,
-                                source_id=source_id,
-                                title=title,
-                                max_chars=max_chars,
-                                overlap=overlap,
-                                page=section.page,
-                                section=section.section,
-                            )
-                        )
+                    try:
+                        chunks = _hybrid_chunks(sections, source_id, title, max_chars, semantic_planner)
+                    except Exception:
+                        chunks = _local_chunks(sections, source_id, title, max_chars)
                     if not chunks:
                         skipped += 1
                         continue
@@ -121,8 +172,21 @@ def sync_wiki_space(space_id: str, client: FeishuClient, store: IndexStore, max_
                     skipped += 1
                     continue
                 source_id = f"feishu:{space_id}:{node_token}"
-                chunks = chunk_text(text, source_id=source_id, title=title, max_chars=max_chars)
-                checksum = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                content_checksum = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                checksum = hashlib.sha256(
+                    f"{content_checksum}:{chunk_strategy_version}:{chunk_model}".encode("utf-8")
+                ).hexdigest()
+                if store.document_checksum(source_id) == checksum:
+                    skipped += 1
+                    continue
+                sections = [Section(text=text)]
+                try:
+                    chunks = _hybrid_chunks(sections, source_id, title, max_chars, semantic_planner)
+                except Exception:
+                    chunks = _local_chunks(sections, source_id, title, max_chars)
+                if not chunks:
+                    skipped += 1
+                    continue
                 store.upsert_document(source_id, title, f"wiki/{space_id}/{node_token}", checksum, chunks)
                 indexed += 1
             has_more = bool(data.get("has_more"))
@@ -145,8 +209,22 @@ def main() -> None:
         raise SystemExit("请提供 --space-id 或设置 FEISHU_SPACE_ID")
     client = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
     store = IndexStore(args.db)
+    semantic_planner = None
+    if settings.rag_semantic_chunking:
+        semantic_planner = DeepSeekPlanner(
+            DeepSeekClient(settings.deepseek_api_key, settings.deepseek_base_url, settings.deepseek_chunk_model),
+            batch_chars=settings.deepseek_chunk_batch_chars,
+        )
     try:
-        result = sync_wiki_space(space_id, client, store, max_chars=args.max_chars)
+        result = sync_wiki_space(
+            space_id,
+            client,
+            store,
+            max_chars=args.max_chars,
+            semantic_planner=semantic_planner,
+            chunk_strategy_version=settings.rag_chunk_strategy_version,
+            chunk_model=settings.deepseek_chunk_model if semantic_planner else "",
+        )
         print(f"nodes_seen={result.nodes_seen} indexed={result.indexed} skipped={result.skipped}")
     finally:
         store.close()

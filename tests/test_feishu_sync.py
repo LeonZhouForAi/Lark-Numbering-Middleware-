@@ -70,7 +70,82 @@ class NestedFeishuClient:
         return "付款申请应先完成部门审批。".encode("utf-8")
 
 
+class SemanticPlanner:
+    def __init__(self):
+        self.calls = 0
+
+    def plan(self, units):
+        self.calls += 1
+        return {
+            "groups": [
+                {
+                    "unit_ids": [unit.unit_id for unit in units],
+                    "title": "语义标题",
+                    "keywords": ["语义关键词"],
+                    "summary": "语义摘要",
+                }
+            ]
+        }
+
+
+class FailingPlanner:
+    def plan(self, units):
+        raise RuntimeError("DeepSeek unavailable")
+
+
 class FeishuSyncTests(unittest.TestCase):
+    def test_sync_uses_semantic_planner_metadata(self):
+        client = FakeFeishuClient()
+        planner = SemanticPlanner()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                result = sync_wiki_space("space-1", client, store, semantic_planner=planner)
+                self.assertEqual(result.indexed, 1)
+                self.assertEqual(planner.calls, 1)
+                self.assertEqual(store.search("语义关键词")[0].chunk.content, client.content)
+            finally:
+                store.close()
+
+    def test_sync_falls_back_to_local_chunks_when_planner_fails(self):
+        client = FakeFeishuClient()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                result = sync_wiki_space("space-1", client, store, semantic_planner=FailingPlanner())
+                self.assertEqual(result.indexed, 1)
+                self.assertTrue(store.search("财务报销制度要求提交发票。"))
+            finally:
+                store.close()
+
+    def test_sync_skips_unchanged_docx_without_calling_planner(self):
+        client = FakeFeishuClient()
+        first_planner = SemanticPlanner()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                sync_wiki_space(
+                    "space-1",
+                    client,
+                    store,
+                    semantic_planner=first_planner,
+                    chunk_strategy_version="hybrid-v1",
+                    chunk_model="deepseek-v4-flash",
+                )
+                second_planner = SemanticPlanner()
+                result = sync_wiki_space(
+                    "space-1",
+                    client,
+                    store,
+                    semantic_planner=second_planner,
+                    chunk_strategy_version="hybrid-v1",
+                    chunk_model="deepseek-v4-flash",
+                )
+                self.assertEqual(result.indexed, 0)
+                self.assertEqual(second_planner.calls, 0)
+            finally:
+                store.close()
+
     def test_sync_recursively_indexes_documents_inside_folders(self):
         client = NestedFeishuClient()
         with tempfile.TemporaryDirectory() as tmp:

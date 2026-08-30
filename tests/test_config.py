@@ -40,6 +40,14 @@ class SettingsTests(unittest.TestCase):
             settings = Settings.from_env()
         self.assertEqual(settings.feishu_verification_token, "")
 
+    def test_semantic_chunking_defaults(self):
+        with patch.dict(os.environ, self._base_env(), clear=True):
+            settings = Settings.from_env()
+        self.assertTrue(settings.rag_semantic_chunking)
+        self.assertEqual(settings.deepseek_chunk_model, "deepseek-v4-flash")
+        self.assertEqual(settings.deepseek_chunk_batch_chars, 12000)
+        self.assertEqual(settings.rag_chunk_strategy_version, "hybrid-v1")
+
 
 if __name__ == "__main__":
     unittest.main()

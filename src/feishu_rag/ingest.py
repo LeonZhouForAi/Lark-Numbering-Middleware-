@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from .chunker import chunk_text
 from .store import IndexStore
+from .semantic_chunker import AtomicUnit, SemanticPlanner, semantic_chunks
 
 
 class UnsupportedFileError(ValueError):
@@ -96,27 +98,43 @@ def index_file(
     store: IndexStore,
     max_chars: int = 900,
     enable_ocr: bool = True,
+    semantic_planner: SemanticPlanner | None = None,
+    chunk_strategy_version: str = "local-v1",
+    chunk_model: str = "",
 ) -> bool:
     sections = extract_sections(path, enable_ocr=enable_ocr)
     source_id = path.relative_to(root).as_posix()
     title = path.stem
+    content_checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+    checksum = hashlib.sha256(f"{content_checksum}:{chunk_strategy_version}:{chunk_model}".encode("utf-8")).hexdigest()
+    if store.document_checksum(source_id) == checksum:
+        return False
     overlap = max(0, min(120, max_chars // 5))
-    chunks = []
-    for section in sections:
-        chunks.extend(
-            chunk_text(
-                section.text,
-                source_id=source_id,
-                title=title,
-                max_chars=max_chars,
-                overlap=overlap,
-                page=section.page,
-                section=section.section,
+    try:
+        if semantic_planner is None:
+            raise ValueError("semantic planner not configured")
+        units = []
+        for section in sections:
+            paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", section.text) if part.strip()]
+            for paragraph in paragraphs:
+                units.append(AtomicUnit(f"{source_id}:unit-{len(units)}", paragraph, section.page, section.section))
+        chunks = semantic_chunks(units, source_id, title, semantic_planner, max_chars)
+    except Exception:
+        chunks = []
+        for section in sections:
+            chunks.extend(
+                chunk_text(
+                    section.text,
+                    source_id=source_id,
+                    title=title,
+                    max_chars=max_chars,
+                    overlap=overlap,
+                    page=section.page,
+                    section=section.section,
+                )
             )
-        )
     if not chunks:
         return False
-    checksum = hashlib.sha256(path.read_bytes()).hexdigest()
     store.upsert_document(source_id, title, source_id, checksum, chunks)
     return True
 
@@ -126,6 +144,9 @@ def index_directory(
     store: IndexStore,
     max_chars: int = 900,
     enable_ocr: bool = True,
+    semantic_planner: SemanticPlanner | None = None,
+    chunk_strategy_version: str = "local-v1",
+    chunk_model: str = "",
 ) -> int:
     """递归索引目录，返回成功索引的文件数量。"""
 
@@ -134,7 +155,16 @@ def index_directory(
     for path in sorted(root_path.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
             continue
-        if index_file(path, root_path, store, max_chars=max_chars, enable_ocr=enable_ocr):
+        if index_file(
+            path,
+            root_path,
+            store,
+            max_chars=max_chars,
+            enable_ocr=enable_ocr,
+            semantic_planner=semantic_planner,
+            chunk_strategy_version=chunk_strategy_version,
+            chunk_model=chunk_model,
+        ):
             indexed += 1
     return indexed
 
