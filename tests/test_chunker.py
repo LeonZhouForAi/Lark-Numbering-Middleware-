@@ -31,6 +31,39 @@ class ChunkerTests(unittest.TestCase):
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(chunk.content for chunk in chunks))
 
+    def test_long_paragraph_keeps_every_source_character(self):
+        text = "".join(chr(0x4E00 + index) for index in range(100))
+
+        chunks = chunk_text(text, "a.txt", "长文档", max_chars=30, overlap=5)
+
+        self.assertTrue(all(len(chunk.content) <= 30 for chunk in chunks))
+        self.assertTrue(set(text).issubset(set().union(*(set(chunk.content) for chunk in chunks))))
+
+    def test_repeated_long_paragraph_keeps_numbered_tokens(self):
+        text = "".join(f"条{index:03d}款" for index in range(20))
+
+        chunks = chunk_text(text, "a.txt", "长文档", max_chars=30, overlap=5)
+
+        combined = "".join(chunk.content for chunk in chunks)
+        self.assertTrue(all(len(chunk.content) <= 30 for chunk in chunks))
+        for index in range(20):
+            self.assertIn(f"条{index:03d}款", combined)
+
+    def test_long_paragraph_with_zero_overlap_matches_non_overlapping_windows(self):
+        text = "报销" * 50
+
+        chunks = chunk_text(text, "a.txt", "长文档", max_chars=30, overlap=0)
+
+        expected = [text[start : start + 30] for start in (0, 30, 60, 90)]
+        self.assertEqual([chunk.content for chunk in chunks], expected)
+
+    def test_paragraph_at_max_chars_is_kept_intact(self):
+        text = "报销" * 15
+
+        chunks = chunk_text(text, "a.txt", "长文档", max_chars=30, overlap=5)
+
+        self.assertEqual([chunk.content for chunk in chunks], [text])
+
 
 if __name__ == "__main__":
     unittest.main()

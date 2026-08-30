@@ -57,10 +57,10 @@ def chunk_text(
             continue
         if current:
             contents.append(current)
-        carry = current[-overlap:] if overlap and current else ""
-        current = f"{carry}\n\n{unit}".strip() if carry else unit
-        if len(current) > max_chars:
-            current = current[:max_chars].rstrip()
+        separator = "\n\n"
+        carry_size = min(overlap, max_chars - len(separator) - len(unit))
+        carry = current[-carry_size:] if carry_size > 0 and current else ""
+        current = f"{carry}{separator}{unit}".strip() if carry else unit
     if current:
         contents.append(current)
 
