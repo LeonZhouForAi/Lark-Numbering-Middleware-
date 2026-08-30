@@ -114,11 +114,13 @@ def test_evaluation_calculates_metrics_and_strips_sensitive_report_fields() -> N
     assert summary.mrr == pytest.approx(0.75)
     assert summary.answerable_insufficient_rate == pytest.approx(0.5)
     assert summary.unanswerable_answer_rate == pytest.approx(1.0)
-    assert summary.forbidden_title_rate == pytest.approx(1.0 / 3)
+    assert summary.forbidden_title_rate == pytest.approx(1.0)
     assert summary.source_leak_rate == pytest.approx(1.0 / 3)
     assert report["results"][0]["case_id"] == "finance-001"
     assert report["results"][1]["expected_terms_hit"] is False
     assert report["results"][1]["forbidden_terms_hit"] is False
+    assert report["results"][0]["forbidden_title_evaluated"] is False
+    assert report["results"][1]["forbidden_title_evaluated"] is True
     report_text = json.dumps(report, ensure_ascii=False)
     assert '"answer"' not in report_text
     assert '"content"' not in report_text

@@ -40,6 +40,7 @@ class EvaluationResult:
     retrieval_evaluated: bool
     hit: bool
     reciprocal_rank: float
+    forbidden_title_evaluated: bool
     forbidden_title_hit: bool
     answer_evaluated: bool
     insufficient: bool
@@ -81,7 +82,9 @@ class EvaluationSummary:
 
     @property
     def forbidden_title_rate(self) -> float:
-        return _average([float(result.forbidden_title_hit) for result in self.results])
+        return _average(
+            [float(result.forbidden_title_hit) for result in self.results if result.forbidden_title_evaluated]
+        )
 
     @property
     def source_leak_rate(self) -> float:
@@ -172,6 +175,7 @@ def evaluate_cases(
         matches = store.search(case.question, top_k=effective_top_k)
         retrieval_evaluated = bool(case.expected_titles or case.expected_source_ids)
         hit, reciprocal_rank = _retrieval_score(case, matches)
+        forbidden_title_evaluated = bool(case.forbidden_titles)
         forbidden_title_hit = any(
             _matches_title(_chunk_value(match, "title"), case.forbidden_titles) for match in matches
         )
@@ -190,6 +194,7 @@ def evaluate_cases(
                 retrieval_evaluated=retrieval_evaluated,
                 hit=hit,
                 reciprocal_rank=reciprocal_rank,
+                forbidden_title_evaluated=forbidden_title_evaluated,
                 forbidden_title_hit=forbidden_title_hit,
                 answer_evaluated=answer_evaluated,
                 insufficient=insufficient,
