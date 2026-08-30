@@ -6,6 +6,13 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class RetrievalScope:
+    """检索可访问空间；None 表示维持当前全库行为。"""
+
+    allowed_space_ids: frozenset[str] | None = None
+
+
+@dataclass(frozen=True)
 class Chunk:
     """可被检索的一段文档内容。"""
 

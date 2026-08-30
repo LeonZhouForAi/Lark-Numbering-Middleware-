@@ -48,6 +48,26 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.deepseek_chunk_batch_chars, 12000)
         self.assertEqual(settings.rag_chunk_strategy_version, "hybrid-v4")
 
+    def test_min_relevance_defaults_to_point_four_two(self):
+        with patch.dict(os.environ, self._base_env(), clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.rag_min_relevance, 0.42)
+
+    def test_min_relevance_accepts_zero_and_one(self):
+        for value, expected in (("0", 0.0), ("1", 1.0)):
+            env = self._base_env()
+            env["RAG_MIN_RELEVANCE"] = value
+            with self.subTest(value=value), patch.dict(os.environ, env, clear=True):
+                self.assertEqual(Settings.from_env().rag_min_relevance, expected)
+
+    def test_min_relevance_must_be_a_finite_probability(self):
+        for value in ("-0.01", "1.01", "nan", "inf", "not-a-number"):
+            env = self._base_env()
+            env["RAG_MIN_RELEVANCE"] = value
+            with self.subTest(value=value), patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(ConfigError, "RAG_MIN_RELEVANCE"):
+                    Settings.from_env()
+
 
 if __name__ == "__main__":
     unittest.main()

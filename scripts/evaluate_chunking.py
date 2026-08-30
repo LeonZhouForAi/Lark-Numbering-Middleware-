@@ -23,7 +23,11 @@ def evaluate_questions(store: IndexStore, rag: RagService, questions: list[str])
     """保留旧版脚本调用方式，输出不含回答正文的简要结果。"""
     report: list[dict[str, object]] = []
     for index, question in enumerate(questions, start=1):
-        matches = store.search(question, top_k=rag.top_k)
+        matches = store.search(
+            question,
+            top_k=rag.top_k,
+            min_relevance=rag.min_relevance,
+        )
         answer = rag.answer(question)
         report.append(
             {
@@ -71,6 +75,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--min-hit-rate", type=_rate)
     parser.add_argument("--min-mrr", type=_rate)
     parser.add_argument("--max-leak-rate", type=_rate)
+    parser.add_argument("--min-relevance", type=_rate)
     args = parser.parse_args(argv)
 
     if args.questions and any(value is not None for value in (args.min_hit_rate, args.min_mrr, args.max_leak_rate)):
@@ -80,24 +85,71 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.questions:
             if args.retrieval_only:
+                min_relevance = (
+                    args.min_relevance if args.min_relevance is not None else 0.42
+                )
                 report = [
-                    {"case_id": f"legacy-{index:03d}", "matches": len(store.search(question, top_k=6))}
+                    {
+                        "case_id": f"legacy-{index:03d}",
+                        "matches": len(
+                            store.search(
+                                question,
+                                top_k=6,
+                                min_relevance=min_relevance,
+                            )
+                        ),
+                    }
                     for index, question in enumerate(args.questions, start=1)
                 ]
             else:
                 settings = Settings.from_env()
-                rag = RagService(store, DeepSeekClient(settings.deepseek_api_key, settings.deepseek_base_url, settings.deepseek_model), settings.rag_top_k)
+                min_relevance = (
+                    args.min_relevance
+                    if args.min_relevance is not None
+                    else settings.rag_min_relevance
+                )
+                rag = RagService(
+                    store,
+                    DeepSeekClient(
+                        settings.deepseek_api_key,
+                        settings.deepseek_base_url,
+                        settings.deepseek_model,
+                    ),
+                    top_k=settings.rag_top_k,
+                    min_relevance=min_relevance,
+                )
                 report = evaluate_questions(store, rag, args.questions)
             print(json.dumps(report, ensure_ascii=False))
             return 0
 
         rag = None
         top_k = 6
+        min_relevance = args.min_relevance if args.min_relevance is not None else 0.42
         if not args.retrieval_only:
             settings = Settings.from_env()
             top_k = settings.rag_top_k
-            rag = RagService(store, DeepSeekClient(settings.deepseek_api_key, settings.deepseek_base_url, settings.deepseek_model), top_k)
-        report = evaluate_cases(store, load_cases(args.cases), rag, top_k=top_k).to_report()
+            min_relevance = (
+                args.min_relevance
+                if args.min_relevance is not None
+                else settings.rag_min_relevance
+            )
+            rag = RagService(
+                store,
+                DeepSeekClient(
+                    settings.deepseek_api_key,
+                    settings.deepseek_base_url,
+                    settings.deepseek_model,
+                ),
+                top_k=top_k,
+                min_relevance=min_relevance,
+            )
+        report = evaluate_cases(
+            store,
+            load_cases(args.cases),
+            rag,
+            top_k=top_k,
+            min_relevance=min_relevance,
+        ).to_report()
         print(json.dumps(report, ensure_ascii=False))
         return int(threshold_failed(report, min_hit_rate=args.min_hit_rate, min_mrr=args.min_mrr, max_leak_rate=args.max_leak_rate))
     finally:

@@ -12,8 +12,17 @@ from feishu_rag.rag import RagAnswer
 class FakeStore:
     def __init__(self, results: list[SearchResult]) -> None:
         self.results = results
+        self.calls: list[dict[str, object]] = []
 
-    def search(self, question: str, top_k: int) -> list[SearchResult]:
+    def search(
+        self,
+        question: str,
+        top_k: int,
+        min_relevance: float = 0.42,
+    ) -> list[SearchResult]:
+        self.calls.append(
+            {"question": question, "top_k": top_k, "min_relevance": min_relevance}
+        )
         return self.results[:top_k]
 
 
@@ -135,6 +144,16 @@ def test_retrieval_only_skips_answer_quality_metrics() -> None:
     assert summary.hit_rate == 1.0
     assert result["answer_evaluated"] is False
     assert result["source_leak"] is False
+
+
+def test_evaluate_cases_passes_custom_min_relevance_to_store() -> None:
+    store = FakeStore([_result("财务报销", "finance-1")])
+
+    evaluate_cases(store, [_case()], top_k=2, min_relevance=0.73)
+
+    assert store.calls == [
+        {"question": "报销怎么弄", "top_k": 2, "min_relevance": 0.73}
+    ]
 
 
 @pytest.mark.parametrize(

@@ -24,10 +24,17 @@ class RagAnswer:
 
 
 class RagService:
-    def __init__(self, store: IndexStore, llm, top_k: int = 6):
+    def __init__(
+        self,
+        store: IndexStore,
+        llm,
+        top_k: int = 6,
+        min_relevance: float = 0.42,
+    ):
         self.store = store
         self.llm = llm
         self.top_k = top_k
+        self.min_relevance = min_relevance
 
     @staticmethod
     def _context(results: list[SearchResult]) -> tuple[str, list[Citation]]:
@@ -43,7 +50,11 @@ class RagService:
         question = question.strip()
         if not question:
             return RagAnswer("请输入要查询的问题。", [])
-        results = self.store.search(question, top_k=self.top_k)
+        results = self.store.search(
+            question,
+            top_k=self.top_k,
+            min_relevance=self.min_relevance,
+        )
         if not results:
             return RagAnswer("知识库中暂无依据，请换一种问法或联系文控管理员。", [])
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Mapping
@@ -41,6 +42,7 @@ class Settings:
     feishu_space_id: str = ""
     rag_db_path: str = "./data/rag.sqlite3"
     rag_top_k: int = 6
+    rag_min_relevance: float = 0.42
     rag_max_chars: int = 900
     rag_enable_ocr: bool = True
     rag_semantic_chunking: bool = True
@@ -69,6 +71,12 @@ class Settings:
             raise ConfigError("RAG_TOP_K 必须大于 0，RAG_MAX_CHARS 必须不小于 100")
         if chunk_batch_chars < 2000:
             raise ConfigError("DEEPSEEK_CHUNK_BATCH_CHARS 必须至少为 2000")
+        try:
+            min_relevance = float(env.get("RAG_MIN_RELEVANCE", "0.42"))
+        except ValueError as exc:
+            raise ConfigError("RAG_MIN_RELEVANCE 必须是 0 到 1 之间的数字") from exc
+        if not math.isfinite(min_relevance) or not 0.0 <= min_relevance <= 1.0:
+            raise ConfigError("RAG_MIN_RELEVANCE 必须在 0 到 1 之间")
         strategy_version = env.get("RAG_CHUNK_STRATEGY_VERSION", "hybrid-v4").strip()
         if not strategy_version:
             raise ConfigError("RAG_CHUNK_STRATEGY_VERSION 不能为空")
@@ -83,6 +91,7 @@ class Settings:
             feishu_space_id=env.get("FEISHU_SPACE_ID", "").strip(),
             rag_db_path=env.get("RAG_DB_PATH", "./data/rag.sqlite3").strip(),
             rag_top_k=top_k,
+            rag_min_relevance=min_relevance,
             rag_max_chars=max_chars,
             rag_enable_ocr=_as_bool(env.get("RAG_ENABLE_OCR", "true"), "RAG_ENABLE_OCR"),
             rag_semantic_chunking=_as_bool(
@@ -102,7 +111,8 @@ class Settings:
             f"feishu_app_id={self.feishu_app_id!r}, "
             f"feishu_space_id={self.feishu_space_id!r}, "
             f"rag_db_path={self.rag_db_path!r}, "
-            f"rag_top_k={self.rag_top_k!r}, rag_max_chars={self.rag_max_chars!r}, "
+            f"rag_top_k={self.rag_top_k!r}, rag_min_relevance={self.rag_min_relevance!r}, "
+            f"rag_max_chars={self.rag_max_chars!r}, "
             f"rag_semantic_chunking={self.rag_semantic_chunking!r}, "
             f"deepseek_chunk_model={self.deepseek_chunk_model!r}, "
             f"rag_chunk_strategy_version={self.rag_chunk_strategy_version!r}, "

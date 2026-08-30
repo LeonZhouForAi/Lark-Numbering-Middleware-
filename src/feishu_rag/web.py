@@ -97,7 +97,12 @@ def create_app(
             settings = settings or Settings.from_env()
             store = IndexStore(settings.rag_db_path)
             llm = DeepSeekClient(settings.deepseek_api_key, settings.deepseek_base_url, settings.deepseek_model)
-            rag = rag or RagService(store, llm, settings.rag_top_k)
+            rag = rag or RagService(
+                store,
+                llm,
+                top_k=settings.rag_top_k,
+                min_relevance=settings.rag_min_relevance,
+            )
             feishu = feishu or FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
         except ConfigError as exc:
             configured_error = exc

@@ -5,10 +5,70 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
+import unicodedata
+from collections import Counter
 from pathlib import Path
 from typing import Collection, Iterable
 
-from .models import Chunk, SearchResult
+from .models import Chunk, RetrievalScope, SearchResult
+
+
+_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]+|[a-z0-9_]+")
+_QUESTION_SHELLS = (
+    "需要什么",
+    "是什么",
+    "有什么",
+    "有哪些",
+    "请问",
+    "有何",
+    "哪些",
+    "怎么",
+    "如何",
+)
+_GENERIC_TERMS = ("流程", "制度", "规定", "办法")
+_QUERY_STOP_WORDS = frozenset({"and", "or", "not", "near"})
+
+
+def _normalize(text: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
+def _tokens(text: str, *, include_single_chinese: bool = True) -> list[str]:
+    terms: list[str] = []
+    for part in _TOKEN_RE.findall(_normalize(text)):
+        if re.fullmatch(r"[\u4e00-\u9fff]+", part):
+            if len(part) == 1:
+                terms.append(part)
+            else:
+                terms.extend(part[index : index + 2] for index in range(len(part) - 1))
+                if include_single_chinese:
+                    terms.extend(part)
+        else:
+            terms.append(part)
+    return list(dict.fromkeys(terms))
+
+
+def _pretokenize(text: str) -> str:
+    """生成供 FTS5 unicode61 tokenizer 使用的 NFKC 预分词文本。"""
+
+    return " ".join(_tokens(text))
+
+
+def _meaningful_query(query: str) -> str:
+    cleaned = _normalize(query)
+    for shell in _QUESTION_SHELLS:
+        cleaned = cleaned.replace(shell, " ")
+    for generic in _GENERIC_TERMS:
+        cleaned = cleaned.replace(generic, " ")
+    return _normalize(cleaned)
+
+
+def _core_terms(query: str) -> list[str]:
+    return [
+        term
+        for term in _tokens(_meaningful_query(query), include_single_chinese=False)
+        if term not in _QUERY_STOP_WORDS
+    ]
 
 
 class IndexStore:
@@ -54,12 +114,63 @@ class IndexStore:
         columns = {row[1] for row in self.connection.execute("PRAGMA table_info(chunks)").fetchall()}
         if "search_text" not in columns:
             self.connection.execute("ALTER TABLE chunks ADD COLUMN search_text TEXT NOT NULL DEFAULT ''")
+        fts_savepoint = "initialize_fts"
+        self.connection.execute(f"SAVEPOINT {fts_savepoint}")
         try:
+            expected_columns = ["chunk_id", "title_terms", "content_terms", "search_terms"]
+            existing = self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'"
+            ).fetchone()
+            rebuild = existing is None
+            if existing is not None:
+                actual_columns = [
+                    row[1]
+                    for row in self.connection.execute("PRAGMA table_info(chunks_fts)").fetchall()
+                ]
+                rebuild = actual_columns != expected_columns
+                if not rebuild:
+                    chunk_ids = [
+                        row[0]
+                        for row in self.connection.execute(
+                            "SELECT id FROM chunks ORDER BY id"
+                        ).fetchall()
+                    ]
+                    fts_ids = [
+                        row[0]
+                        for row in self.connection.execute(
+                            "SELECT chunk_id FROM chunks_fts ORDER BY chunk_id"
+                        ).fetchall()
+                    ]
+                    rebuild = chunk_ids != fts_ids
+            if rebuild and existing is not None:
+                self.connection.execute("DROP TABLE chunks_fts")
             self.connection.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_id UNINDEXED, title, content)"
+                "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING "
+                "fts5(chunk_id UNINDEXED, title_terms, content_terms, search_terms)"
             )
+            if rebuild:
+                rows = self.connection.execute(
+                    "SELECT id,title,content,search_text FROM chunks"
+                ).fetchall()
+                self.connection.executemany(
+                    "INSERT INTO chunks_fts(chunk_id,title_terms,content_terms,search_terms) "
+                    "VALUES(?,?,?,?)",
+                    (
+                        (
+                            row["id"],
+                            _pretokenize(row["title"]),
+                            _pretokenize(row["content"]),
+                            _pretokenize(row["search_text"] or ""),
+                        )
+                        for row in rows
+                    ),
+                )
         except sqlite3.OperationalError:
+            self.connection.execute(f"ROLLBACK TO SAVEPOINT {fts_savepoint}")
+            self.connection.execute(f"RELEASE SAVEPOINT {fts_savepoint}")
             self._fts_available = False
+        else:
+            self.connection.execute(f"RELEASE SAVEPOINT {fts_savepoint}")
         self.connection.commit()
 
     def upsert_document(
@@ -91,26 +202,37 @@ class IndexStore:
             )
             if self._fts_available:
                 self.connection.executemany(
-                    "INSERT INTO chunks_fts(chunk_id,title,content) VALUES(?,?,?)",
-                    ((c.id, c.title, c.content) for c in chunk_list),
+                    "INSERT INTO chunks_fts(chunk_id,title_terms,content_terms,search_terms) "
+                    "VALUES(?,?,?,?)",
+                    (
+                        (
+                            c.id,
+                            _pretokenize(c.title),
+                            _pretokenize(c.content),
+                            _pretokenize(c.search_text),
+                        )
+                        for c in chunk_list
+                    ),
                 )
 
     @staticmethod
     def _terms(query: str) -> list[str]:
-        terms: list[str] = []
-        for part in re.findall(r"[\u4e00-\u9fff]+|[A-Za-z0-9_]+", query):
-            if re.fullmatch(r"[\u4e00-\u9fff]+", part):
-                if len(part) >= 2:
-                    terms.append(part)
-                    terms.extend(part[i : i + 2] for i in range(len(part) - 1))
-                else:
-                    terms.append(part)
-            else:
-                terms.append(part.lower())
-        return list(dict.fromkeys(terms))
+        return _tokens(query)
 
-    def search(self, query: str, top_k: int = 6) -> list[SearchResult]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 6,
+        min_relevance: float = 0.42,
+        scope: RetrievalScope | None = None,
+    ) -> list[SearchResult]:
         if top_k < 1:
+            return []
+        if not 0.0 <= min_relevance <= 1.0:
+            raise ValueError("min_relevance must be between 0 and 1")
+        del scope  # ACL 存储列由后续任务实现；此处只建立兼容接口。
+        core_terms = _core_terms(query)
+        if not core_terms:
             return []
         terms = self._terms(query)
         if not terms:
@@ -118,34 +240,97 @@ class IndexStore:
         rows = self.connection.execute(
             "SELECT id,source_id,title,content,page,section,search_text FROM chunks"
         ).fetchall()
-        scored: list[SearchResult] = []
+
+        candidate_limit = top_k * 4
+        literal_scores: list[tuple[str, float]] = []
         for row in rows:
-            title = row["title"].lower()
-            content = row["content"].lower()
-            search_text = (row["search_text"] or "").lower()
+            title = _normalize(row["title"])
+            content = _normalize(row["content"])
+            search_text = _normalize(row["search_text"] or "")
             score = 0.0
             for term in terms:
-                needle = term.lower()
-                score += title.count(needle) * 3.0
-                score += content.count(needle)
-                score += search_text.count(needle) * 0.75
+                score += title.count(term) * 3.0
+                score += content.count(term)
+                score += search_text.count(term) * 0.75
             if score:
-                scored.append(
-                    SearchResult(
-                        Chunk(
-                            row["id"],
-                            row["source_id"],
-                            row["title"],
-                            row["content"],
-                            row["page"],
-                            row["section"],
-                            row["search_text"] or "",
-                        ),
-                        score,
-                    )
+                literal_scores.append((row["id"], score))
+        literal_scores.sort(key=lambda item: (-item[1], item[0]))
+        literal_ids = [chunk_id for chunk_id, _ in literal_scores[:candidate_limit]]
+
+        fts_ids: list[str] = []
+        if self._fts_available:
+            match_query = " OR ".join(f'"{term}"' for term in terms)
+            try:
+                fts_ids = [
+                    row[0]
+                    for row in self.connection.execute(
+                        "SELECT chunk_id FROM chunks_fts WHERE chunks_fts MATCH ? "
+                        "ORDER BY bm25(chunks_fts, 0.0, 3.0, 1.0, 0.75), chunk_id LIMIT ?",
+                        (match_query, candidate_limit),
+                    ).fetchall()
+                ]
+            except sqlite3.OperationalError:
+                self._fts_available = False
+
+        rrf_scores: Counter[str] = Counter()
+        for rank, chunk_id in enumerate(fts_ids, start=1):
+            rrf_scores[chunk_id] += 1.0 / (60 + rank)
+        for rank, chunk_id in enumerate(literal_ids, start=1):
+            rrf_scores[chunk_id] += 0.8 / (60 + rank)
+        if not rrf_scores:
+            return []
+
+        normalized_documents = [
+            set(_tokens(f'{row["title"]} {row["content"]} {row["search_text"] or ""}'))
+            for row in rows
+        ]
+        document_frequency = {
+            term: sum(term in document_terms for document_terms in normalized_documents)
+            for term in core_terms
+        }
+        rarity_weights = {
+            term: 1.0 / max(document_frequency[term], 1) for term in core_terms
+        }
+        rarity_total = sum(rarity_weights.values())
+        phrase = "".join(_TOKEN_RE.findall(_meaningful_query(query)))
+        row_by_id = {row["id"]: row for row in rows}
+        results: list[tuple[float, SearchResult]] = []
+        for chunk_id, rrf_score in rrf_scores.items():
+            row = row_by_id[chunk_id]
+            title_terms = set(_tokens(row["title"]))
+            all_terms = set(
+                _tokens(f'{row["title"]} {row["content"]} {row["search_text"] or ""}')
+            )
+            matched = [term for term in core_terms if term in all_terms]
+            coverage = len(matched) / len(core_terms)
+            title_coverage = sum(term in title_terms for term in core_terms) / len(core_terms)
+            rarity_coverage = sum(rarity_weights[term] for term in matched) / rarity_total
+            searchable_phrase = "".join(
+                _TOKEN_RE.findall(
+                    _normalize(f'{row["title"]} {row["content"]} {row["search_text"] or ""}')
                 )
-        scored.sort(key=lambda result: (-result.score, result.chunk.id))
-        return scored[:top_k]
+            )
+            phrase_match = bool(phrase and phrase in searchable_phrase)
+            confidence = min(
+                1.0,
+                0.50 * coverage
+                + 0.15 * title_coverage
+                + 0.20 * float(phrase_match)
+                + 0.15 * rarity_coverage,
+            )
+            if confidence >= min_relevance:
+                chunk = Chunk(
+                    row["id"],
+                    row["source_id"],
+                    row["title"],
+                    row["content"],
+                    row["page"],
+                    row["section"],
+                    row["search_text"] or "",
+                )
+                results.append((rrf_score, SearchResult(chunk, confidence)))
+        results.sort(key=lambda item: (-item[0], -item[1].score, item[1].chunk.id))
+        return [result for _, result in results[:top_k]]
 
     def count_documents(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0])

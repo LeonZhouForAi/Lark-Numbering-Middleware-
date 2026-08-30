@@ -11,7 +11,12 @@ from typing import Any, Protocol, Sequence
 
 
 class SearchStore(Protocol):
-    def search(self, query: str, top_k: int = 6) -> Sequence[Any]: ...
+    def search(
+        self,
+        query: str,
+        top_k: int = 6,
+        min_relevance: float = 0.42,
+    ) -> Sequence[Any]: ...
 
 
 class AnswerService(Protocol):
@@ -166,13 +171,18 @@ def evaluate_cases(
     rag: AnswerService | None = None,
     *,
     top_k: int | None = None,
+    min_relevance: float = 0.42,
 ) -> EvaluationSummary:
     """评估检索结果，且只在传入 RAG 服务时评估回答质量。"""
     effective_top_k = top_k if top_k is not None else getattr(rag, "top_k", 6)
     results: list[EvaluationResult] = []
     for case in cases:
         started = time.perf_counter()
-        matches = store.search(case.question, top_k=effective_top_k)
+        matches = store.search(
+            case.question,
+            top_k=effective_top_k,
+            min_relevance=min_relevance,
+        )
         retrieval_evaluated = bool(case.expected_titles or case.expected_source_ids)
         hit, reciprocal_rank = _retrieval_score(case, matches)
         forbidden_title_evaluated = bool(case.forbidden_titles)

@@ -62,7 +62,8 @@ def run() -> None:
     rag = RagService(
         store,
         DeepSeekClient(settings.deepseek_api_key, settings.deepseek_base_url, settings.deepseek_model),
-        settings.rag_top_k,
+        top_k=settings.rag_top_k,
+        min_relevance=settings.rag_min_relevance,
     )
     feishu = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
 

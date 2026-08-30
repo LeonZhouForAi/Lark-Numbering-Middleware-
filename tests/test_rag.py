@@ -17,7 +17,28 @@ class FakeLLM:
         return "根据制度，员工需要先提交申请。"
 
 
+class RecordingStore:
+    def __init__(self):
+        self.calls = []
+
+    def search(self, query, top_k=6, min_relevance=0.42):
+        self.calls.append(
+            {"query": query, "top_k": top_k, "min_relevance": min_relevance}
+        )
+        return []
+
+
 class RagTests(unittest.TestCase):
+    def test_answer_passes_custom_min_relevance_to_store(self):
+        store = RecordingStore()
+
+        RagService(store, FakeLLM(), top_k=4, min_relevance=0.73).answer("报销要求")
+
+        self.assertEqual(
+            store.calls,
+            [{"query": "报销要求", "top_k": 4, "min_relevance": 0.73}],
+        )
+
     def test_no_evidence_does_not_call_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
