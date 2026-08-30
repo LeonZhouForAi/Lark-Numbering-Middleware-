@@ -104,6 +104,7 @@ class DeepSeekClient:
                 "stream": False,
                 "temperature": 0,
                 "max_tokens": 2000,
+                "thinking": {"type": "disabled"},
                 "response_format": {"type": "json_object"},
             }
         )

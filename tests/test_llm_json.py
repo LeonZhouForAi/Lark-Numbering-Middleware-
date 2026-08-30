@@ -25,6 +25,7 @@ def test_complete_json_requests_json_object_and_parses_response() -> None:
     assert result == {"groups": []}
     assert transport.payload["response_format"] == {"type": "json_object"}
     assert transport.payload["temperature"] == 0
+    assert transport.payload["thinking"] == {"type": "disabled"}
 
 
 def test_complete_json_rejects_invalid_json() -> None:
