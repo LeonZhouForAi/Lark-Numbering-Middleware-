@@ -7,6 +7,25 @@ from feishu_rag.store import IndexStore
 
 
 class StoreTests(unittest.TestCase):
+    def test_sqlite_connection_uses_concurrency_safe_pragmas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA journal_mode").fetchone()[0],
+                    "wal",
+                )
+                self.assertGreaterEqual(
+                    store.connection.execute("PRAGMA busy_timeout").fetchone()[0],
+                    30000,
+                )
+                self.assertEqual(
+                    store.connection.execute("PRAGMA synchronous").fetchone()[0],
+                    1,
+                )
+            finally:
+                store.close()
+
     def test_search_text_is_searchable_but_original_content_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
