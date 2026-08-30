@@ -324,6 +324,17 @@ def test_output_removes_zero_width_control_characters_and_numeric_citations() ->
         "client_secret = sensitive",
         '\"token\": \"sensitive\"',
         "“client_secret”：‘sensitive’",
+        "sk-abcdefghijklmnopqrstuvwxyz123456",
+        "SK-ABCDEF1234567890ABCDEF",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "AKIAIOSFODNN7EXAMPLE",
+        "token AbCdEf1234567890GhIjKl",
+        "secret ZxCvBn1234567890QwErTy",
+        "password Pa55w0rdABCDEF123456",
+        "api key AbCdEf1234567890GhIj",
+        "**token** AbCdEf1234567890GhIjKl",
+        "| client_secret | ZxCvBn1234567890QwErTy |",
+        "token is AbCdEf1234567890GhIjKl",
     ],
 )
 def test_dangerous_output_fails_closed(unsafe: str) -> None:
@@ -353,6 +364,24 @@ def test_answer_may_end_with_office_document_filename(filename: str) -> None:
     answer = RagService(RecordingStore([_result()]), llm).answer("报销流程")
 
     assert answer.text == filename
+
+
+def test_normal_token_count_phrase_is_not_treated_as_a_bare_secret() -> None:
+    generated = "token 数量为 1200。"
+    llm = FakeLLM({"answer": generated, "evidence_sufficient": True})
+
+    answer = RagService(RecordingStore([_result()]), llm).answer("用量是多少")
+
+    assert answer.text == generated
+
+
+def test_normal_token_explanation_is_not_treated_as_a_bare_secret() -> None:
+    generated = "token 是模型计费单位，数量按响应统计。"
+    llm = FakeLLM({"answer": generated, "evidence_sufficient": True})
+
+    answer = RagService(RecordingStore([_result()]), llm).answer("token 是什么")
+
+    assert answer.text == "token 是模型计费单位,数量按响应统计。"
 
 
 class DeepSeekClientTests(unittest.TestCase):

@@ -51,6 +51,18 @@ _MARKDOWN_REFERENCE_RE = re.compile(
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)(?:apikey|accesstoken|refreshtoken|clientsecret|token|secret|password)[:=]"
 )
+_EXPLICIT_SECRET_RE = re.compile(
+    r"(?i)(?:(?<![a-z0-9])sk-[a-z0-9_-]{16,}(?![a-z0-9_-])"
+    r"|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+    r"|(?<![a-z0-9])AKIA[A-Z0-9]{16}(?![a-z0-9]))"
+)
+_BARE_NAMED_SECRET_RE = re.compile(
+    r"(?i)(?<![a-z0-9])"
+    r"(?:api[ _-]*key|access[ _-]*token|refresh[ _-]*token|client[ _-]*secret"
+    r"|token|secret|password)"
+    r"(?:\s*(?:is|是|为|[:=])\s*|\s+)"
+    r"(?P<value>[a-z0-9_+./=-]{16,})"
+)
 
 
 class RagResponseError(ValueError):
@@ -131,6 +143,22 @@ class RagService:
         return False
 
     @staticmethod
+    def _has_unsafe_secret(answer: str, compact_answer: str) -> bool:
+        if _SECRET_ASSIGNMENT_RE.search(compact_answer) or _EXPLICIT_SECRET_RE.search(answer):
+            return True
+        flattened_answer = re.sub(r"[*`|_\"'“”‘’「」『』]+", " ", answer)
+        flattened_answer = re.sub(r"\s+", " ", flattened_answer).strip()
+        for match in _BARE_NAMED_SECRET_RE.finditer(flattened_answer):
+            value = match.group("value")
+            has_mixed_alphanumeric = any(character.isalpha() for character in value) and any(
+                character.isdigit() for character in value
+            )
+            has_diverse_long_value = len(value) >= 24 and len(set(value.lower())) >= 10
+            if has_mixed_alphanumeric or has_diverse_long_value:
+                return True
+        return False
+
+    @staticmethod
     def _clean_answer(answer: str) -> str:
         answer = unicodedata.normalize("NFKC", answer)
         answer = "".join(
@@ -148,7 +176,7 @@ class RagService:
             RagService._has_unsafe_url(answer)
             or _MARKDOWN_LINK_RE.search(answer)
             or _MARKDOWN_REFERENCE_RE.search(answer)
-            or _SECRET_ASSIGNMENT_RE.search(compact_answer)
+            or RagService._has_unsafe_secret(answer, compact_answer)
         ):
             return UNSAFE_ANSWER
         return answer or INSUFFICIENT_ANSWER
