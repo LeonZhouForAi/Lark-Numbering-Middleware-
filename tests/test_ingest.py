@@ -7,16 +7,60 @@ from docx import Document
 
 from feishu_rag.ingest import (
     DocumentExtractionError,
+    Section,
     UnsupportedFileError,
     _ocr_pdf_page,
     _read_pdf,
     extract_sections,
+    index_file,
     index_directory,
 )
 from feishu_rag.store import IndexStore
 
 
 class IngestTests(unittest.TestCase):
+    def test_pdf_ocr_mode_change_reindexes_file_and_same_mode_skips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "scan.pdf"
+            path.write_bytes(b"same-pdf-bytes")
+            store = IndexStore(root / "rag.sqlite3")
+            try:
+                with patch(
+                    "feishu_rag.ingest.extract_sections",
+                    return_value=[Section(text="PDF 正文")],
+                ) as extract:
+                    self.assertTrue(index_file(path, root, store, enable_ocr=False))
+                    self.assertFalse(index_file(path, root, store, enable_ocr=False))
+                    self.assertTrue(index_file(path, root, store, enable_ocr=True))
+                    self.assertFalse(index_file(path, root, store, enable_ocr=True))
+
+                self.assertEqual(extract.call_count, 2)
+                self.assertEqual(
+                    [call.kwargs["enable_ocr"] for call in extract.call_args_list],
+                    [False, True],
+                )
+            finally:
+                store.close()
+
+    def test_non_pdf_ocr_mode_change_keeps_file_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "policy.txt"
+            path.write_text("同一份文本内容", encoding="utf-8")
+            store = IndexStore(root / "rag.sqlite3")
+            try:
+                with patch(
+                    "feishu_rag.ingest.extract_sections",
+                    return_value=[Section(text="同一份文本内容")],
+                ) as extract:
+                    self.assertTrue(index_file(path, root, store, enable_ocr=False))
+                    self.assertFalse(index_file(path, root, store, enable_ocr=True))
+
+                self.assertEqual(extract.call_count, 1)
+            finally:
+                store.close()
+
     def test_index_file_can_use_semantic_planner_metadata(self):
         class Planner:
             def plan(self, units):

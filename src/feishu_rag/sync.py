@@ -147,6 +147,7 @@ def sync_wiki_space(
     semantic_planner: SemanticPlanner | None = None,
     chunk_strategy_version: str = "local-v1",
     chunk_model: str = "",
+    enable_ocr: bool = True,
 ) -> SyncResult:
     nodes_seen = indexed = skipped = 0
     pending_parents: list[str | None] = [None]
@@ -173,9 +174,9 @@ def sync_wiki_space(
                 object_type = node.get("obj_type")
                 if not isinstance(object_type, str) or not object_type.strip():
                     raise FeishuSyncError("飞书知识库节点缺少有效 obj_type")
-                has_child = node.get("has_child", False)
+                has_child = node.get("has_child")
                 if not isinstance(has_child, bool):
-                    raise FeishuSyncError("飞书知识库节点 has_child 不是布尔值")
+                    raise FeishuSyncError("飞书知识库节点缺少有效 has_child")
                 object_token = node.get("obj_token") or node.get("document_id")
                 if not isinstance(object_token, str) or not object_token.strip():
                     raise FeishuSyncError("飞书知识库节点缺少有效 object_token")
@@ -199,8 +200,9 @@ def sync_wiki_space(
                     source_id = f"feishu:{space_id}:{node_token}"
                     raw_file = client.download_file(object_token)
                     content_checksum = hashlib.sha256(raw_file).hexdigest()
+                    ocr_cache_mode = str(enable_ocr).lower() if suffix == ".pdf" else "na"
                     checksum = hashlib.sha256(
-                        f"{content_checksum}:{chunk_strategy_version}:{chunk_model}".encode("utf-8")
+                        f"{content_checksum}:{chunk_strategy_version}:{chunk_model}:ocr={ocr_cache_mode}".encode("utf-8")
                     ).hexdigest()
                     if store.document_checksum(source_id) == checksum:
                         retained_source_ids.add(source_id)
@@ -209,7 +211,7 @@ def sync_wiki_space(
                     with tempfile.TemporaryDirectory() as tmp:
                         downloaded = Path(tmp) / f"downloaded{suffix}"
                         downloaded.write_bytes(raw_file)
-                        sections = extract_sections(downloaded)
+                        sections = extract_sections(downloaded, enable_ocr=enable_ocr)
                     try:
                         chunks = _hybrid_chunks(sections, source_id, title, max_chars, semantic_planner)
                     except Exception as exc:
@@ -297,6 +299,7 @@ def main() -> None:
             client,
             store,
             max_chars=args.max_chars,
+            enable_ocr=settings.rag_enable_ocr,
             semantic_planner=semantic_planner,
             chunk_strategy_version=settings.rag_chunk_strategy_version,
             chunk_model=settings.deepseek_chunk_model if semantic_planner else "",

@@ -148,13 +148,16 @@ def index_file(
     chunk_strategy_version: str = "local-v1",
     chunk_model: str = "",
 ) -> bool:
-    sections = extract_sections(path, enable_ocr=enable_ocr)
     source_id = path.relative_to(root).as_posix()
     title = path.stem
     content_checksum = hashlib.sha256(path.read_bytes()).hexdigest()
-    checksum = hashlib.sha256(f"{content_checksum}:{chunk_strategy_version}:{chunk_model}".encode("utf-8")).hexdigest()
+    ocr_cache_mode = str(enable_ocr).lower() if path.suffix.lower() == ".pdf" else "na"
+    checksum = hashlib.sha256(
+        f"{content_checksum}:{chunk_strategy_version}:{chunk_model}:ocr={ocr_cache_mode}".encode("utf-8")
+    ).hexdigest()
     if store.document_checksum(source_id) == checksum:
         return False
+    sections = extract_sections(path, enable_ocr=enable_ocr)
     overlap = max(0, min(120, max_chars // 5))
 
     def local_chunks() -> list:

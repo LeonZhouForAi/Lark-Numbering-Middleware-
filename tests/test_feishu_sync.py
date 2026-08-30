@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from feishu_rag.logging_utils import configure_logging
-from feishu_rag.ingest import index_file
+from feishu_rag.ingest import Section, index_file
 from feishu_rag.store import IndexStore
 from feishu_rag import sync as sync_module
 from feishu_rag.sync import SyncResult, sync_wiki_space
@@ -23,8 +23,20 @@ class FakeFeishuClient:
         return {
             "data": {
                 "items": [
-                    {"node_token": "node-1", "obj_token": "doc-1", "obj_type": "docx", "title": "财务报销制度"},
-                    {"node_token": "node-file", "obj_token": "file-1", "obj_type": "file", "title": "流程图.xlsx"},
+                    {
+                        "node_token": "node-1",
+                        "obj_token": "doc-1",
+                        "obj_type": "docx",
+                        "title": "财务报销制度",
+                        "has_child": False,
+                    },
+                    {
+                        "node_token": "node-file",
+                        "obj_token": "file-1",
+                        "obj_type": "file",
+                        "title": "流程图.xlsx",
+                        "has_child": False,
+                    },
                 ],
                 "has_more": False,
             }
@@ -117,6 +129,7 @@ class StaticResponseFeishuClient:
 class MutableFileFeishuClient:
     def __init__(self):
         self.content = "有效附件内容。".encode("utf-8")
+        self.title = "附件.txt"
 
     def list_wiki_nodes(self, space_id, page_token=None, page_size=50, parent_node_token=None):
         return {
@@ -126,7 +139,8 @@ class MutableFileFeishuClient:
                         "node_token": "file-node",
                         "obj_token": "file-token",
                         "obj_type": "file",
-                        "title": "附件.txt",
+                        "title": self.title,
+                        "has_child": False,
                     }
                 ],
                 "has_more": False,
@@ -160,6 +174,7 @@ class UnsupportedParentFeishuClient:
                     "obj_token": "child-doc",
                     "obj_type": "docx",
                     "title": "可同步子文档",
+                    "has_child": False,
                 }
             ]
         return {"data": {"items": items, "has_more": False}}
@@ -182,6 +197,7 @@ class PaginationFailureClient:
                             "obj_token": "new-doc",
                             "obj_type": "docx",
                             "title": "新文档",
+                            "has_child": False,
                         }
                     ],
                     "has_more": True,
@@ -521,6 +537,23 @@ class FeishuSyncTests(unittest.TestCase):
             }
         )
 
+    def test_missing_has_child_does_not_prune_existing_documents(self):
+        self._assert_invalid_snapshot_does_not_prune(
+            {
+                "data": {
+                    "items": [
+                        {
+                            "node_token": "missing-child-node",
+                            "obj_token": "doc-1",
+                            "obj_type": "docx",
+                            "title": "缺少子节点标记",
+                        }
+                    ],
+                    "has_more": False,
+                }
+            }
+        )
+
     def test_malformed_duplicate_node_is_validated_before_deduplication(self):
         self._assert_invalid_snapshot_does_not_prune(
             {
@@ -679,6 +712,69 @@ class FeishuSyncTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_sync_passes_disabled_ocr_to_attachment_extraction(self):
+        client = MutableFileFeishuClient()
+        client.title = "扫描附件.pdf"
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                with patch(
+                    "feishu_rag.sync.extract_sections",
+                    return_value=[Section(text="无需 OCR 的附件内容。")],
+                ) as extract:
+                    result = sync_wiki_space("space-1", client, store, enable_ocr=False)
+
+                self.assertEqual(result.indexed, 1)
+                extract.assert_called_once()
+                self.assertFalse(extract.call_args.kwargs["enable_ocr"])
+            finally:
+                store.close()
+
+    def test_pdf_ocr_mode_change_reindexes_attachment_and_same_mode_skips(self):
+        client = MutableFileFeishuClient()
+        client.title = "扫描附件.pdf"
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                with patch(
+                    "feishu_rag.sync.extract_sections",
+                    return_value=[Section(text="PDF 附件内容。")],
+                ) as extract:
+                    first = sync_wiki_space("space-1", client, store, enable_ocr=False)
+                    repeated_false = sync_wiki_space("space-1", client, store, enable_ocr=False)
+                    changed = sync_wiki_space("space-1", client, store, enable_ocr=True)
+                    repeated_true = sync_wiki_space("space-1", client, store, enable_ocr=True)
+
+                self.assertEqual(first.indexed, 1)
+                self.assertEqual(repeated_false.indexed, 0)
+                self.assertEqual(changed.indexed, 1)
+                self.assertEqual(repeated_true.indexed, 0)
+                self.assertEqual(extract.call_count, 2)
+                self.assertEqual(
+                    [call.kwargs["enable_ocr"] for call in extract.call_args_list],
+                    [False, True],
+                )
+            finally:
+                store.close()
+
+    def test_non_pdf_ocr_mode_change_keeps_attachment_cache(self):
+        client = MutableFileFeishuClient()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                with patch(
+                    "feishu_rag.sync.extract_sections",
+                    return_value=[Section(text="文本附件内容。")],
+                ) as extract:
+                    first = sync_wiki_space("space-1", client, store, enable_ocr=False)
+                    changed = sync_wiki_space("space-1", client, store, enable_ocr=True)
+
+                self.assertEqual(first.indexed, 1)
+                self.assertEqual(changed.indexed, 0)
+                self.assertEqual(extract.call_count, 1)
+            finally:
+                store.close()
+
     def test_cli_output_and_completion_log_include_deleted_count(self):
         store = MagicMock()
         settings = MagicMock(
@@ -686,6 +782,7 @@ class FeishuSyncTests(unittest.TestCase):
             feishu_app_id="app-id",
             feishu_app_secret="app-secret",
             rag_semantic_chunking=False,
+            rag_enable_ocr=False,
             rag_chunk_strategy_version="local-v1",
             deepseek_chunk_model="",
             log_level="INFO",
@@ -696,7 +793,7 @@ class FeishuSyncTests(unittest.TestCase):
             patch("feishu_rag.sync.configure_logging"),
             patch("feishu_rag.sync.FeishuClient"),
             patch("feishu_rag.sync.IndexStore", return_value=store),
-            patch("feishu_rag.sync.sync_wiki_space", return_value=SyncResult(3, 2, 1, 4)),
+            patch("feishu_rag.sync.sync_wiki_space", return_value=SyncResult(3, 2, 1, 4)) as sync,
             patch.object(sys, "argv", ["feishu-rag-sync"]),
             self.assertLogs("feishu_rag.sync", level="INFO") as logs,
             redirect_stdout(stdout),
@@ -705,6 +802,7 @@ class FeishuSyncTests(unittest.TestCase):
 
         self.assertIn("deleted=4", stdout.getvalue())
         self.assertIn("deleted=4", "\n".join(logs.output))
+        self.assertFalse(sync.call_args.kwargs["enable_ocr"])
         store.close.assert_called_once_with()
 
     def test_sync_does_not_reparse_unchanged_file_nodes(self):
