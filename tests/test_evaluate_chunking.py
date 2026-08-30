@@ -96,6 +96,7 @@ def test_non_retrieval_cli_passes_settings_min_relevance_everywhere(monkeypatch)
         deepseek_model="model",
         rag_top_k=5,
         rag_min_relevance=0.73,
+        rag_question_max_chars=321,
     )
 
     class FakeSettings:
@@ -104,8 +105,8 @@ def test_non_retrieval_cli_passes_settings_min_relevance_everywhere(monkeypatch)
             return settings
 
     class FakeRagService:
-        def __init__(self, store, llm, *, top_k, min_relevance):
-            seen["rag"] = (top_k, min_relevance)
+        def __init__(self, store, llm, *, top_k, min_relevance, question_max_chars):
+            seen["rag"] = (top_k, min_relevance, question_max_chars)
 
     class FakeSummary:
         def to_report(self):
@@ -123,7 +124,7 @@ def test_non_retrieval_cli_passes_settings_min_relevance_everywhere(monkeypatch)
     monkeypatch.setattr(evaluation_script, "evaluate_cases", fake_evaluate_cases)
 
     assert main([]) == 0
-    assert seen == {"rag": (5, 0.73), "evaluation": (5, 0.73)}
+    assert seen == {"rag": (5, 0.73, 321), "evaluation": (5, 0.73)}
 
 
 def test_explicit_cli_min_relevance_overrides_settings_everywhere(monkeypatch) -> None:
@@ -134,6 +135,7 @@ def test_explicit_cli_min_relevance_overrides_settings_everywhere(monkeypatch) -
         deepseek_model="model",
         rag_top_k=5,
         rag_min_relevance=0.73,
+        rag_question_max_chars=321,
     )
 
     class FakeSettings:
@@ -142,10 +144,10 @@ def test_explicit_cli_min_relevance_overrides_settings_everywhere(monkeypatch) -
             return settings
 
     class FakeRagService:
-        def __init__(self, store, llm, *, top_k, min_relevance):
+        def __init__(self, store, llm, *, top_k, min_relevance, question_max_chars):
             self.top_k = top_k
             self.min_relevance = min_relevance
-            seen["rag"] = min_relevance
+            seen["rag"] = (min_relevance, question_max_chars)
 
         def answer(self, question):
             return RagAnswer("根据制度回答", [])
@@ -171,11 +173,11 @@ def test_explicit_cli_min_relevance_overrides_settings_everywhere(monkeypatch) -
     monkeypatch.setattr(evaluation_script, "evaluate_questions", fake_evaluate_questions)
 
     assert main(["--min-relevance", "0.61"]) == 0
-    assert seen == {"rag": 0.61, "evaluation": 0.61}
+    assert seen == {"rag": (0.61, 321), "evaluation": 0.61}
 
     seen.clear()
     assert main(["--question", "报销要求", "--min-relevance", "0.61"]) == 0
-    assert seen == {"rag": 0.61, "legacy": 0.61}
+    assert seen == {"rag": (0.61, 321), "legacy": 0.61}
 
 
 def test_thresholds_return_failure_when_summary_does_not_meet_gate() -> None:

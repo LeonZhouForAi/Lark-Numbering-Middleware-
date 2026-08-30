@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from feishu_rag.llm import DeepSeekClient, DeepSeekError
@@ -26,6 +28,15 @@ def test_complete_json_requests_json_object_and_parses_response() -> None:
     assert transport.payload["response_format"] == {"type": "json_object"}
     assert transport.payload["temperature"] == 0
     assert transport.payload["thinking"] == {"type": "disabled"}
+
+
+def test_complete_json_accepts_keyword_only_purpose_defaulting_to_chunking() -> None:
+    client = DeepSeekClient("secret", transport=FakeTransport())
+
+    assert client.complete_json("system", "user", purpose="answer") == {"groups": []}
+    parameter = inspect.signature(DeepSeekClient.complete_json).parameters["purpose"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default == "chunking"
 
 
 def test_complete_json_rejects_invalid_json() -> None:

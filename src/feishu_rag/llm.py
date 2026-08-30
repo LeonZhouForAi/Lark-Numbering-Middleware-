@@ -93,7 +93,13 @@ class DeepSeekClient:
             }
         )
 
-    def complete_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    def complete_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        purpose: str = "chunking",
+    ) -> dict[str, Any]:
         content = self._chat_completion(
             {
                 "model": self.model,

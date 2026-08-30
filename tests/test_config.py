@@ -68,6 +68,24 @@ class SettingsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, "RAG_MIN_RELEVANCE"):
                     Settings.from_env()
 
+    def test_question_max_chars_defaults_to_500(self):
+        with patch.dict(os.environ, self._base_env(), clear=True):
+            self.assertEqual(Settings.from_env().rag_question_max_chars, 500)
+
+    def test_question_max_chars_accepts_positive_integer(self):
+        env = self._base_env()
+        env["RAG_QUESTION_MAX_CHARS"] = "321"
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(Settings.from_env().rag_question_max_chars, 321)
+
+    def test_question_max_chars_must_be_strictly_positive_integer(self):
+        for value in ("0", "-1", "1.5", "not-an-integer", ""):
+            env = self._base_env()
+            env["RAG_QUESTION_MAX_CHARS"] = value
+            with self.subTest(value=value), patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(ConfigError, "RAG_QUESTION_MAX_CHARS"):
+                    Settings.from_env()
+
 
 if __name__ == "__main__":
     unittest.main()

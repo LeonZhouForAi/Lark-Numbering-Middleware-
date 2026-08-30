@@ -21,9 +21,11 @@ class FakePlanner:
 class RecordingLLM:
     def __init__(self):
         self.prompts = []
+        self.purposes = []
 
-    def complete_json(self, system_prompt, user_prompt):
+    def complete_json(self, system_prompt, user_prompt, *, purpose="chunking"):
         self.prompts.append(user_prompt)
+        self.purposes.append(purpose)
         units = [
             AtomicUnit(item["id"], item["text"])
             for item in (__import__("json").loads(line) for line in user_prompt.splitlines()[1:])
@@ -103,3 +105,4 @@ def test_deepseek_planner_splits_long_input_into_bounded_batches() -> None:
 
     assert len(llm.prompts) > 1
     assert len(result["groups"]) == len(llm.prompts)
+    assert llm.purposes == ["chunking"] * len(llm.prompts)

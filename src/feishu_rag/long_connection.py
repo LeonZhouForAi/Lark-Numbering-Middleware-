@@ -64,6 +64,7 @@ def run() -> None:
         DeepSeekClient(settings.deepseek_api_key, settings.deepseek_base_url, settings.deepseek_model),
         top_k=settings.rag_top_k,
         min_relevance=settings.rag_min_relevance,
+        question_max_chars=settings.rag_question_max_chars,
     )
     feishu = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
 

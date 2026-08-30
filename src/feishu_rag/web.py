@@ -102,6 +102,7 @@ def create_app(
                 llm,
                 top_k=settings.rag_top_k,
                 min_relevance=settings.rag_min_relevance,
+                question_max_chars=settings.rag_question_max_chars,
             )
             feishu = feishu or FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
         except ConfigError as exc:

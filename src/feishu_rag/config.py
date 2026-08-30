@@ -43,6 +43,7 @@ class Settings:
     rag_db_path: str = "./data/rag.sqlite3"
     rag_top_k: int = 6
     rag_min_relevance: float = 0.42
+    rag_question_max_chars: int = 500
     rag_max_chars: int = 900
     rag_enable_ocr: bool = True
     rag_semantic_chunking: bool = True
@@ -63,10 +64,16 @@ class Settings:
         env = os.environ if environ is None else environ
         try:
             top_k = int(env.get("RAG_TOP_K", "6"))
+            question_max_chars = int(env.get("RAG_QUESTION_MAX_CHARS", "500"))
             max_chars = int(env.get("RAG_MAX_CHARS", "900"))
             chunk_batch_chars = int(env.get("DEEPSEEK_CHUNK_BATCH_CHARS", "12000"))
         except ValueError as exc:
-            raise ConfigError("RAG_TOP_K、RAG_MAX_CHARS 和 DEEPSEEK_CHUNK_BATCH_CHARS 必须是整数") from exc
+            raise ConfigError(
+                "RAG_TOP_K、RAG_QUESTION_MAX_CHARS、RAG_MAX_CHARS 和 "
+                "DEEPSEEK_CHUNK_BATCH_CHARS 必须是整数"
+            ) from exc
+        if question_max_chars < 1:
+            raise ConfigError("RAG_QUESTION_MAX_CHARS 必须是正整数")
         if top_k < 1 or max_chars < 100:
             raise ConfigError("RAG_TOP_K 必须大于 0，RAG_MAX_CHARS 必须不小于 100")
         if chunk_batch_chars < 2000:
@@ -92,6 +99,7 @@ class Settings:
             rag_db_path=env.get("RAG_DB_PATH", "./data/rag.sqlite3").strip(),
             rag_top_k=top_k,
             rag_min_relevance=min_relevance,
+            rag_question_max_chars=question_max_chars,
             rag_max_chars=max_chars,
             rag_enable_ocr=_as_bool(env.get("RAG_ENABLE_OCR", "true"), "RAG_ENABLE_OCR"),
             rag_semantic_chunking=_as_bool(
@@ -112,6 +120,7 @@ class Settings:
             f"feishu_space_id={self.feishu_space_id!r}, "
             f"rag_db_path={self.rag_db_path!r}, "
             f"rag_top_k={self.rag_top_k!r}, rag_min_relevance={self.rag_min_relevance!r}, "
+            f"rag_question_max_chars={self.rag_question_max_chars!r}, "
             f"rag_max_chars={self.rag_max_chars!r}, "
             f"rag_semantic_chunking={self.rag_semantic_chunking!r}, "
             f"deepseek_chunk_model={self.deepseek_chunk_model!r}, "

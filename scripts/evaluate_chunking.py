@@ -117,6 +117,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ),
                     top_k=settings.rag_top_k,
                     min_relevance=min_relevance,
+                    question_max_chars=settings.rag_question_max_chars,
                 )
                 report = evaluate_questions(store, rag, args.questions)
             print(json.dumps(report, ensure_ascii=False))
@@ -142,6 +143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 top_k=top_k,
                 min_relevance=min_relevance,
+                question_max_chars=settings.rag_question_max_chars,
             )
         report = evaluate_cases(
             store,
