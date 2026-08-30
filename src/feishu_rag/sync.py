@@ -31,6 +31,24 @@ class SyncResult:
     nodes_seen: int
     indexed: int
     skipped: int
+    deleted: int = 0
+
+
+class FeishuSyncError(RuntimeError):
+    """飞书知识库分页响应不完整，无法安全完成同步。"""
+
+
+def _wiki_page_data(response: Any) -> dict[str, Any]:
+    if not isinstance(response, dict):
+        raise FeishuSyncError("飞书知识库列表响应不是对象")
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise FeishuSyncError("飞书知识库列表响应缺少有效 data")
+    if not isinstance(data.get("items"), list):
+        raise FeishuSyncError("飞书知识库列表响应缺少有效 items")
+    if not isinstance(data.get("has_more"), bool):
+        raise FeishuSyncError("飞书知识库列表响应缺少有效 has_more")
+    return data
 
 
 def _response_data(response: dict[str, Any]) -> dict[str, Any]:
@@ -48,6 +66,30 @@ def _extract_text(response: dict[str, Any]) -> str:
     if not isinstance(candidate, str):
         return ""
     return html.unescape(re.sub(r"<[^>]+>", " ", candidate)).strip()
+
+
+def _extract_sync_text(response: Any) -> str:
+    if not isinstance(response, dict):
+        raise FeishuSyncError("飞书文档正文响应不是对象")
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise FeishuSyncError("飞书文档正文响应缺少有效 data")
+    if "content" in data:
+        candidate = data["content"]
+    else:
+        document = data.get("document")
+        if not isinstance(document, dict) or "content" not in document:
+            raise FeishuSyncError("飞书文档正文响应缺少 content")
+        candidate = document["content"]
+    if isinstance(candidate, list):
+        for item in candidate:
+            if isinstance(item, str):
+                continue
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                raise FeishuSyncError("飞书文档正文 content 列表项无效")
+    elif not isinstance(candidate, str):
+        raise FeishuSyncError("飞书文档正文 content 类型无效")
+    return _extract_text({"data": {"content": candidate}})
 
 
 def _sections_to_units(sections: list[Section], source_id: str, max_unit_chars: int = 600) -> list[AtomicUnit]:
@@ -108,51 +150,60 @@ def sync_wiki_space(
 ) -> SyncResult:
     nodes_seen = indexed = skipped = 0
     pending_parents: list[str | None] = [None]
-    seen_nodes: set[str] = set()
+    seen_nodes: dict[str, tuple[str, str, bool, str]] = {}
+    retained_source_ids: set[str] = set()
     while pending_parents:
         parent_node_token = pending_parents.pop()
         page_token: str | None = None
+        seen_page_tokens: set[str] = set()
         while True:
             response = client.list_wiki_nodes(
                 space_id,
                 page_token=page_token,
                 parent_node_token=parent_node_token,
             )
-            data = _response_data(response)
-            items = data.get("items", [])
-            if not isinstance(items, list):
-                items = []
+            data = _wiki_page_data(response)
+            items = data["items"]
             for node in items:
                 if not isinstance(node, dict):
-                    skipped += 1
-                    continue
+                    raise FeishuSyncError("飞书知识库节点不是对象")
                 node_token = node.get("node_token")
-                if not isinstance(node_token, str) or node_token in seen_nodes:
-                    continue
-                seen_nodes.add(node_token)
-                nodes_seen += 1
-                if node.get("has_child"):
-                    pending_parents.append(node_token)
-                    skipped += 1
-                    continue
-                object_type = str(node.get("obj_type", "")).lower()
+                if not isinstance(node_token, str) or not node_token.strip():
+                    raise FeishuSyncError("飞书知识库节点缺少有效 node_token")
+                object_type = node.get("obj_type")
+                if not isinstance(object_type, str) or not object_type.strip():
+                    raise FeishuSyncError("飞书知识库节点缺少有效 obj_type")
+                has_child = node.get("has_child", False)
+                if not isinstance(has_child, bool):
+                    raise FeishuSyncError("飞书知识库节点 has_child 不是布尔值")
                 object_token = node.get("obj_token") or node.get("document_id")
+                if not isinstance(object_token, str) or not object_token.strip():
+                    raise FeishuSyncError("飞书知识库节点缺少有效 object_token")
+                object_type = object_type.strip().lower()
                 title = str(node.get("title") or "未命名飞书文档")
-                if not isinstance(object_token, str):
-                    skipped += 1
+                fingerprint = (object_type, object_token, has_child, title)
+                previous_fingerprint = seen_nodes.get(node_token)
+                if previous_fingerprint is not None:
+                    if previous_fingerprint != fingerprint:
+                        raise FeishuSyncError("飞书知识库重复 node_token 的节点信息冲突")
                     continue
+                seen_nodes[node_token] = fingerprint
+                nodes_seen += 1
+                if has_child:
+                    pending_parents.append(node_token)
                 if object_type == "file":
                     suffix = Path(title).suffix.lower()
                     if suffix not in SUPPORTED_SUFFIXES:
                         skipped += 1
                         continue
-                    raw_file = client.download_file(object_token)
                     source_id = f"feishu:{space_id}:{node_token}"
+                    raw_file = client.download_file(object_token)
                     content_checksum = hashlib.sha256(raw_file).hexdigest()
                     checksum = hashlib.sha256(
                         f"{content_checksum}:{chunk_strategy_version}:{chunk_model}".encode("utf-8")
                     ).hexdigest()
                     if store.document_checksum(source_id) == checksum:
+                        retained_source_ids.add(source_id)
                         skipped += 1
                         continue
                     with tempfile.TemporaryDirectory() as tmp:
@@ -172,21 +223,23 @@ def sync_wiki_space(
                         skipped += 1
                         continue
                     store.upsert_document(source_id, title, f"wiki/{space_id}/{node_token}", checksum, chunks)
+                    retained_source_ids.add(source_id)
                     indexed += 1
                     continue
                 if object_type not in {"docx", "doc"}:
                     skipped += 1
                     continue
-                text = _extract_text(client.get_document_raw_content(object_token))
+                source_id = f"feishu:{space_id}:{node_token}"
+                text = _extract_sync_text(client.get_document_raw_content(object_token))
                 if not text:
                     skipped += 1
                     continue
-                source_id = f"feishu:{space_id}:{node_token}"
                 content_checksum = hashlib.sha256(text.encode("utf-8")).hexdigest()
                 checksum = hashlib.sha256(
                     f"{content_checksum}:{chunk_strategy_version}:{chunk_model}".encode("utf-8")
                 ).hexdigest()
                 if store.document_checksum(source_id) == checksum:
+                    retained_source_ids.add(source_id)
                     skipped += 1
                     continue
                 sections = [Section(text=text)]
@@ -203,13 +256,20 @@ def sync_wiki_space(
                     skipped += 1
                     continue
                 store.upsert_document(source_id, title, f"wiki/{space_id}/{node_token}", checksum, chunks)
+                retained_source_ids.add(source_id)
                 indexed += 1
             has_more = bool(data.get("has_more"))
-            next_token = data.get("page_token")
-            if not has_more or not isinstance(next_token, str) or not next_token or next_token == page_token:
+            if not has_more:
                 break
+            next_token = data.get("page_token")
+            if not isinstance(next_token, str) or not next_token.strip():
+                raise FeishuSyncError("has_more=true 时缺少有效 page_token")
+            if next_token in seen_page_tokens:
+                raise FeishuSyncError("has_more=true 时 page_token 重复")
+            seen_page_tokens.add(next_token)
             page_token = next_token
-    return SyncResult(nodes_seen, indexed, skipped)
+    deleted = store.prune_documents(f"feishu:{space_id}:", retained_source_ids)
+    return SyncResult(nodes_seen, indexed, skipped, deleted)
 
 
 def main() -> None:
@@ -242,12 +302,16 @@ def main() -> None:
             chunk_model=settings.deepseek_chunk_model if semantic_planner else "",
         )
         logger.info(
-            "sync_completed nodes_seen=%d indexed=%d skipped=%d",
+            "sync_completed nodes_seen=%d indexed=%d skipped=%d deleted=%d",
             result.nodes_seen,
             result.indexed,
             result.skipped,
+            result.deleted,
         )
-        print(f"nodes_seen={result.nodes_seen} indexed={result.indexed} skipped={result.skipped}")
+        print(
+            f"nodes_seen={result.nodes_seen} indexed={result.indexed} "
+            f"skipped={result.skipped} deleted={result.deleted}"
+        )
     finally:
         store.close()
 
