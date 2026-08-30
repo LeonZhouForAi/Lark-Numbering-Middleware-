@@ -94,7 +94,7 @@ def semantic_chunks(
             section=group_units[0].section,
         )
         chunks.extend(
-            Chunk(chunk.id, chunk.source_id, chunk.title, chunk.content, chunk.page, chunk.section, search_text)
+            Chunk(chunk.id, source_id, chunk.title, chunk.content, chunk.page, chunk.section, search_text)
             for chunk in base_chunks
         )
     return chunks
