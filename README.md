@@ -66,7 +66,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_CHUNK_MODEL=deepseek-v4-flash
 DEEPSEEK_CHUNK_BATCH_CHARS=12000
 RAG_SEMANTIC_CHUNKING=true
-RAG_CHUNK_STRATEGY_VERSION=hybrid-v1
+RAG_CHUNK_STRATEGY_VERSION=hybrid-v3
 ```
 
 DeepSeek 使用 OpenAI 兼容的 `/chat/completions` 接口，模型和价格以官方文档为准：
@@ -101,7 +101,7 @@ uvicorn feishu_rag.web:app --host 0.0.0.0 --port 8000
 python scripts/smoke_test.py
 ```
 
-生产环境使用 Docker：
+Docker 宿主机端口发布绑定地址由 `RAG_BIND_HOST` 控制，默认仅发布到 `127.0.0.1:8010`。手工运行 Uvicorn 仍监听 `0.0.0.0:8000`。生产环境使用 Docker：
 
 ```bash
 cp .env.example .env
@@ -116,7 +116,7 @@ docker compose ps
 
 飞书 Webhook 必须通过 HTTPS 暴露。建议在服务前放置公司网关、Caddy 或 Nginx，只开放 443。容器内部使用 8000，Docker 默认映射为服务器的 8010 端口（可通过 `RAG_HOST_PORT` 修改）。
 
-长连接模式由 `rag-events` 服务运行：在飞书后台选择“使用长连接接收事件”，订阅 `im.message.receive_v1` 后，该服务会主动连接飞书，不需要公网域名或开放 443 端口。
+长连接模式由 `rag-events` 服务运行：在飞书后台选择“使用长连接接收事件”，订阅 `im.message.receive_v1` 后，该服务会主动连接飞书，不需要公网域名或开放 443 端口，也无需将 8010 端口暴露到公网。
 
 ### 从飞书知识库同步
 
