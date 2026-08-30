@@ -23,6 +23,10 @@ class UnsupportedFileError(ValueError):
     """文件格式需要先转换。"""
 
 
+class DocumentExtractionError(RuntimeError):
+    """文档内容无法完整抽取。"""
+
+
 @dataclass(frozen=True)
 class Section:
     text: str
@@ -33,30 +37,28 @@ class Section:
 SUPPORTED_SUFFIXES = {".txt", ".md", ".markdown", ".pdf", ".docx"}
 
 
-def _read_pdf_ocr(path: Path) -> list[Section]:
-    """在服务器安装 OCR 依赖时识别扫描型 PDF；依赖缺失则安全返回空列表。"""
-
+def _ocr_pdf_page(path: Path, page_no: int) -> str | None:
+    """识别 PDF 指定页；依赖、渲染或识别失败时显式报错。"""
     try:
         import pytesseract
         from pdf2image import convert_from_path
-    except ImportError:
-        return []
+    except ImportError as exc:
+        raise DocumentExtractionError("PDF OCR 依赖不可用") from exc
     try:
-        images = convert_from_path(str(path), dpi=220)
+        images = convert_from_path(str(path), first_page=page_no, last_page=page_no, dpi=220)
+    except Exception as exc:
+        raise DocumentExtractionError(f"PDF 第 {page_no} 页渲染失败") from exc
+    if not images:
+        raise DocumentExtractionError(f"PDF 第 {page_no} 页渲染失败")
+    try:
+        text = pytesseract.image_to_string(images[0], lang="chi_sim")
     except Exception:
-        return []
-    sections: list[Section] = []
-    for page_number, image in enumerate(images, start=1):
         try:
-            text = pytesseract.image_to_string(image, lang="chi_sim+eng").strip()
-        except Exception:
-            try:
-                text = pytesseract.image_to_string(image, lang="eng").strip()
-            except Exception:
-                text = ""
-        if text:
-            sections.append(Section(text=text, page=page_number))
-    return sections
+            text = pytesseract.image_to_string(images[0], lang="eng")
+        except Exception as exc:
+            raise DocumentExtractionError(f"PDF 第 {page_no} 页 OCR 识别失败") from exc
+    text = text.strip()
+    return text or None
 
 
 def _read_pdf(path: Path, enable_ocr: bool = True) -> list[Section]:
@@ -68,16 +70,54 @@ def _read_pdf(path: Path, enable_ocr: bool = True) -> list[Section]:
         text = (page.extract_text() or "").strip()
         if text:
             sections.append(Section(text=text, page=page_number))
-    if sections or not enable_ocr:
-        return sections
-    return _read_pdf_ocr(path)
+        elif enable_ocr:
+            ocr_text = _ocr_pdf_page(path, page_number)
+            if ocr_text:
+                sections.append(Section(text=ocr_text, page=page_number))
+    return sections
 
 
 def _read_docx(path: Path) -> list[Section]:
     from docx import Document
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
 
     document = Document(str(path))
-    text = "\n\n".join(p.text.strip() for p in document.paragraphs if p.text.strip())
+
+    def table_rows(table: Table, seen_cells: set[object]) -> list[str]:
+        rows: list[str] = []
+        for row in table.rows:
+            cells: list[str] = []
+            for cell in row.cells:
+                cell_element = cell._tc
+                if cell_element in seen_cells:
+                    continue
+                seen_cells.add(cell_element)
+                cell_text = ""
+                for cell_content in cell.iter_inner_content():
+                    if isinstance(cell_content, Paragraph):
+                        text = cell_content.text.strip()
+                        if text:
+                            cell_text = f"{cell_text} {text}".strip()
+                    elif isinstance(cell_content, Table):
+                        nested_rows = table_rows(cell_content, seen_cells)
+                        if nested_rows:
+                            nested_text = " / ".join(nested_rows)
+                            cell_text = f"{cell_text} / {nested_text}".strip(" / ")
+                cells.append(cell_text)
+            if any(cells):
+                rows.append(" | ".join(cells))
+        return rows
+
+    parts: list[str] = []
+    for content in document.iter_inner_content():
+        if isinstance(content, Paragraph):
+            text = content.text.strip()
+            if text:
+                parts.append(text)
+        elif isinstance(content, Table):
+            parts.extend(table_rows(content, set()))
+    text = "\n\n".join(parts)
     return [Section(text=text)] if text else []
 
 
