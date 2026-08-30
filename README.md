@@ -45,7 +45,7 @@ RAGcode/
 
 ### 本地测试
 
-需要 Python 3.11+。真实密钥只放在本机或服务器的 `.env`，不要提交 Git。
+需要 Python 3.14+。真实密钥只放在本机或服务器的 `.env`，不要提交 Git。
 
 ```bash
 python3 -m venv .venv

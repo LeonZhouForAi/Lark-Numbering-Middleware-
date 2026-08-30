@@ -6,7 +6,7 @@
 
 **架构：** 服务器先把文档拆成带稳定编号的原子段落，DeepSeek 仅返回段落分组和检索元数据，程序使用原始段落重建切片。SQLite 用独立 `search_text` 字段检索模型生成的标题、关键词和摘要；最终回答只使用原始 `content`。模型异常时回退现有本地切片。
 
-**技术栈：** Python 3.11、SQLite、FastAPI、DeepSeek Chat Completions JSON Output、pytest、Docker Compose、systemd timer。
+**技术栈：** Python 3.14、SQLite、FastAPI、DeepSeek Chat Completions JSON Output、pytest、Docker Compose、systemd timer。
 
 **版本控制说明：** 当前目录不是 Git 仓库。每个任务结束时运行完整测试并生成带版本号的部署包；部署前备份 SQLite 数据库。不得把 `.env`、文档或数据库放入部署包。
 
