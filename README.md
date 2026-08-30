@@ -1,6 +1,6 @@
 # 飞书 + DeepSeek RAG 机器人
 
-这是一个部署在公司 Ubuntu 服务器上的轻量 RAG 服务：文档先在本地解析，再由 DeepSeek 可选地优化语义切片，飞书自建应用负责接收员工问题并回复。
+这是一个面向公司 Ubuntu 服务器部署的轻量 RAG 服务：文档先在本地解析，再由 DeepSeek 可选地优化语义切片，飞书自建应用负责接收员工问题并回复。当前 v0.4.0 已完成代码与测试，尚未部署生产环境。
 
 ## 目录
 
@@ -73,6 +73,12 @@ DEEPSEEK_CHUNK_MODEL=deepseek-v4-flash
 DEEPSEEK_CHUNK_BATCH_CHARS=12000
 RAG_SEMANTIC_CHUNKING=true
 RAG_CHUNK_STRATEGY_VERSION=hybrid-v4
+RAG_MIN_RELEVANCE=0.42
+RAG_QUESTION_MAX_CHARS=500
+RAG_RATE_LIMIT_PER_MINUTE=10
+RAG_RATE_LIMIT_PER_DAY=200
+API_RETRY_MAX_ATTEMPTS=3
+API_RETRY_BASE_DELAY=0.5
 ```
 
 DeepSeek 使用 OpenAI 兼容的 `/chat/completions` 接口，模型和价格以官方文档为准：
@@ -100,7 +106,7 @@ python scripts/index_local_documents.py documents --db data/rag.sqlite3
 
 索引过程在服务器本地解析和 OCR，先按结构初切，再将文档正文按批次发送给 DeepSeek 做语义分组。模型只返回段落编号和检索元数据，程序用原文重组切片。DOCX 会按文档顺序提取父页正文、表格和嵌套可见文本；混合 PDF 仅对没有原生文本的页面逐页 OCR。重复运行同一个文件会按内容、模型和策略签名跳过，不会产生重复片段；模型失败时自动退回本地切片。
 
-飞书同步只有在整个空间成功完成完整快照后，才会清理本次快照中已失效的索引；分页异常或同步失败不会触发删除。质量可用 `scripts/evaluate_chunking.py` 配合不含制度正文的金标 JSON/报告脱敏 CLI 验收（支持 `--cases`、`--retrieval-only` 和阈值参数）。v0.3.0 当前仅完成代码与测试，尚未部署到生产环境。
+飞书同步只有在整个空间成功完成完整快照后，才会清理本次快照中已失效的索引；分页异常或同步失败不会触发删除。质量可用 `scripts/evaluate_chunking.py` 配合不含制度正文的金标 JSON/报告脱敏 CLI 验收（支持 `--cases`、`--retrieval-only` 和阈值参数）。
 
 ### 启动服务
 
@@ -134,6 +140,12 @@ docker compose ps
 python -m feishu_rag.sync --db data/rag.sqlite3
 ```
 
+查看按日期、模型和用途聚合的 Token 用量，并从命令行传入输入/输出单价：
+
+```bash
+python scripts/report_usage.py data/rag.sqlite3 --input-price 1 --output-price 2
+```
+
 你当前的三个知识库 ID 如下，可分别执行同步：
 
 ```bash
@@ -146,12 +158,17 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 
 ## 当前 RAG 行为
 
-- 先使用 SQLite 本地关键词检索，针对中文制度文档无需额外嵌入 API。
-- 命中片段会用于生成回答，但员工不会看到来源列表或 `[1]`、`[2]` 引用编号。
+- 先使用 SQLite FTS5/BM25 和字面关键词检索生成候选，再以 RRF 混排；confidence 低于 `RAG_MIN_RELEVANCE`（默认 0.42）的泛词或无关命中会被过滤。
+- 当前不使用向量数据库或外部 Embedding 服务；针对中文制度文档，检索完全在本地 SQLite 完成。
+- 回答模型只接收匿名结构化 JSON 中的原始正文，不接收标题、来源、页码或引用编号；员工不会看到来源列表或 `[1]`、`[2]` 引用编号。
+- 回答严格校验 `answer` 与 `evidence_sufficient` 字段；证据不足、来源/链接/密钥泄漏或其他危险输出均 fail-closed，返回固定提示。
 - 无命中时不会调用 DeepSeek，直接返回“知识库中暂无依据”。
 - 提示词要求模型只依据召回资料回答，不补造金额、日期、审批人或制度条款。
 - `RAG_SEMANTIC_CHUNKING=true` 时使用本地结构切片加 DeepSeek 语义分组；失败自动回退本地切片。
 - 模型生成的标题、关键词和摘要只参与检索，最终回答上下文只包含原始正文。
+- DeepSeek 的 429、5xx 和网络错误，以及飞书幂等读取请求，按有限次数重试；发送回复等非幂等写入不重试。Token usage 可用上方 `report_usage.py` 命令查看。
+- 消息去重后按用户哈希执行固定分钟/日限流（默认每分钟 10 次、每天 200 次，设为 0 可禁用）；数据库不保存原始用户 ID。
+- `RetrievalScope` 对检索提供空间过滤 seam：未指定时检索全库，指定空间集合时严格限制候选范围；后续可在此接入更细粒度 ACL。
 
 ## 密钥和数据安全
 
@@ -159,6 +176,7 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 - API Key 和 App Secret 只从环境变量读取，日志和对象 repr 不包含密钥。
 - Webhook 开启 Encrypt Key 后强制校验签名。
 - 语义切片开启时，完整文档会在索引阶段按批次发送给 DeepSeek；回答阶段只发送命中的原始片段。
+- 切片策略版本固定为 `hybrid-v4`；修改策略版本后应重新索引现有文档。
 - 当前飞书知识库按你的要求设置为企业全员可读；如果以后改为分部门权限，Webhook 需要增加按用户过滤召回结果的逻辑。
 
 ## 验收清单
@@ -169,3 +187,5 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 - 错误签名返回 HTTP 403。
 - 员工发送“报销怎么走”能收到不带来源区块的回答。
 - 缺少 API Key 时服务健康检查报配置不完整，且不会发起外部请求。
+
+v0.4.0 发布状态：代码与测试已完成，尚未部署生产；仍使用 SQLite（含 FTS5/BM25）和 `hybrid-v4`，没有引入向量数据库。
