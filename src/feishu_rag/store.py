@@ -28,8 +28,11 @@ _QUESTION_SHELLS = (
     "如何",
 )
 _GENERIC_TERMS = ("流程", "制度", "规定", "办法")
+_GENERIC_RESIDUALS = frozenset({"这", "那", "呢", "都", "是", "有", "要", "吗", "么", "的", "了"})
 _QUERY_STOP_WORDS = frozenset({"and", "or", "not", "near"})
+_FEISHU_SOURCE_RE = re.compile(r"^feishu:([^:]+):")
 _SQLITE_INT_MAX = 2**63 - 1
+_LOCK_RETRY_ATTEMPTS = 20
 
 
 def _normalize(text: str) -> str:
@@ -41,7 +44,8 @@ def _tokens(text: str, *, include_single_chinese: bool = True) -> list[str]:
     for part in _TOKEN_RE.findall(_normalize(text)):
         if re.fullmatch(r"[\u4e00-\u9fff]+", part):
             if len(part) == 1:
-                terms.append(part)
+                if include_single_chinese:
+                    terms.append(part)
             else:
                 terms.extend(part[index : index + 2] for index in range(len(part) - 1))
                 if include_single_chinese:
@@ -63,6 +67,9 @@ def _meaningful_query(query: str) -> str:
         cleaned = cleaned.replace(shell, " ")
     for generic in _GENERIC_TERMS:
         cleaned = cleaned.replace(generic, " ")
+    searchable = "".join(_TOKEN_RE.findall(cleaned))
+    if searchable and all(character in _GENERIC_RESIDUALS for character in searchable):
+        return ""
     return _normalize(cleaned)
 
 
@@ -74,6 +81,23 @@ def _core_terms(query: str) -> list[str]:
     ]
 
 
+def _execute_with_lock_retry(
+    connection: sqlite3.Connection,
+    statement: str,
+) -> sqlite3.Cursor:
+    for attempt in range(_LOCK_RETRY_ATTEMPTS):
+        try:
+            return connection.execute(statement)
+        except sqlite3.OperationalError as exc:
+            message = str(exc).casefold()
+            if not ("locked" in message or "busy" in message):
+                raise
+            if attempt == _LOCK_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(min(0.01 * (attempt + 1), 0.1))
+    raise AssertionError("unreachable")
+
+
 class IndexStore:
     """保存文档元数据和片段，并提供本地检索。"""
 
@@ -82,124 +106,171 @@ class IndexStore:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.db_path, timeout=30.0)
         self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA journal_mode = WAL")
-        self.connection.execute("PRAGMA busy_timeout = 30000")
-        self.connection.execute("PRAGMA synchronous = NORMAL")
-        self.connection.execute("PRAGMA foreign_keys = ON")
-        self._fts_available = True
-        self._initialize()
+        try:
+            self.connection.execute("PRAGMA busy_timeout = 30000")
+            _execute_with_lock_retry(self.connection, "PRAGMA journal_mode = WAL")
+            self.connection.execute("PRAGMA synchronous = NORMAL")
+            self.connection.execute("PRAGMA foreign_keys = ON")
+            self._fts_available = True
+            self._initialize()
+        except Exception:
+            self.connection.close()
+            raise
 
     def _initialize(self) -> None:
-        self.connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS documents (
-                source_id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                path TEXT NOT NULL,
-                checksum TEXT NOT NULL,
-                updated_at REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS chunks (
-                id TEXT PRIMARY KEY,
-                source_id TEXT NOT NULL REFERENCES documents(source_id) ON DELETE CASCADE,
-                title TEXT NOT NULL,
-                content TEXT NOT NULL,
-                page INTEGER,
-                section TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_chunks_source_id ON chunks(source_id);
-            CREATE TABLE IF NOT EXISTS processed_messages (
-                message_id TEXT PRIMARY KEY,
-                processed_at REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS llm_usage_daily (
-                day TEXT NOT NULL,
-                model TEXT NOT NULL,
-                purpose TEXT NOT NULL,
-                requests INTEGER NOT NULL,
-                prompt_tokens INTEGER NOT NULL,
-                completion_tokens INTEGER NOT NULL,
-                total_tokens INTEGER NOT NULL,
-                PRIMARY KEY(day, model, purpose)
-            );
-            CREATE TABLE IF NOT EXISTS rate_limit_buckets (
-                user_hash TEXT NOT NULL,
-                window_seconds INTEGER NOT NULL,
-                bucket_start INTEGER NOT NULL,
-                count INTEGER NOT NULL,
-                PRIMARY KEY(user_hash, window_seconds, bucket_start)
-            );
-            """
-        )
-        document_columns = {
-            row[1]
-            for row in self.connection.execute("PRAGMA table_info(documents)").fetchall()
-        }
-        if "space_id" not in document_columns:
-            self.connection.execute(
-                "ALTER TABLE documents ADD COLUMN space_id TEXT NOT NULL DEFAULT ''"
-            )
-        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(chunks)").fetchall()}
-        if "search_text" not in columns:
-            self.connection.execute("ALTER TABLE chunks ADD COLUMN search_text TEXT NOT NULL DEFAULT ''")
-        fts_savepoint = "initialize_fts"
-        self.connection.execute(f"SAVEPOINT {fts_savepoint}")
+        _execute_with_lock_retry(self.connection, "BEGIN IMMEDIATE")
         try:
-            expected_columns = ["chunk_id", "title_terms", "content_terms", "search_terms"]
-            existing = self.connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'"
-            ).fetchone()
-            rebuild = existing is None
-            if existing is not None:
-                actual_columns = [
-                    row[1]
-                    for row in self.connection.execute("PRAGMA table_info(chunks_fts)").fetchall()
-                ]
-                rebuild = actual_columns != expected_columns
-                if not rebuild:
-                    chunk_ids = [
-                        row[0]
-                        for row in self.connection.execute(
-                            "SELECT id FROM chunks ORDER BY id"
-                        ).fetchall()
-                    ]
-                    fts_ids = [
-                        row[0]
-                        for row in self.connection.execute(
-                            "SELECT chunk_id FROM chunks_fts ORDER BY chunk_id"
-                        ).fetchall()
-                    ]
-                    rebuild = chunk_ids != fts_ids
-            if rebuild and existing is not None:
-                self.connection.execute("DROP TABLE chunks_fts")
-            self.connection.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING "
-                "fts5(chunk_id UNINDEXED, title_terms, content_terms, search_terms)"
-            )
-            if rebuild:
-                rows = self.connection.execute(
-                    "SELECT id,title,content,search_text FROM chunks"
-                ).fetchall()
-                self.connection.executemany(
-                    "INSERT INTO chunks_fts(chunk_id,title_terms,content_terms,search_terms) "
-                    "VALUES(?,?,?,?)",
-                    (
-                        (
-                            row["id"],
-                            _pretokenize(row["title"]),
-                            _pretokenize(row["content"]),
-                            _pretokenize(row["search_text"] or ""),
-                        )
-                        for row in rows
-                    ),
+            schema_statements = (
+                """
+                CREATE TABLE IF NOT EXISTS documents (
+                    source_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    updated_at REAL NOT NULL
                 )
-        except sqlite3.OperationalError:
-            self.connection.execute(f"ROLLBACK TO SAVEPOINT {fts_savepoint}")
-            self.connection.execute(f"RELEASE SAVEPOINT {fts_savepoint}")
-            self._fts_available = False
-        else:
-            self.connection.execute(f"RELEASE SAVEPOINT {fts_savepoint}")
-        self.connection.commit()
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES documents(source_id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    page INTEGER,
+                    section TEXT
+                )
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_chunks_source_id ON chunks(source_id)",
+                """
+                CREATE TABLE IF NOT EXISTS processed_messages (
+                    message_id TEXT PRIMARY KEY,
+                    processed_at REAL NOT NULL
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS llm_usage_daily (
+                    day TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    requests INTEGER NOT NULL,
+                    prompt_tokens INTEGER NOT NULL,
+                    completion_tokens INTEGER NOT NULL,
+                    total_tokens INTEGER NOT NULL,
+                    PRIMARY KEY(day, model, purpose)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+                    user_hash TEXT NOT NULL,
+                    window_seconds INTEGER NOT NULL,
+                    bucket_start INTEGER NOT NULL,
+                    count INTEGER NOT NULL,
+                    PRIMARY KEY(user_hash, window_seconds, bucket_start)
+                )
+                """,
+            )
+            for statement in schema_statements:
+                self.connection.execute(statement)
+
+            document_columns = {
+                row[1]
+                for row in self.connection.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            if "space_id" not in document_columns:
+                self.connection.execute(
+                    "ALTER TABLE documents ADD COLUMN space_id TEXT NOT NULL DEFAULT ''"
+                )
+            legacy_space_updates = []
+            for row in self.connection.execute(
+                "SELECT source_id,space_id FROM documents WHERE space_id = ''"
+            ).fetchall():
+                match = _FEISHU_SOURCE_RE.match(row["source_id"])
+                if match is not None:
+                    legacy_space_updates.append((match.group(1), row["source_id"]))
+            self.connection.executemany(
+                "UPDATE documents SET space_id = ? WHERE source_id = ?",
+                legacy_space_updates,
+            )
+
+            chunk_columns = {
+                row[1]
+                for row in self.connection.execute("PRAGMA table_info(chunks)").fetchall()
+            }
+            if "search_text" not in chunk_columns:
+                self.connection.execute(
+                    "ALTER TABLE chunks ADD COLUMN search_text TEXT NOT NULL DEFAULT ''"
+                )
+
+            fts_savepoint = "initialize_fts"
+            self.connection.execute(f"SAVEPOINT {fts_savepoint}")
+            try:
+                expected_columns = [
+                    "chunk_id",
+                    "title_terms",
+                    "content_terms",
+                    "search_terms",
+                ]
+                existing = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'chunks_fts'"
+                ).fetchone()
+                rebuild = existing is None
+                if existing is not None:
+                    actual_columns = [
+                        row[1]
+                        for row in self.connection.execute(
+                            "PRAGMA table_info(chunks_fts)"
+                        ).fetchall()
+                    ]
+                    rebuild = actual_columns != expected_columns
+                    if not rebuild:
+                        chunk_ids = [
+                            row[0]
+                            for row in self.connection.execute(
+                                "SELECT id FROM chunks ORDER BY id"
+                            ).fetchall()
+                        ]
+                        fts_ids = [
+                            row[0]
+                            for row in self.connection.execute(
+                                "SELECT chunk_id FROM chunks_fts ORDER BY chunk_id"
+                            ).fetchall()
+                        ]
+                        rebuild = chunk_ids != fts_ids
+                if rebuild and existing is not None:
+                    self.connection.execute("DROP TABLE chunks_fts")
+                self.connection.execute(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING "
+                    "fts5(chunk_id UNINDEXED, title_terms, content_terms, search_terms)"
+                )
+                if rebuild:
+                    rows = self.connection.execute(
+                        "SELECT id,title,content,search_text FROM chunks"
+                    ).fetchall()
+                    self.connection.executemany(
+                        "INSERT INTO chunks_fts("
+                        "chunk_id,title_terms,content_terms,search_terms"
+                        ") VALUES(?,?,?,?)",
+                        (
+                            (
+                                row["id"],
+                                _pretokenize(row["title"]),
+                                _pretokenize(row["content"]),
+                                _pretokenize(row["search_text"] or ""),
+                            )
+                            for row in rows
+                        ),
+                    )
+            except sqlite3.OperationalError:
+                self.connection.execute(f"ROLLBACK TO SAVEPOINT {fts_savepoint}")
+                self.connection.execute(f"RELEASE SAVEPOINT {fts_savepoint}")
+                self._fts_available = False
+            else:
+                self.connection.execute(f"RELEASE SAVEPOINT {fts_savepoint}")
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def upsert_document(
         self,

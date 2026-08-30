@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from feishu_rag.models import Chunk, RetrievalScope
-from feishu_rag.store import IndexStore, _pretokenize
+from feishu_rag.store import IndexStore, _pretokenize, _tokens
 
 
 class StoreTests(unittest.TestCase):
@@ -85,6 +85,187 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_legacy_feishu_documents_backfill_space_id_for_scoped_search(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            connection = sqlite3.connect(db_path)
+            connection.executescript(
+                """
+                CREATE TABLE documents (
+                    source_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE chunks (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES documents(source_id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    page INTEGER,
+                    section TEXT
+                );
+                INSERT INTO documents VALUES(
+                    'feishu:space-a:node-1', '电子发票', 'wiki/node-1', 'v1', 0
+                );
+                INSERT INTO documents VALUES('local.txt', '本地文档', 'local.txt', 'v1', 0);
+                INSERT INTO documents VALUES(
+                    'feishu::malformed', '异常文档', 'malformed', 'v1', 0
+                );
+                INSERT INTO chunks VALUES(
+                    'feishu-chunk', 'feishu:space-a:node-1', '电子发票',
+                    '电子发票需要核验。', NULL, NULL
+                );
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            store = IndexStore(db_path)
+            try:
+                spaces = dict(
+                    store.connection.execute(
+                        "SELECT source_id,space_id FROM documents ORDER BY source_id"
+                    ).fetchall()
+                )
+                self.assertEqual(spaces["feishu:space-a:node-1"], "space-a")
+                self.assertEqual(spaces["local.txt"], "")
+                self.assertEqual(spaces["feishu::malformed"], "")
+                self.assertEqual(
+                    store.search(
+                        "电子发票",
+                        scope=RetrievalScope(frozenset({""})),
+                    ),
+                    [],
+                )
+                self.assertEqual(
+                    store.search(
+                        "电子发票",
+                        scope=RetrievalScope(frozenset({"space-a"})),
+                    )[0].chunk.id,
+                    "feishu-chunk",
+                )
+            finally:
+                store.close()
+
+    def test_busy_timeout_is_configured_before_journal_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real_connection = sqlite3.connect(Path(tmp) / "rag.sqlite3")
+            statements = []
+
+            class RecordingConnection:
+                def __getattr__(self, name):
+                    return getattr(real_connection, name)
+
+                def __setattr__(self, name, value):
+                    if name in {"row_factory"}:
+                        setattr(real_connection, name, value)
+                    else:
+                        object.__setattr__(self, name, value)
+
+                def execute(self, sql, parameters=()):
+                    statements.append(sql)
+                    return real_connection.execute(sql, parameters)
+
+            with patch("feishu_rag.store.sqlite3.connect", return_value=RecordingConnection()):
+                store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                busy_index = statements.index("PRAGMA busy_timeout = 30000")
+                journal_index = statements.index("PRAGMA journal_mode = WAL")
+                self.assertLess(busy_index, journal_index)
+            finally:
+                store.close()
+
+    def test_concurrent_initialization_of_same_legacy_database_is_consistent(self):
+        for iteration in range(3):
+            with self.subTest(iteration=iteration), tempfile.TemporaryDirectory() as tmp:
+                db_path = Path(tmp) / "rag.sqlite3"
+                connection = sqlite3.connect(db_path)
+                connection.executescript(
+                    """
+                    CREATE TABLE documents (
+                        source_id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        path TEXT NOT NULL,
+                        checksum TEXT NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE TABLE chunks (
+                        id TEXT PRIMARY KEY,
+                        source_id TEXT NOT NULL REFERENCES documents(source_id) ON DELETE CASCADE,
+                        title TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        page INTEGER,
+                        section TEXT
+                    );
+                    INSERT INTO documents VALUES(
+                        'feishu:space-a:node-1', '电子发票', 'wiki/node-1', 'v1', 0
+                    );
+                    INSERT INTO chunks VALUES(
+                        'legacy', 'feishu:space-a:node-1', '电子发票',
+                        '电子发票需要核验。', NULL, NULL
+                    );
+                    CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                        chunk_id UNINDEXED, title, content
+                    );
+                    INSERT INTO chunks_fts VALUES(
+                        'legacy', '电子发票', '电子发票需要核验。'
+                    );
+                    """
+                )
+                connection.commit()
+                connection.close()
+                barrier = threading.Barrier(8)
+
+                def initialize():
+                    barrier.wait()
+                    store = IndexStore(db_path)
+                    try:
+                        return (
+                            [
+                                row[1]
+                                for row in store.connection.execute(
+                                    "PRAGMA table_info(documents)"
+                                ).fetchall()
+                            ],
+                            [
+                                row[1]
+                                for row in store.connection.execute(
+                                    "PRAGMA table_info(chunks)"
+                                ).fetchall()
+                            ],
+                            [
+                                row[1]
+                                for row in store.connection.execute(
+                                    "PRAGMA table_info(chunks_fts)"
+                                ).fetchall()
+                            ],
+                            store.connection.execute(
+                                "SELECT space_id FROM documents "
+                                "WHERE source_id = 'feishu:space-a:node-1'"
+                            ).fetchone()[0],
+                            store.connection.execute(
+                                "SELECT COUNT(*) FROM chunks_fts "
+                                "WHERE chunk_id = 'legacy'"
+                            ).fetchone()[0],
+                        )
+                    finally:
+                        store.close()
+
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    results = list(executor.map(lambda _: initialize(), range(8)))
+
+                for document_columns, chunk_columns, fts_columns, space_id, fts_count in results:
+                    self.assertIn("space_id", document_columns)
+                    self.assertIn("search_text", chunk_columns)
+                    self.assertEqual(
+                        fts_columns,
+                        ["chunk_id", "title_terms", "content_terms", "search_terms"],
+                    )
+                    self.assertEqual(space_id, "space-a")
+                    self.assertEqual(fts_count, 1)
+
     def test_retrieval_scope_preserves_an_explicit_immutable_space_set(self):
         allowed = frozenset({"space-a", "space-b"})
         self.assertEqual(RetrievalScope(allowed).allowed_space_ids, allowed)
@@ -95,6 +276,10 @@ class StoreTests(unittest.TestCase):
         self.assertIn("报销", terms.split())
         self.assertIn("报", terms.split())
         self.assertIn("销", terms.split())
+
+    def test_tokens_exclude_single_chinese_when_requested(self):
+        self.assertEqual(_tokens("这", include_single_chinese=False), [])
+        self.assertEqual(_tokens("电子", include_single_chinese=False), ["电子"])
 
     def test_initialization_migrates_old_fts_schema_and_backfills_chunks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -493,9 +678,48 @@ class StoreTests(unittest.TestCase):
                     "v1",
                     [Chunk("finance", "finance.pdf", "财务制度", "报销流程按规定办理。")],
                 )
-                for query in ("请问是什么制度", "流程规定办法", "量子芯片温度"):
+                for query in (
+                    "请问是什么制度",
+                    "这是什么制度",
+                    "那都有哪些办法呢",
+                    "流程规定办法",
+                    "量子芯片温度",
+                ):
                     with self.subTest(query=query):
                         self.assertEqual(store.search(query), [])
+            finally:
+                store.close()
+
+    def test_search_does_not_strip_residual_characters_inside_real_entities(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                documents = (
+                    ("ownership", "所有权说明", "本制度说明资产所有权。"),
+                    ("purpose", "文件目的", "文件目的用于说明适用范围。"),
+                    ("summary", "内容摘要", "摘要概括主要内容。"),
+                    ("key-points", "操作要点", "要点包括核验和审批。"),
+                )
+                for chunk_id, title, content in documents:
+                    source_id = f"{chunk_id}.pdf"
+                    store.upsert_document(
+                        source_id,
+                        title,
+                        source_id,
+                        "v1",
+                        [Chunk(chunk_id, source_id, title, content)],
+                    )
+
+                for query, expected_id in (
+                    ("所有权", "ownership"),
+                    ("所有权规定", "ownership"),
+                    ("目的", "purpose"),
+                    ("摘要", "summary"),
+                    ("要点", "key-points"),
+                ):
+                    with self.subTest(query=query):
+                        self.assertEqual(store.search(query)[0].chunk.id, expected_id)
+                self.assertEqual(store.search("这是什么制度"), [])
             finally:
                 store.close()
 
