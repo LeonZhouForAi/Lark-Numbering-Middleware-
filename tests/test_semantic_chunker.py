@@ -4,6 +4,7 @@ import pytest
 
 from feishu_rag.semantic_chunker import (
     AtomicUnit,
+    DeepSeekPlanner,
     SemanticChunkError,
     semantic_chunks,
 )
@@ -15,6 +16,28 @@ class FakePlanner:
 
     def plan(self, units):
         return self.response
+
+
+class RecordingLLM:
+    def __init__(self):
+        self.prompts = []
+
+    def complete_json(self, system_prompt, user_prompt):
+        self.prompts.append(user_prompt)
+        units = [
+            AtomicUnit(item["id"], item["text"])
+            for item in (__import__("json").loads(line) for line in user_prompt.splitlines()[1:])
+        ]
+        return {
+            "groups": [
+                {
+                    "unit_ids": [unit.unit_id for unit in units],
+                    "title": "批次",
+                    "keywords": [],
+                    "summary": "",
+                }
+            ]
+        }
 
 
 def test_semantic_groups_reassemble_original_units_without_rewriting() -> None:
@@ -69,3 +92,14 @@ def test_semantic_group_split_keeps_original_text_when_over_limit() -> None:
 
     assert len(chunks) > 1
     assert "".join(chunk.content for chunk in chunks).replace("\n", "") == "甲" * 60 + "乙" * 60
+
+
+def test_deepseek_planner_splits_long_input_into_bounded_batches() -> None:
+    llm = RecordingLLM()
+    planner = DeepSeekPlanner(llm, batch_chars=2000)
+    units = [AtomicUnit(f"u{index}", "制度段落" * 100) for index in range(8)]
+
+    result = planner.plan(units)
+
+    assert len(llm.prompts) > 1
+    assert len(result["groups"]) == len(llm.prompts)
