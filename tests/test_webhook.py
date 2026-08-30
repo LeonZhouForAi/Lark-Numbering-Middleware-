@@ -45,6 +45,9 @@ class WebhookTests(unittest.TestCase):
         self.assertTrue(verify_signature(timestamp, nonce, body, encrypt_key, signature))
         self.assertFalse(verify_signature(timestamp, nonce, body, encrypt_key, "bad"))
 
+    def test_signature_rejects_when_encrypt_key_is_missing(self):
+        self.assertFalse(verify_signature("1700000000", "nonce", '{}', "", ""))
+
     def test_text_message_is_answered_once(self):
         rag = FakeRag()
         feishu = FakeFeishu()

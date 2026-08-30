@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover - 本地无 FastAPI 时核心逻辑仍�
 
 def verify_signature(timestamp: str, nonce: str, body: str, encrypt_key: str, signature: str) -> bool:
     if not encrypt_key:
-        return True
+        return False
     expected = hashlib.sha256((timestamp + nonce + encrypt_key + body).encode("utf-8")).hexdigest()
     return hmac.compare_digest(expected, signature)
 
