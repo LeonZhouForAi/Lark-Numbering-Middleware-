@@ -206,6 +206,7 @@ def sync_wiki_space(
                         f"{content_checksum}:{chunk_strategy_version}:{chunk_model}:ocr={ocr_cache_mode}".encode("utf-8")
                     ).hexdigest()
                     if store.document_checksum(source_id) == checksum:
+                        store.set_document_space(source_id, space_id)
                         retained_source_ids.add(source_id)
                         skipped += 1
                         continue
@@ -225,7 +226,14 @@ def sync_wiki_space(
                     if not chunks:
                         skipped += 1
                         continue
-                    store.upsert_document(source_id, title, f"wiki/{space_id}/{node_token}", checksum, chunks)
+                    store.upsert_document(
+                        source_id,
+                        title,
+                        f"wiki/{space_id}/{node_token}",
+                        checksum,
+                        chunks,
+                        space_id=space_id,
+                    )
                     retained_source_ids.add(source_id)
                     indexed += 1
                     continue
@@ -242,6 +250,7 @@ def sync_wiki_space(
                     f"{content_checksum}:{chunk_strategy_version}:{chunk_model}".encode("utf-8")
                 ).hexdigest()
                 if store.document_checksum(source_id) == checksum:
+                    store.set_document_space(source_id, space_id)
                     retained_source_ids.add(source_id)
                     skipped += 1
                     continue
@@ -258,7 +267,14 @@ def sync_wiki_space(
                 if not chunks:
                     skipped += 1
                     continue
-                store.upsert_document(source_id, title, f"wiki/{space_id}/{node_token}", checksum, chunks)
+                store.upsert_document(
+                    source_id,
+                    title,
+                    f"wiki/{space_id}/{node_token}",
+                    checksum,
+                    chunks,
+                    space_id=space_id,
+                )
                 retained_source_ids.add(source_id)
                 indexed += 1
             has_more = bool(data.get("has_more"))

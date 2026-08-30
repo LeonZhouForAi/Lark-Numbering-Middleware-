@@ -7,8 +7,9 @@ import sqlite3
 import time
 import unicodedata
 from collections import Counter
-from pathlib import Path
 from datetime import datetime, timezone
+from hashlib import sha256
+from pathlib import Path
 from typing import Collection, Iterable
 
 from .models import Chunk, RetrievalScope, SearchResult
@@ -121,8 +122,23 @@ class IndexStore:
                 total_tokens INTEGER NOT NULL,
                 PRIMARY KEY(day, model, purpose)
             );
+            CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+                user_hash TEXT NOT NULL,
+                window_seconds INTEGER NOT NULL,
+                bucket_start INTEGER NOT NULL,
+                count INTEGER NOT NULL,
+                PRIMARY KEY(user_hash, window_seconds, bucket_start)
+            );
             """
         )
+        document_columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(documents)").fetchall()
+        }
+        if "space_id" not in document_columns:
+            self.connection.execute(
+                "ALTER TABLE documents ADD COLUMN space_id TEXT NOT NULL DEFAULT ''"
+            )
         columns = {row[1] for row in self.connection.execute("PRAGMA table_info(chunks)").fetchall()}
         if "search_text" not in columns:
             self.connection.execute("ALTER TABLE chunks ADD COLUMN search_text TEXT NOT NULL DEFAULT ''")
@@ -192,6 +208,8 @@ class IndexStore:
         path: str,
         checksum: str,
         chunks: Iterable[Chunk],
+        *,
+        space_id: str = "",
     ) -> None:
         chunk_list = list(chunks)
         with self.connection:
@@ -205,8 +223,9 @@ class IndexStore:
                 self.connection.executemany("DELETE FROM chunks_fts WHERE chunk_id = ?", ((cid,) for cid in old_ids))
             self.connection.execute("DELETE FROM documents WHERE source_id = ?", (source_id,))
             self.connection.execute(
-                "INSERT INTO documents(source_id,title,path,checksum,updated_at) VALUES(?,?,?,?,?)",
-                (source_id, title, path, checksum, time.time()),
+                "INSERT INTO documents(source_id,title,path,checksum,updated_at,space_id) "
+                "VALUES(?,?,?,?,?,?)",
+                (source_id, title, path, checksum, time.time(), space_id),
             )
             self.connection.executemany(
                 "INSERT INTO chunks(id,source_id,title,content,page,section,search_text) VALUES(?,?,?,?,?,?,?)",
@@ -242,16 +261,26 @@ class IndexStore:
             return []
         if not 0.0 <= min_relevance <= 1.0:
             raise ValueError("min_relevance must be between 0 and 1")
-        del scope  # ACL 存储列由后续任务实现；此处只建立兼容接口。
+        allowed_space_ids = None if scope is None else scope.allowed_space_ids
+        if allowed_space_ids is not None and not allowed_space_ids:
+            return []
         core_terms = _core_terms(query)
         if not core_terms:
             return []
         terms = self._terms(query)
         if not terms:
             return []
-        rows = self.connection.execute(
-            "SELECT id,source_id,title,content,page,section,search_text FROM chunks"
-        ).fetchall()
+        row_sql = (
+            "SELECT chunks.id,chunks.source_id,chunks.title,chunks.content,"
+            "chunks.page,chunks.section,chunks.search_text FROM chunks "
+            "JOIN documents ON documents.source_id = chunks.source_id"
+        )
+        scope_parameters: tuple[str, ...] = ()
+        if allowed_space_ids is not None:
+            scope_parameters = tuple(sorted(allowed_space_ids))
+            placeholders = ",".join("?" for _ in scope_parameters)
+            row_sql += f" WHERE documents.space_id IN ({placeholders})"
+        rows = self.connection.execute(row_sql, scope_parameters).fetchall()
 
         candidate_limit = top_k * 4
         literal_scores: list[tuple[str, float]] = []
@@ -273,12 +302,26 @@ class IndexStore:
         if self._fts_available:
             match_query = " OR ".join(f'"{term}"' for term in terms)
             try:
+                fts_sql = (
+                    "SELECT chunks_fts.chunk_id FROM chunks_fts "
+                    "JOIN chunks ON chunks.id = chunks_fts.chunk_id "
+                    "JOIN documents ON documents.source_id = chunks.source_id "
+                    "WHERE chunks_fts MATCH ?"
+                )
+                fts_parameters: tuple[object, ...] = (match_query,)
+                if allowed_space_ids is not None:
+                    placeholders = ",".join("?" for _ in scope_parameters)
+                    fts_sql += f" AND documents.space_id IN ({placeholders})"
+                    fts_parameters += scope_parameters
+                fts_sql += (
+                    " ORDER BY bm25(chunks_fts, 0.0, 3.0, 1.0, 0.75), "
+                    "chunks_fts.chunk_id LIMIT ?"
+                )
+                fts_parameters += (candidate_limit,)
                 fts_ids = [
                     row[0]
                     for row in self.connection.execute(
-                        "SELECT chunk_id FROM chunks_fts WHERE chunks_fts MATCH ? "
-                        "ORDER BY bm25(chunks_fts, 0.0, 3.0, 1.0, 0.75), chunk_id LIMIT ?",
-                        (match_query, candidate_limit),
+                        fts_sql, fts_parameters
                     ).fetchall()
                 ]
             except sqlite3.OperationalError:
@@ -346,6 +389,68 @@ class IndexStore:
 
     def count_documents(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+
+    def claim_rate_limit(
+        self,
+        actor_id: str,
+        per_minute: int,
+        per_day: int,
+        now: float | datetime | None = None,
+    ) -> bool:
+        if not isinstance(actor_id, str) or not actor_id.strip():
+            raise ValueError("actor_id must not be empty")
+        if any(
+            type(limit) is not int or not 0 <= limit <= _SQLITE_INT_MAX
+            for limit in (per_minute, per_day)
+        ):
+            raise ValueError("rate limits must be non-negative integers")
+        timestamp = time.time() if now is None else (
+            now.timestamp() if isinstance(now, datetime) else float(now)
+        )
+        if timestamp != timestamp or timestamp in {float("inf"), float("-inf")}:
+            raise ValueError("now must be finite")
+
+        actor_hash = sha256(actor_id.strip().encode("utf-8")).hexdigest()
+        active_limits = tuple(
+            (window_seconds, limit)
+            for window_seconds, limit in ((60, per_minute), (86400, per_day))
+            if limit > 0
+        )
+        bucket_starts = {
+            window_seconds: int(timestamp // window_seconds) * window_seconds
+            for window_seconds, _ in active_limits
+        }
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute(
+                "DELETE FROM rate_limit_buckets "
+                "WHERE bucket_start + window_seconds <= ?",
+                (int(timestamp),),
+            )
+            for window_seconds, limit in active_limits:
+                row = self.connection.execute(
+                    "SELECT count FROM rate_limit_buckets "
+                    "WHERE user_hash = ? AND window_seconds = ? AND bucket_start = ?",
+                    (actor_hash, window_seconds, bucket_starts[window_seconds]),
+                ).fetchone()
+                if row is not None and row[0] >= limit:
+                    self.connection.commit()
+                    return False
+            for window_seconds, _ in active_limits:
+                self.connection.execute(
+                    "INSERT INTO rate_limit_buckets("
+                    "user_hash,window_seconds,bucket_start,count"
+                    ") VALUES(?,?,?,1) "
+                    "ON CONFLICT(user_hash,window_seconds,bucket_start) "
+                    "DO UPDATE SET count = count + 1",
+                    (actor_hash, window_seconds, bucket_starts[window_seconds]),
+                )
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def record_llm_usage(
         self,
@@ -439,6 +544,14 @@ class IndexStore:
             "SELECT checksum FROM documents WHERE source_id = ?", (source_id,)
         ).fetchone()
         return str(row[0]) if row else None
+
+    def set_document_space(self, source_id: str, space_id: str) -> bool:
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE documents SET space_id = ? WHERE source_id = ?",
+                (space_id, source_id),
+            )
+        return cursor.rowcount == 1
 
     def claim_message(self, message_id: str, retention_seconds: int = 7 * 24 * 60 * 60) -> bool:
         cutoff = time.time() - retention_seconds

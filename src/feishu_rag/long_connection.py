@@ -76,6 +76,8 @@ def run() -> None:
         top_k=settings.rag_top_k,
         min_relevance=settings.rag_min_relevance,
         question_max_chars=settings.rag_question_max_chars,
+        rate_limit_per_minute=settings.rag_rate_limit_per_minute,
+        rate_limit_per_day=settings.rag_rate_limit_per_day,
     )
     feishu = FeishuClient(
         settings.feishu_app_id,

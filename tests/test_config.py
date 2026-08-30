@@ -122,6 +122,52 @@ class SettingsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, "API_RETRY"):
                     Settings.from_env()
 
+    def test_rate_limit_defaults_and_accepts_zero_to_disable(self):
+        with patch.dict(os.environ, self._base_env(), clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.rag_rate_limit_per_minute, 10)
+        self.assertEqual(settings.rag_rate_limit_per_day, 200)
+
+        env = self._base_env()
+        env.update(
+            RAG_RATE_LIMIT_PER_MINUTE="0",
+            RAG_RATE_LIMIT_PER_DAY="0",
+        )
+        with patch.dict(os.environ, env, clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.rag_rate_limit_per_minute, 0)
+        self.assertEqual(settings.rag_rate_limit_per_day, 0)
+
+    def test_rate_limits_must_be_non_negative_integers(self):
+        for name in ("RAG_RATE_LIMIT_PER_MINUTE", "RAG_RATE_LIMIT_PER_DAY"):
+            for value in ("-1", "1.5", "not-an-integer", ""):
+                env = self._base_env()
+                env[name] = value
+                with self.subTest(name=name, value=value), patch.dict(
+                    os.environ, env, clear=True
+                ):
+                    with self.assertRaisesRegex(ConfigError, name):
+                        Settings.from_env()
+
+    def test_rate_limits_accept_sqlite_max_and_reject_larger_values(self):
+        maximum = 2**63 - 1
+        env = self._base_env()
+        env.update(
+            RAG_RATE_LIMIT_PER_MINUTE=str(maximum),
+            RAG_RATE_LIMIT_PER_DAY=str(maximum),
+        )
+        with patch.dict(os.environ, env, clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.rag_rate_limit_per_minute, maximum)
+        self.assertEqual(settings.rag_rate_limit_per_day, maximum)
+
+        for name in ("RAG_RATE_LIMIT_PER_MINUTE", "RAG_RATE_LIMIT_PER_DAY"):
+            env = self._base_env()
+            env[name] = str(maximum + 1)
+            with self.subTest(name=name), patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(ConfigError, name):
+                    Settings.from_env()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from feishu_rag.llm import DeepSeekClient
-from feishu_rag.models import Chunk, SearchResult
+from feishu_rag.models import Chunk, RetrievalScope, SearchResult
 from feishu_rag.rag import RagResponseError, RagService
 from feishu_rag.store import IndexStore
 
@@ -33,9 +33,14 @@ class RecordingStore:
         self.calls = []
         self.results = [] if results is None else results
 
-    def search(self, query, top_k=6, min_relevance=0.42):
+    def search(self, query, top_k=6, min_relevance=0.42, scope=None):
         self.calls.append(
-            {"query": query, "top_k": top_k, "min_relevance": min_relevance}
+            {
+                "query": query,
+                "top_k": top_k,
+                "min_relevance": min_relevance,
+                "scope": scope,
+            }
         )
         return self.results
 
@@ -62,8 +67,60 @@ class RagTests(unittest.TestCase):
 
         self.assertEqual(
             store.calls,
-            [{"query": "报销要求", "top_k": 4, "min_relevance": 0.73}],
+            [
+                {
+                    "query": "报销要求",
+                    "top_k": 4,
+                    "min_relevance": 0.73,
+                    "scope": None,
+                }
+            ],
         )
+
+    def test_answer_passes_retrieval_scope_to_store_and_saves_rate_limits(self):
+        store = RecordingStore()
+        scope = RetrievalScope(frozenset({"space-a"}))
+        rag = RagService(
+            store,
+            FakeLLM(),
+            rate_limit_per_minute=7,
+            rate_limit_per_day=99,
+        )
+
+        rag.answer("报销要求", scope=scope)
+
+        self.assertEqual(store.calls[0]["scope"], scope)
+        self.assertEqual(rag.rate_limit_per_minute, 7)
+        self.assertEqual(rag.rate_limit_per_day, 99)
+
+    def test_constructor_rate_limits_use_sqlite_integer_bounds(self):
+        maximum = 2**63 - 1
+        rag = RagService(
+            RecordingStore(),
+            FakeLLM(),
+            rate_limit_per_minute=maximum,
+            rate_limit_per_day=maximum,
+        )
+        self.assertEqual(rag.rate_limit_per_minute, maximum)
+        self.assertEqual(rag.rate_limit_per_day, maximum)
+
+        for per_minute, per_day in (
+            (-1, 0),
+            (0, -1),
+            (True, 0),
+            (0, False),
+            (maximum + 1, 0),
+            (0, maximum + 1),
+        ):
+            with self.subTest(
+                per_minute=per_minute, per_day=per_day
+            ), self.assertRaises(ValueError):
+                RagService(
+                    RecordingStore(),
+                    FakeLLM(),
+                    rate_limit_per_minute=per_minute,
+                    rate_limit_per_day=per_day,
+                )
 
     def test_no_evidence_does_not_call_model(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -22,6 +22,9 @@ except ImportError:  # pragma: no cover - 本地无 FastAPI 时核心逻辑仍�
     Request = Any  # type: ignore[misc,assignment]
 
 
+RATE_LIMIT_ANSWER = "请求过于频繁，请稍后再试。"
+
+
 def verify_signature(timestamp: str, nonce: str, body: str, encrypt_key: str, signature: str) -> bool:
     if not encrypt_key:
         return False
@@ -38,6 +41,20 @@ def _message_text(message: dict[str, Any]) -> str | None:
         return None
     text = content.get("text")
     return text.strip() if isinstance(text, str) and text.strip() else None
+
+
+def _actor_id(event: dict[str, Any]) -> str | None:
+    sender = event.get("sender")
+    if not isinstance(sender, dict):
+        return None
+    sender_id = sender.get("sender_id")
+    if not isinstance(sender_id, dict):
+        return None
+    for key in ("open_id", "union_id", "user_id"):
+        value = sender_id.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def handle_event(
@@ -74,19 +91,35 @@ def handle_event(
         if not claim_message(message_id):
             return {"status": "duplicate"}
         claimed = True
+    per_minute = getattr(rag, "rate_limit_per_minute", 0)
+    per_day = getattr(rag, "rate_limit_per_day", 0)
+    status = "ok"
     try:
-        answer = rag.answer(question)
+        if per_minute or per_day:
+            actor_id = _actor_id(event)
+            if actor_id is None:
+                raise ValueError("missing actor_id")
+            claim_rate_limit = getattr(store, "claim_rate_limit", None)
+            if not callable(claim_rate_limit):
+                raise RuntimeError("rate limiting requires a persistent store")
+            if claim_rate_limit(actor_id, per_minute, per_day):
+                answer_text = rag.answer(question).text
+            else:
+                answer_text = RATE_LIMIT_ANSWER
+                status = "rate_limited"
+        else:
+            answer_text = rag.answer(question).text
     except Exception:
         if claimed and callable(release_message):
             release_message(message_id)
         raise
     try:
-        feishu.reply_text(message_id, answer.text)
+        feishu.reply_text(message_id, answer_text)
     except FeishuReplyNotSentError:
         if claimed and callable(release_message):
             release_message(message_id)
         raise
-    return {"status": "ok"}
+    return {"status": status}
 
 
 def create_app(
@@ -119,6 +152,8 @@ def create_app(
                 top_k=settings.rag_top_k,
                 min_relevance=settings.rag_min_relevance,
                 question_max_chars=settings.rag_question_max_chars,
+                rate_limit_per_minute=settings.rag_rate_limit_per_minute,
+                rate_limit_per_day=settings.rag_rate_limit_per_day,
             )
             feishu = feishu or FeishuClient(
                 settings.feishu_app_id,

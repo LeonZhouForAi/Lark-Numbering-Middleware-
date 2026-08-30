@@ -1,6 +1,9 @@
 import sqlite3
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +12,79 @@ from feishu_rag.store import IndexStore, _pretokenize
 
 
 class StoreTests(unittest.TestCase):
+    def test_set_document_space_updates_only_an_existing_document(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.upsert_document(
+                    "legacy.txt",
+                    "旧文档",
+                    "legacy.txt",
+                    "v1",
+                    [Chunk("legacy", "legacy.txt", "旧文档", "报销内容")],
+                )
+
+                self.assertTrue(store.set_document_space("legacy.txt", "space-a"))
+                self.assertFalse(store.set_document_space("missing.txt", "space-b"))
+                self.assertEqual(store.count_documents(), 1)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT space_id FROM documents WHERE source_id = 'legacy.txt'"
+                    ).fetchone()[0],
+                    "space-a",
+                )
+            finally:
+                store.close()
+
+    def test_initialization_migrates_documents_space_id_and_creates_rate_limit_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            connection = sqlite3.connect(db_path)
+            connection.executescript(
+                """
+                CREATE TABLE documents (
+                    source_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                INSERT INTO documents VALUES('legacy.txt', '旧文档', 'legacy.txt', 'v1', 0);
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            store = IndexStore(db_path)
+            try:
+                space_column = next(
+                    row
+                    for row in store.connection.execute(
+                        "PRAGMA table_info(documents)"
+                    ).fetchall()
+                    if row[1] == "space_id"
+                )
+                self.assertEqual(space_column[2], "TEXT")
+                self.assertEqual(space_column[3], 1)
+                self.assertEqual(space_column[4], "''")
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT space_id FROM documents WHERE source_id = 'legacy.txt'"
+                    ).fetchone()[0],
+                    "",
+                )
+                self.assertEqual(
+                    [
+                        row[1]
+                        for row in store.connection.execute(
+                            "PRAGMA table_info(rate_limit_buckets)"
+                        ).fetchall()
+                    ],
+                    ["user_hash", "window_seconds", "bucket_start", "count"],
+                )
+            finally:
+                store.close()
+
     def test_retrieval_scope_preserves_an_explicit_immutable_space_set(self):
         allowed = frozenset({"space-a", "space-b"})
         self.assertEqual(RetrievalScope(allowed).allowed_space_ids, allowed)
@@ -490,19 +566,192 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_search_accepts_scope_without_claiming_to_filter_before_acl_schema(self):
+    def test_search_scope_filters_all_candidates_and_none_preserves_full_database(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
             try:
                 store.upsert_document(
-                    "finance.pdf",
-                    "报销指引",
-                    "finance.pdf",
+                    "space-a.pdf",
+                    "A 空间报销指引",
+                    "space-a.pdf",
                     "v1",
-                    [Chunk("finance", "finance.pdf", "报销指引", "提交电子发票。")],
+                    [Chunk("space-a", "space-a.pdf", "A 空间报销指引", "提交电子发票。")],
+                    space_id="space-a",
                 )
-                scope = RetrievalScope(frozenset({"space-a"}))
-                self.assertEqual(store.search("电子发票", scope=scope)[0].chunk.id, "finance")
+                store.upsert_document(
+                    "space-b.pdf",
+                    "B 空间报销指引",
+                    "space-b.pdf",
+                    "v1",
+                    [Chunk("space-b", "space-b.pdf", "B 空间报销指引", "提交电子发票。")],
+                    space_id="space-b",
+                )
+                store.upsert_document(
+                    "local.pdf",
+                    "本地报销指引",
+                    "local.pdf",
+                    "v1",
+                    [Chunk("local", "local.pdf", "本地报销指引", "提交电子发票。")],
+                )
+
+                self.assertEqual(
+                    {result.chunk.id for result in store.search("电子发票", top_k=6)},
+                    {"space-a", "space-b", "local"},
+                )
+                self.assertEqual(
+                    [
+                        result.chunk.id
+                        for result in store.search(
+                            "电子发票",
+                            top_k=6,
+                            scope=RetrievalScope(frozenset({"space-a"})),
+                        )
+                    ],
+                    ["space-a"],
+                )
+                self.assertEqual(
+                    store.search(
+                        "电子发票",
+                        scope=RetrievalScope(frozenset()),
+                    ),
+                    [],
+                )
+            finally:
+                store.close()
+
+    def test_search_document_frequency_is_calculated_only_inside_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.upsert_document(
+                    "allowed.pdf",
+                    "允许文档",
+                    "allowed.pdf",
+                    "v1",
+                    [Chunk("allowed", "allowed.pdf", "允许文档", "alpha")],
+                    space_id="allowed",
+                )
+                scope = RetrievalScope(frozenset({"allowed"}))
+                before = store.search("alpha beta", min_relevance=0.0, scope=scope)[0].score
+                for index in range(12):
+                    source_id = f"blocked-{index}.pdf"
+                    store.upsert_document(
+                        source_id,
+                        "禁止文档",
+                        source_id,
+                        "v1",
+                        [Chunk(f"blocked-{index}", source_id, "禁止文档", "alpha")],
+                        space_id="blocked",
+                    )
+
+                after = store.search("alpha beta", min_relevance=0.0, scope=scope)[0].score
+
+                self.assertEqual(after, before)
+            finally:
+                store.close()
+
+    def test_claim_rate_limit_validates_actor_and_limits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                for actor in ("", "   ", None):
+                    with self.subTest(actor=actor), self.assertRaises(ValueError):
+                        store.claim_rate_limit(actor, 10, 200, now=0)
+                for per_minute, per_day in ((-1, 1), (1, -1), (True, 1), (1, 1.5)):
+                    with self.subTest(
+                        per_minute=per_minute, per_day=per_day
+                    ), self.assertRaises(ValueError):
+                        store.claim_rate_limit("actor", per_minute, per_day, now=0)
+                self.assertTrue(store.claim_rate_limit("actor", 0, 0, now=0))
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM rate_limit_buckets"
+                    ).fetchone()[0],
+                    0,
+                )
+                maximum = 2**63 - 1
+                self.assertTrue(
+                    store.claim_rate_limit("max-user", maximum, maximum, now=0)
+                )
+                with self.assertRaises(ValueError):
+                    store.claim_rate_limit("too-large", maximum + 1, 0, now=0)
+            finally:
+                store.close()
+
+    def test_claim_rate_limit_enforces_minute_and_day_windows_without_partial_increment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                for _ in range(10):
+                    self.assertTrue(store.claim_rate_limit("minute-user", 10, 0, now=59))
+                self.assertFalse(store.claim_rate_limit("minute-user", 10, 0, now=59))
+                self.assertTrue(store.claim_rate_limit("minute-user", 10, 0, now=60))
+
+                for _ in range(200):
+                    self.assertTrue(store.claim_rate_limit("day-user", 0, 200, now=86399))
+                self.assertFalse(store.claim_rate_limit("day-user", 0, 200, now=86399))
+                self.assertTrue(store.claim_rate_limit("day-user", 0, 200, now=86400))
+
+                self.assertTrue(store.claim_rate_limit("both-user", 1, 2, now=0))
+                self.assertFalse(store.claim_rate_limit("both-user", 1, 2, now=1))
+                self.assertTrue(store.claim_rate_limit("both-user", 1, 2, now=60))
+            finally:
+                store.close()
+
+    def test_claim_rate_limit_stores_only_sha256_actor_hash_and_prunes_old_buckets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            actor = "ou_original_user_id"
+            try:
+                self.assertTrue(store.claim_rate_limit(actor, 10, 200, now=0))
+                hashes = {
+                    row[0]
+                    for row in store.connection.execute(
+                        "SELECT user_hash FROM rate_limit_buckets"
+                    ).fetchall()
+                }
+                self.assertEqual(hashes, {sha256(actor.encode("utf-8")).hexdigest()})
+                self.assertNotIn(actor.encode("utf-8"), Path(store.db_path).read_bytes())
+
+                self.assertTrue(store.claim_rate_limit("another-user", 1, 1, now=86400))
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM rate_limit_buckets WHERE bucket_start = 0"
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                store.close()
+
+    def test_two_connections_concurrently_never_exceed_the_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            IndexStore(db_path).close()
+            barrier = threading.Barrier(2)
+
+            def claim_many() -> int:
+                store = IndexStore(db_path)
+                try:
+                    barrier.wait()
+                    return sum(
+                        store.claim_rate_limit("shared-user", 10, 0, now=0)
+                        for _ in range(10)
+                    )
+                finally:
+                    store.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                accepted = list(executor.map(lambda _: claim_many(), range(2)))
+
+            self.assertEqual(sum(accepted), 10)
+            store = IndexStore(db_path)
+            try:
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT count FROM rate_limit_buckets WHERE window_seconds = 60"
+                    ).fetchone()[0],
+                    10,
+                )
             finally:
                 store.close()
 

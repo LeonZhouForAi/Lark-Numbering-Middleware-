@@ -44,6 +44,8 @@ class Settings:
     rag_top_k: int = 6
     rag_min_relevance: float = 0.42
     rag_question_max_chars: int = 500
+    rag_rate_limit_per_minute: int = 10
+    rag_rate_limit_per_day: int = 200
     rag_max_chars: int = 900
     rag_enable_ocr: bool = True
     rag_semantic_chunking: bool = True
@@ -88,6 +90,18 @@ class Settings:
             raise ConfigError("API_RETRY_BASE_DELAY 必须是有限非负数")
         if question_max_chars < 1:
             raise ConfigError("RAG_QUESTION_MAX_CHARS 必须是正整数")
+        rate_limits: dict[str, int] = {}
+        for name, default in (
+            ("RAG_RATE_LIMIT_PER_MINUTE", "10"),
+            ("RAG_RATE_LIMIT_PER_DAY", "200"),
+        ):
+            try:
+                value = int(env.get(name, default))
+            except ValueError as exc:
+                raise ConfigError(f"{name} 必须是非负整数") from exc
+            if not 0 <= value <= 2**63 - 1:
+                raise ConfigError(f"{name} 必须是非负整数")
+            rate_limits[name] = value
         if top_k < 1 or max_chars < 100:
             raise ConfigError("RAG_TOP_K 必须大于 0，RAG_MAX_CHARS 必须不小于 100")
         if chunk_batch_chars < 2000:
@@ -114,6 +128,8 @@ class Settings:
             rag_top_k=top_k,
             rag_min_relevance=min_relevance,
             rag_question_max_chars=question_max_chars,
+            rag_rate_limit_per_minute=rate_limits["RAG_RATE_LIMIT_PER_MINUTE"],
+            rag_rate_limit_per_day=rate_limits["RAG_RATE_LIMIT_PER_DAY"],
             rag_max_chars=max_chars,
             rag_enable_ocr=_as_bool(env.get("RAG_ENABLE_OCR", "true"), "RAG_ENABLE_OCR"),
             rag_semantic_chunking=_as_bool(
@@ -137,6 +153,8 @@ class Settings:
             f"rag_db_path={self.rag_db_path!r}, "
             f"rag_top_k={self.rag_top_k!r}, rag_min_relevance={self.rag_min_relevance!r}, "
             f"rag_question_max_chars={self.rag_question_max_chars!r}, "
+            f"rag_rate_limit_per_minute={self.rag_rate_limit_per_minute!r}, "
+            f"rag_rate_limit_per_day={self.rag_rate_limit_per_day!r}, "
             f"rag_max_chars={self.rag_max_chars!r}, "
             f"rag_semantic_chunking={self.rag_semantic_chunking!r}, "
             f"deepseek_chunk_model={self.deepseek_chunk_model!r}, "

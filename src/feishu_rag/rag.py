@@ -7,7 +7,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from .models import SearchResult
+from .models import RetrievalScope, SearchResult
 from .store import IndexStore
 
 
@@ -79,14 +79,23 @@ class RagService:
         top_k: int = 6,
         min_relevance: float = 0.42,
         question_max_chars: int = 500,
+        rate_limit_per_minute: int = 10,
+        rate_limit_per_day: int = 200,
     ):
         if question_max_chars < 1:
             raise ValueError("question_max_chars 必须大于 0")
+        if any(
+            type(limit) is not int or not 0 <= limit <= 2**63 - 1
+            for limit in (rate_limit_per_minute, rate_limit_per_day)
+        ):
+            raise ValueError("rate limits must be non-negative integers")
         self.store = store
         self.llm = llm
         self.top_k = top_k
         self.min_relevance = min_relevance
         self.question_max_chars = question_max_chars
+        self.rate_limit_per_minute = rate_limit_per_minute
+        self.rate_limit_per_day = rate_limit_per_day
 
     @staticmethod
     def _context(results: list[SearchResult]) -> tuple[str, list[Citation]]:
@@ -144,7 +153,7 @@ class RagService:
             return UNSAFE_ANSWER
         return answer or INSUFFICIENT_ANSWER
 
-    def answer(self, question: str) -> RagAnswer:
+    def answer(self, question: str, scope: RetrievalScope | None = None) -> RagAnswer:
         question = question.strip()
         if not question:
             return RagAnswer("请输入要查询的问题。", [])
@@ -154,6 +163,7 @@ class RagService:
             question,
             top_k=self.top_k,
             min_relevance=self.min_relevance,
+            scope=scope,
         )
         if not results:
             return RagAnswer("知识库中暂无依据，请换一种问法或联系文控管理员。", [])

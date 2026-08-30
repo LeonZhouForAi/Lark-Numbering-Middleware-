@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from feishu_rag.logging_utils import configure_logging
 from feishu_rag.ingest import Section, index_file
+from feishu_rag.models import RetrievalScope
 from feishu_rag.store import IndexStore
 from feishu_rag import sync as sync_module
 from feishu_rag.sync import SyncResult, sync_wiki_space
@@ -247,6 +248,87 @@ class FeishuSyncTests(unittest.TestCase):
                 self.assertIn("feishu:space-1:node-1", output)
                 self.assertIn("RuntimeError", output)
                 self.assertNotIn(client.content, output)
+            finally:
+                store.close()
+
+    def test_sync_stores_actual_feishu_space_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                sync_wiki_space("space-1", FakeFeishuClient(), store)
+
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT DISTINCT space_id FROM documents"
+                    ).fetchall()[0][0],
+                    "space-1",
+                )
+            finally:
+                store.close()
+
+    def test_unchanged_docx_backfills_legacy_space_without_rechunking(self):
+        client = FakeFeishuClient()
+        planner = SemanticPlanner()
+        scope = RetrievalScope(frozenset({"space-1"}))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                sync_wiki_space("space-1", client, store, semantic_planner=planner)
+                store.connection.execute(
+                    "UPDATE documents SET space_id = '' "
+                    "WHERE source_id = 'feishu:space-1:node-1'"
+                )
+                store.connection.commit()
+
+                result = sync_wiki_space(
+                    "space-1", client, store, semantic_planner=planner
+                )
+
+                self.assertEqual(result.indexed, 0)
+                self.assertEqual(planner.calls, 1)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT space_id FROM documents "
+                        "WHERE source_id = 'feishu:space-1:node-1'"
+                    ).fetchone()[0],
+                    "space-1",
+                )
+                self.assertTrue(store.search("财务报销", scope=scope))
+            finally:
+                store.close()
+
+    def test_unchanged_file_backfills_legacy_space_without_reparsing(self):
+        client = MutableFileFeishuClient()
+        planner = SemanticPlanner()
+        scope = RetrievalScope(frozenset({"space-1"}))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                sync_wiki_space("space-1", client, store, semantic_planner=planner)
+                store.connection.execute(
+                    "UPDATE documents SET space_id = '' "
+                    "WHERE source_id = 'feishu:space-1:file-node'"
+                )
+                store.connection.commit()
+
+                with patch(
+                    "feishu_rag.sync.extract_sections",
+                    side_effect=AssertionError("unchanged file must not be reparsed"),
+                ):
+                    result = sync_wiki_space(
+                        "space-1", client, store, semantic_planner=planner
+                    )
+
+                self.assertEqual(result.indexed, 0)
+                self.assertEqual(planner.calls, 1)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT space_id FROM documents "
+                        "WHERE source_id = 'feishu:space-1:file-node'"
+                    ).fetchone()[0],
+                    "space-1",
+                )
+                self.assertTrue(store.search("有效附件", scope=scope))
             finally:
                 store.close()
 

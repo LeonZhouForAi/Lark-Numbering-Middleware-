@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from hashlib import sha256
 
 from feishu_rag.feishu_client import (
     FeishuAPIError,
@@ -14,10 +15,17 @@ from feishu_rag.store import IndexStore
 from feishu_rag.web import handle_event, verify_signature
 
 
+RATE_LIMIT_ANSWER = "请求过于频繁，请稍后再试。"
+
+
 class FakeRag:
-    def __init__(self, store=None):
+    def __init__(self, store=None, per_minute=None, per_day=None):
         self.questions = []
         self.store = store
+        if per_minute is not None:
+            self.rate_limit_per_minute = per_minute
+        if per_day is not None:
+            self.rate_limit_per_day = per_day
 
     def answer(self, question):
         self.questions.append(question)
@@ -38,7 +46,32 @@ class AmbiguousFeishu(FakeFeishu):
         raise ConnectionError("reply result unknown")
 
 
+class NotSentOnceFeishu(FakeFeishu):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def reply_text(self, message_id, text):
+        self.calls += 1
+        if self.calls == 1:
+            raise FeishuReplyNotSentError("not sent")
+        super().reply_text(message_id, text)
+
+
 class WebhookTests(unittest.TestCase):
+    @staticmethod
+    def _payload(message_id, sender_id=None):
+        event = {
+            "message": {
+                "message_id": message_id,
+                "message_type": "text",
+                "content": json.dumps({"text": "报销怎么走"}, ensure_ascii=False),
+            }
+        }
+        if sender_id is not None:
+            event["sender"] = {"sender_type": "user", "sender_id": sender_id}
+        return {"header": {"event_type": "im.message.receive_v1"}, "event": event}
+
     def test_url_verification_returns_challenge(self):
         payload = {"type": "url_verification", "token": "verify", "challenge": "abc"}
 
@@ -228,6 +261,144 @@ class WebhookTests(unittest.TestCase):
 
                 self.assertEqual(second, {"status": "ok"})
                 self.assertEqual(rag.questions, ["报销怎么走", "报销怎么走"])
+            finally:
+                store.close()
+
+    def test_rate_limit_uses_sender_id_priority_after_message_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                rag = FakeRag(store, per_minute=10, per_day=200)
+                payload = self._payload(
+                    "om_actor",
+                    {
+                        "open_id": "ou_preferred",
+                        "union_id": "on_fallback",
+                        "user_id": "legacy_fallback",
+                    },
+                )
+
+                self.assertEqual(
+                    handle_event(payload, rag, FakeFeishu(), verification_token="verify"),
+                    {"status": "ok"},
+                )
+                self.assertEqual(
+                    {
+                        row[0]
+                        for row in store.connection.execute(
+                            "SELECT user_hash FROM rate_limit_buckets"
+                        ).fetchall()
+                    },
+                    {sha256(b"ou_preferred").hexdigest()},
+                )
+                self.assertEqual(
+                    handle_event(payload, rag, FakeFeishu(), verification_token="verify"),
+                    {"status": "duplicate"},
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT SUM(count) FROM rate_limit_buckets"
+                    ).fetchone()[0],
+                    2,
+                )
+            finally:
+                store.close()
+
+    def test_rate_limit_falls_back_to_union_then_user_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                rag = FakeRag(store, per_minute=10, per_day=0)
+                feishu = FakeFeishu()
+                handle_event(
+                    self._payload("om_union", {"union_id": "on_union", "user_id": "u_old"}),
+                    rag,
+                    feishu,
+                    verification_token="verify",
+                )
+                handle_event(
+                    self._payload("om_user", {"user_id": "u_user"}),
+                    rag,
+                    feishu,
+                    verification_token="verify",
+                )
+                self.assertEqual(
+                    {
+                        row[0]
+                        for row in store.connection.execute(
+                            "SELECT user_hash FROM rate_limit_buckets"
+                        ).fetchall()
+                    },
+                    {
+                        sha256(b"on_union").hexdigest(),
+                        sha256(b"u_user").hexdigest(),
+                    },
+                )
+            finally:
+                store.close()
+
+    def test_exceeded_rate_limit_sends_fixed_reply_without_calling_rag_and_keeps_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                rag = FakeRag(store, per_minute=1, per_day=0)
+                feishu = FakeFeishu()
+                first = self._payload("om_first", {"open_id": "ou_limited"})
+                limited = self._payload("om_limited", {"open_id": "ou_limited"})
+
+                self.assertEqual(
+                    handle_event(first, rag, feishu, verification_token="verify"),
+                    {"status": "ok"},
+                )
+                self.assertEqual(
+                    handle_event(limited, rag, feishu, verification_token="verify"),
+                    {"status": "rate_limited"},
+                )
+                self.assertEqual(rag.questions, ["报销怎么走"])
+                self.assertEqual(feishu.replies[-1], ("om_limited", RATE_LIMIT_ANSWER))
+                self.assertEqual(
+                    handle_event(limited, rag, feishu, verification_token="verify"),
+                    {"status": "duplicate"},
+                )
+            finally:
+                store.close()
+
+    def test_missing_actor_with_enabled_limit_releases_message_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                rag = FakeRag(store, per_minute=1, per_day=0)
+                payload = self._payload("om_missing_actor")
+
+                with self.assertRaisesRegex(ValueError, "actor"):
+                    handle_event(payload, rag, FakeFeishu(), verification_token="verify")
+                payload["event"]["sender"] = {
+                    "sender_type": "user",
+                    "sender_id": {"open_id": "ou_retry"},
+                }
+                self.assertEqual(
+                    handle_event(payload, rag, FakeFeishu(), verification_token="verify"),
+                    {"status": "ok"},
+                )
+            finally:
+                store.close()
+
+    def test_reply_not_sent_releases_claim_but_keeps_rate_limit_consumption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                rag = FakeRag(store, per_minute=1, per_day=0)
+                feishu = NotSentOnceFeishu()
+                payload = self._payload("om_retry", {"open_id": "ou_retry"})
+
+                with self.assertRaises(FeishuReplyNotSentError):
+                    handle_event(payload, rag, feishu, verification_token="verify")
+                self.assertEqual(
+                    handle_event(payload, rag, feishu, verification_token="verify"),
+                    {"status": "rate_limited"},
+                )
+                self.assertEqual(rag.questions, ["报销怎么走"])
+                self.assertEqual(feishu.replies, [("om_retry", RATE_LIMIT_ANSWER)])
             finally:
                 store.close()
 
