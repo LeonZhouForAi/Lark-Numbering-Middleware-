@@ -46,7 +46,7 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(settings.rag_semantic_chunking)
         self.assertEqual(settings.deepseek_chunk_model, "deepseek-v4-flash")
         self.assertEqual(settings.deepseek_chunk_batch_chars, 12000)
-        self.assertEqual(settings.rag_chunk_strategy_version, "hybrid-v1")
+        self.assertEqual(settings.rag_chunk_strategy_version, "hybrid-v2")
 
 
 if __name__ == "__main__":

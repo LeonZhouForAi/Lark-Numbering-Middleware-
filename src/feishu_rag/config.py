@@ -46,7 +46,7 @@ class Settings:
     rag_semantic_chunking: bool = True
     deepseek_chunk_model: str = "deepseek-v4-flash"
     deepseek_chunk_batch_chars: int = 12000
-    rag_chunk_strategy_version: str = "hybrid-v1"
+    rag_chunk_strategy_version: str = "hybrid-v2"
     log_level: str = "INFO"
 
     @classmethod
@@ -69,7 +69,7 @@ class Settings:
             raise ConfigError("RAG_TOP_K 必须大于 0，RAG_MAX_CHARS 必须不小于 100")
         if chunk_batch_chars < 2000:
             raise ConfigError("DEEPSEEK_CHUNK_BATCH_CHARS 必须至少为 2000")
-        strategy_version = env.get("RAG_CHUNK_STRATEGY_VERSION", "hybrid-v1").strip()
+        strategy_version = env.get("RAG_CHUNK_STRATEGY_VERSION", "hybrid-v2").strip()
         if not strategy_version:
             raise ConfigError("RAG_CHUNK_STRATEGY_VERSION 不能为空")
         return cls(

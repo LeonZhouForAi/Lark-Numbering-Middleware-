@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feishu-rag-bot"
-version = "0.2.1"
+version = "0.2.2"
 description = "飞书机器人 + DeepSeek 的轻量 RAG 服务"
 requires-python = ">=3.11"
 dependencies = [
