@@ -15,6 +15,7 @@ class Chunk:
     content: str
     page: int | None = None
     section: str | None = None
+    search_text: str = ""
 
     @property
     def location(self) -> str:

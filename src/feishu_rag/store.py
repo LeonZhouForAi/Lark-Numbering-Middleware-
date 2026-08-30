@@ -48,6 +48,9 @@ class IndexStore:
             );
             """
         )
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(chunks)").fetchall()}
+        if "search_text" not in columns:
+            self.connection.execute("ALTER TABLE chunks ADD COLUMN search_text TEXT NOT NULL DEFAULT ''")
         try:
             self.connection.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_id UNINDEXED, title, content)"
@@ -80,8 +83,8 @@ class IndexStore:
                 (source_id, title, path, checksum, time.time()),
             )
             self.connection.executemany(
-                "INSERT INTO chunks(id,source_id,title,content,page,section) VALUES(?,?,?,?,?,?)",
-                ((c.id, c.source_id, c.title, c.content, c.page, c.section) for c in chunk_list),
+                "INSERT INTO chunks(id,source_id,title,content,page,section,search_text) VALUES(?,?,?,?,?,?,?)",
+                ((c.id, c.source_id, c.title, c.content, c.page, c.section, c.search_text) for c in chunk_list),
             )
             if self._fts_available:
                 self.connection.executemany(
@@ -110,21 +113,31 @@ class IndexStore:
         if not terms:
             return []
         rows = self.connection.execute(
-            "SELECT id,source_id,title,content,page,section FROM chunks"
+            "SELECT id,source_id,title,content,page,section,search_text FROM chunks"
         ).fetchall()
         scored: list[SearchResult] = []
         for row in rows:
             title = row["title"].lower()
             content = row["content"].lower()
+            search_text = (row["search_text"] or "").lower()
             score = 0.0
             for term in terms:
                 needle = term.lower()
                 score += title.count(needle) * 3.0
                 score += content.count(needle)
+                score += search_text.count(needle) * 0.75
             if score:
                 scored.append(
                     SearchResult(
-                        Chunk(row["id"], row["source_id"], row["title"], row["content"], row["page"], row["section"]),
+                        Chunk(
+                            row["id"],
+                            row["source_id"],
+                            row["title"],
+                            row["content"],
+                            row["page"],
+                            row["section"],
+                            row["search_text"] or "",
+                        ),
                         score,
                     )
                 )

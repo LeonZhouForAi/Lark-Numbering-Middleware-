@@ -7,6 +7,31 @@ from feishu_rag.store import IndexStore
 
 
 class StoreTests(unittest.TestCase):
+    def test_search_text_is_searchable_but_original_content_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.upsert_document(
+                    "finance.pdf",
+                    "财务制度",
+                    "finance.pdf",
+                    "v1",
+                    [
+                        Chunk(
+                            "c-meta",
+                            "finance.pdf",
+                            "财务制度",
+                            "提交费用申请单。",
+                            search_text="报销 付款 审批流程",
+                        )
+                    ],
+                )
+                result = store.search("报销审批", 3)[0].chunk
+                self.assertEqual(result.content, "提交费用申请单。")
+                self.assertEqual(result.search_text, "报销 付款 审批流程")
+            finally:
+                store.close()
+
     def test_message_claim_prevents_duplicate_processing(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
