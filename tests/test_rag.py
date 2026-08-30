@@ -31,7 +31,7 @@ class RagTests(unittest.TestCase):
         self.assertEqual(llm.calls, [])
         self.assertEqual(answer.citations, [])
 
-    def test_hit_answer_contains_numbered_source(self):
+    def test_hit_answer_hides_sources_but_keeps_internal_citations(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
             store.upsert_document(
@@ -47,9 +47,10 @@ class RagTests(unittest.TestCase):
             finally:
                 store.close()
 
-        self.assertIn("[1]", answer.text)
-        self.assertIn("财务报销制度", answer.text)
+        self.assertNotIn("来源：", answer.text)
+        self.assertNotIn("[1]", answer.text)
         self.assertIn("仅依据资料", llm.calls[0][0])
+        self.assertIn("不得输出资料编号", llm.calls[0][0])
         self.assertEqual(len(answer.citations), 1)
 
 

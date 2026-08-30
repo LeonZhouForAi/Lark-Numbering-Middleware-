@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from .models import SearchResult
@@ -50,9 +51,10 @@ class RagService:
         system_prompt = (
             "你是公司内部知识库助手。仅依据资料回答，不得补造制度、金额、日期或审批人。"
             "资料不足时明确说明‘现有资料不足’，不要用常识替代。回答简洁，保留必要条件。"
-            "回答中可使用资料编号，例如 [1]。"
+            "直接回答问题，不得输出资料编号、引用编号、来源列表或‘来源’区块。"
         )
         user_prompt = f"问题：{question}\n\n资料：\n{context}"
         generated = self.llm.complete(system_prompt, user_prompt)
-        source_lines = "\n".join(f"[{c.index}] {c.title}（{c.location}）" for c in citations)
-        return RagAnswer(f"{generated}\n\n来源：\n{source_lines}", citations)
+        generated = re.sub(r"(?im)^\s*来源[:：][\s\S]*$", "", generated)
+        generated = re.sub(r"\[\d+\]", "", generated)
+        return RagAnswer(generated.strip(), citations)
