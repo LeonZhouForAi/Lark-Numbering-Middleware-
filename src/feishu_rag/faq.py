@@ -161,8 +161,11 @@ class FaqService:
         current_revision = observation.knowledge_revision
         text_terms = self._token_set(observation.normalized_question)
         stale_marked = False
+        best: tuple[float, float, Any] | None = None
         for candidate in candidates:
             if _row_value(candidate, "state", "enabled") != "enabled":
+                continue
+            if _row_value(candidate, "intent_key") != observation.intent_key:
                 continue
             candidate_question = _row_value(
                 candidate, "normalized_question", observation.normalized_question
@@ -174,16 +177,21 @@ class FaqService:
             )
             if text_similarity < self.min_text_similarity:
                 continue
-            if (
-                self._source_overlap(candidate, observation.source_ids)
-                < self.min_source_overlap
-            ):
+            source_overlap = self._source_overlap(candidate, observation.source_ids)
+            if source_overlap < self.min_source_overlap:
                 continue
             if _row_value(candidate, "knowledge_revision") != current_revision:
                 if not stale_marked:
                     self.store.mark_faq_stale_before_revision(current_revision)
                     stale_marked = True
                 continue
+            score = (text_similarity, source_overlap)
+            if best is None or score > best[:2]:
+                best = (text_similarity, source_overlap, candidate)
+        if stale_marked:
+            return None
+        if best is not None:
+            candidate = best[2]
             return FaqMatch(
                 str(_row_value(candidate, "id")),
                 str(_row_value(candidate, "answer", "")),

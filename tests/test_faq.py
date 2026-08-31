@@ -144,7 +144,7 @@ class FaqServiceTests(unittest.TestCase):
                 "knowledge_revision": 3, "state": "enabled",
             },
             {
-                "id": "current-faq", "answer": "新答案",
+                "id": "current-faq", "intent_key": observation.intent_key, "answer": "新答案",
                 "normalized_question": observation.normalized_question,
                 "source_signature": observation.source_signature,
                 "source_ids_json": json.dumps(list(observation.source_ids)),
@@ -156,6 +156,46 @@ class FaqServiceTests(unittest.TestCase):
             FaqMatch("current-faq", "新答案", observation.intent_key),
         )
         self.assertEqual(store.marked, [])
+
+    def test_different_intent_never_hits_even_with_high_text_and_source_similarity(self):
+        store = _FakeStore(revision=4)
+        service = self._service(store)
+        observation = service.describe("甲乙丙丁", _results("supplier"), None)
+        store.candidates = [{
+            "id": "wrong-intent", "intent_key": "different-intent", "answer": "答案",
+            "normalized_question": observation.normalized_question,
+            "source_signature": observation.source_signature,
+            "source_ids_json": json.dumps(list(observation.source_ids)),
+            "knowledge_revision": 4, "state": "enabled",
+        }]
+        self.assertIsNone(service.lookup("甲乙丙丁", _results("supplier"), None))
+        self.assertEqual(store.marked, [])
+
+    def test_lookup_selects_best_same_intent_alias_instead_of_store_order(self):
+        store = _FakeStore(revision=4)
+        service = FaqService(store, True, 3, 15, 0.70, 0.30)
+        results = _results("source-a", "source-b")
+        observation = service.describe("甲乙丙丁", results, None)
+        store.candidates = [
+            {
+                "id": "less-similar", "intent_key": observation.intent_key, "answer": "较差答案",
+                "normalized_question": f"{observation.normalized_question} extra",
+                "source_signature": observation.source_signature,
+                "source_ids_json": json.dumps(["source-a", "source-b"]),
+                "knowledge_revision": 4, "state": "enabled",
+            },
+            {
+                "id": "best-alias", "intent_key": observation.intent_key, "answer": "正确答案",
+                "normalized_question": observation.normalized_question,
+                "source_signature": "other",
+                "source_ids_json": json.dumps(["source-a", "source-c"]),
+                "knowledge_revision": 4, "state": "enabled",
+            },
+        ]
+        self.assertEqual(
+            service.lookup("甲乙丙丁", results, None),
+            FaqMatch("best-alias", "正确答案", observation.intent_key),
+        )
 
     def test_lookup_rejects_different_source_signature(self):
         store = _FakeStore()
@@ -236,7 +276,7 @@ class FaqServiceTests(unittest.TestCase):
                 restarted = IndexStore(db_path)
                 try:
                     fresh_service = FaqService(restarted, True, 2, 15, 0.70, 0.80)
-                    match = fresh_service.lookup("供应商开发怎么执行", results, None)
+                    match = fresh_service.lookup("新供应商怎么导入", results, None)
                     self.assertIsNotNone(match)
                 finally:
                     restarted.close()
