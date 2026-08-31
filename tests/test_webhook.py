@@ -150,6 +150,46 @@ class WebhookTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_reply_is_atomically_sealed_before_external_send(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+
+            class InspectingFeishu(FakeFeishu):
+                def reply_text(self, message_id, text):
+                    row = store.connection.execute(
+                        "SELECT state,claim_token FROM processed_messages "
+                        "WHERE message_id = ?",
+                        (message_id,),
+                    ).fetchone()
+                    self.state_during_reply = tuple(row)
+                    super().reply_text(message_id, text)
+
+            rag = FakeRag(store)
+            feishu = InspectingFeishu()
+            try:
+                result = handle_event(
+                    self._payload("om_sealed"),
+                    rag,
+                    feishu,
+                    verification_token="verify",
+                )
+
+                self.assertEqual(result, {"status": "ok"})
+                self.assertEqual(feishu.state_during_reply[0], "replying")
+                self.assertRegex(feishu.state_during_reply[1], r"^[0-9a-f]{32}$")
+                self.assertEqual(
+                    tuple(
+                        store.connection.execute(
+                            "SELECT state,claim_token FROM processed_messages "
+                            "WHERE message_id = ?",
+                            ("om_sealed",),
+                        ).fetchone()
+                    ),
+                    ("completed", ""),
+                )
+            finally:
+                store.close()
+
     def test_in_progress_message_is_returned_for_retry_without_answering(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
@@ -278,7 +318,7 @@ class WebhookTests(unittest.TestCase):
                 return False
 
             @staticmethod
-            def is_message_claim_owner(message_id, token):
+            def begin_message_reply(message_id, token):
                 return False
 
             @staticmethod
@@ -314,7 +354,7 @@ class WebhookTests(unittest.TestCase):
                 return "claimed", "0123456789abcdef0123456789abcdef"
 
             @staticmethod
-            def is_message_claim_owner(message_id, token):
+            def begin_message_reply(message_id, token):
                 return True
 
         store = IncompleteLeaseStore()
@@ -441,6 +481,12 @@ class WebhookTests(unittest.TestCase):
 
                 with self.assertRaises(FeishuAPIError):
                     handle_event(payload, rag, feishu, verification_token="verify")
+                self.assertIsNone(
+                    store.connection.execute(
+                        "SELECT state FROM processed_messages WHERE message_id = ?",
+                        ("om_not_sent",),
+                    ).fetchone()
+                )
                 second = handle_event(
                     payload, rag, feishu, verification_token="verify"
                 )
@@ -487,6 +533,12 @@ class WebhookTests(unittest.TestCase):
 
                 with self.assertRaises(FeishuReplyNotSentError):
                     handle_event(payload, rag, feishu, verification_token="verify")
+                self.assertIsNone(
+                    store.connection.execute(
+                        "SELECT state FROM processed_messages WHERE message_id = ?",
+                        ("om_invalid_expire",),
+                    ).fetchone()
+                )
                 second = handle_event(
                     payload, rag, feishu, verification_token="verify"
                 )

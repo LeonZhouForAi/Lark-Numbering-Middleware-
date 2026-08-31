@@ -671,7 +671,8 @@ class IndexStore:
         _execute_with_lock_retry(self.connection, "BEGIN IMMEDIATE")
         try:
             self.connection.execute(
-                "DELETE FROM processed_messages WHERE processed_at < ?",
+                "DELETE FROM processed_messages "
+                "WHERE processed_at < ? AND state != 'replying'",
                 (now - retention_seconds,),
             )
             claim_token = uuid.uuid4().hex
@@ -711,8 +712,8 @@ class IndexStore:
             self.connection.commit()
             if state == "claimed":
                 return state, claim_token
-            if state == "in_progress":
-                return state, claim_token
+            if state in {"in_progress", "replying"}:
+                return "in_progress", None
             if state == "completed":
                 return state, None
             raise RuntimeError("invalid message claim state")
@@ -737,17 +738,55 @@ class IndexStore:
         return state
 
     def claim_message(self, message_id: str, retention_seconds: int = 7 * 24 * 60 * 60) -> bool:
-        return self.claim_message_state(message_id, retention_seconds) == "claimed"
+        if (
+            isinstance(retention_seconds, bool)
+            or not isinstance(retention_seconds, (int, float))
+            or retention_seconds <= 0
+        ):
+            raise ValueError("retention_seconds must be positive")
+        now = time.time()
+        _execute_with_lock_retry(self.connection, "BEGIN IMMEDIATE")
+        try:
+            self.connection.execute(
+                "DELETE FROM processed_messages "
+                "WHERE processed_at < ? AND claim_token = ''",
+                (now - retention_seconds,),
+            )
+            cursor = self.connection.execute(
+                "INSERT OR IGNORE INTO processed_messages("
+                "message_id,processed_at,state,claim_token"
+                ") VALUES(?,?,'completed','')",
+                (message_id, now),
+            )
+            self.connection.commit()
+            return cursor.rowcount == 1
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def is_message_claim_owner(self, message_id: str, token: str | None) -> bool:
         if token is None:
             return False
         row = self.connection.execute(
             "SELECT 1 FROM processed_messages "
-            "WHERE message_id = ? AND state = 'in_progress' AND claim_token = ?",
+            "WHERE message_id = ? AND state IN ('in_progress','replying') "
+            "AND claim_token = ?",
             (message_id, token),
         ).fetchone()
         return row is not None
+
+    def begin_message_reply(self, message_id: str, token: str | None) -> bool:
+        if token is None:
+            return False
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE processed_messages "
+                "SET state = 'replying', processed_at = ? "
+                "WHERE message_id = ? AND state = 'in_progress' "
+                "AND claim_token = ?",
+                (time.time(), message_id, token),
+            )
+        return cursor.rowcount == 1
 
     def complete_message(self, message_id: str, token: str | None = None) -> bool:
         with self.connection:
@@ -756,14 +795,14 @@ class IndexStore:
                 cursor = self.connection.execute(
                     "UPDATE processed_messages "
                     "SET state = 'completed', processed_at = ?, claim_token = '' "
-                    "WHERE message_id = ?",
+                    "WHERE message_id = ? AND claim_token = ''",
                     (time.time(), message_id),
                 )
             else:
                 cursor = self.connection.execute(
                     "UPDATE processed_messages "
                     "SET state = 'completed', processed_at = ?, claim_token = '' "
-                    "WHERE message_id = ? AND state = 'in_progress' "
+                    "WHERE message_id = ? AND state = 'replying' "
                     "AND claim_token = ?",
                     (time.time(), message_id, token),
                 )
@@ -774,12 +813,14 @@ class IndexStore:
             if token is None:
                 # 仅为旧调用方保留；生产消息处理始终传入租约 token。
                 cursor = self.connection.execute(
-                    "DELETE FROM processed_messages WHERE message_id = ?", (message_id,)
+                    "DELETE FROM processed_messages "
+                    "WHERE message_id = ? AND claim_token = ''",
+                    (message_id,),
                 )
             else:
                 cursor = self.connection.execute(
                     "DELETE FROM processed_messages "
-                    "WHERE message_id = ? AND state = 'in_progress' "
+                    "WHERE message_id = ? AND state IN ('in_progress','replying') "
                     "AND claim_token = ?",
                     (message_id, token),
                 )

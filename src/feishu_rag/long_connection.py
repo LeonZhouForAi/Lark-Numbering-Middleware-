@@ -50,8 +50,8 @@ class MessageProcessingError(RuntimeError):
 class AckAfterProcessingClient(LarkWsClient):
     """在工作线程完成事件处理后才向飞书确认消息。
 
-    此适配器集中依赖 ``lark-oapi>=1.4,<2`` 的私有长连接契约。SDK 2.x
-    升级前必须重新核对 ``Client._handle_data_frame``；项目不会修改 site-packages。
+    此适配器集中依赖 ``lark-oapi==1.7.3`` 的私有长连接契约。升级 SDK
+    前必须重新核对 ``Client._handle_data_frame``；项目不会修改 site-packages。
     """
 
     def __init__(

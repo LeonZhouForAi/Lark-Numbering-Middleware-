@@ -984,10 +984,43 @@ class StoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
             try:
+                self.assertTrue(
+                    store.claim_message("om_duplicate", retention_seconds=60)
+                )
+                self.assertFalse(
+                    store.claim_message("om_duplicate", retention_seconds=60)
+                )
+                self.assertEqual(
+                    tuple(
+                        store.connection.execute(
+                            "SELECT state,claim_token FROM processed_messages "
+                            "WHERE message_id = ?",
+                            ("om_duplicate",),
+                        ).fetchone()
+                    ),
+                    ("completed", ""),
+                )
+                self.assertTrue(store.release_message("om_duplicate"))
                 self.assertTrue(store.claim_message("om_duplicate"))
-                self.assertFalse(store.claim_message("om_duplicate"))
-                store.release_message("om_duplicate")
-                self.assertTrue(store.claim_message("om_duplicate"))
+            finally:
+                store.close()
+
+    def test_legacy_message_claim_respects_short_retention_without_a_lease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                with patch("feishu_rag.store.time.time", return_value=100):
+                    self.assertTrue(
+                        store.claim_message("om_short", retention_seconds=60)
+                    )
+                with patch("feishu_rag.store.time.time", return_value=159):
+                    self.assertFalse(
+                        store.claim_message("om_short", retention_seconds=60)
+                    )
+                with patch("feishu_rag.store.time.time", return_value=161):
+                    self.assertTrue(
+                        store.claim_message("om_short", retention_seconds=60)
+                    )
             finally:
                 store.close()
 
@@ -995,13 +1028,19 @@ class StoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
             try:
-                self.assertEqual(store.claim_message_state("om_state"), "claimed")
-                self.assertEqual(store.claim_message_state("om_state"), "in_progress")
+                state, token = store.claim_message_lease("om_state")
+                self.assertEqual(state, "claimed")
+                self.assertIsNotNone(token)
+                self.assertEqual(
+                    store.claim_message_lease("om_state"),
+                    ("in_progress", None),
+                )
 
-                store.complete_message("om_state")
+                self.assertTrue(store.begin_message_reply("om_state", token))
+                self.assertTrue(store.complete_message("om_state", token=token))
 
                 self.assertEqual(store.claim_message_state("om_state"), "completed")
-                store.release_message("om_state")
+                self.assertTrue(store.release_message("om_state"))
                 self.assertEqual(store.claim_message_state("om_state"), "claimed")
             finally:
                 store.close()
@@ -1054,6 +1093,8 @@ class StoreTests(unittest.TestCase):
                     ),
                     ("completed", None),
                 )
+                self.assertTrue(store.complete_message("om_legacy"))
+                self.assertTrue(store.release_message("om_legacy"))
             finally:
                 store.close()
 
@@ -1067,7 +1108,7 @@ class StoreTests(unittest.TestCase):
                 self.assertRegex(first_token or "", r"^[0-9a-f]{32}$")
                 self.assertEqual(
                     store.claim_message_lease("om_fenced", now=101),
-                    ("in_progress", first_token),
+                    ("in_progress", None),
                 )
 
                 state, second_token = store.claim_message_lease(
@@ -1081,14 +1122,39 @@ class StoreTests(unittest.TestCase):
                 self.assertTrue(store.is_message_claim_owner("om_fenced", second_token))
                 self.assertFalse(store.is_message_claim_owner("om_fenced", first_token))
 
+                self.assertFalse(store.begin_message_reply("om_fenced", first_token))
                 self.assertFalse(store.complete_message("om_fenced", token=first_token))
                 self.assertFalse(store.release_message("om_fenced", token=first_token))
+                self.assertFalse(store.complete_message("om_fenced"))
+                self.assertFalse(store.release_message("om_fenced"))
+                self.assertFalse(store.complete_message("om_fenced", token=second_token))
                 row = store.connection.execute(
                     "SELECT state,claim_token FROM processed_messages WHERE message_id = ?",
                     ("om_fenced",),
                 ).fetchone()
                 self.assertEqual(tuple(row), ("in_progress", second_token))
 
+                self.assertTrue(store.begin_message_reply("om_fenced", second_token))
+                self.assertFalse(store.begin_message_reply("om_fenced", second_token))
+                self.assertEqual(
+                    store.claim_message_lease(
+                        "om_fenced",
+                        retention_seconds=700,
+                        in_progress_timeout_seconds=600,
+                        now=10_000,
+                    ),
+                    ("in_progress", None),
+                )
+                self.assertEqual(
+                    tuple(
+                        store.connection.execute(
+                            "SELECT state,claim_token FROM processed_messages "
+                            "WHERE message_id = ?",
+                            ("om_fenced",),
+                        ).fetchone()
+                    ),
+                    ("replying", second_token),
+                )
                 self.assertTrue(store.complete_message("om_fenced", token=second_token))
                 self.assertEqual(
                     store.connection.execute(
@@ -1122,11 +1188,49 @@ class StoreTests(unittest.TestCase):
                 leases = list(executor.map(lambda _: claim(), range(2)))
 
             self.assertEqual(sorted(state for state, _ in leases), ["claimed", "in_progress"])
-            tokens = {token for _, token in leases}
-            self.assertEqual(len(tokens), 1)
-            token = tokens.pop()
-            self.assertIsNotNone(token)
-            self.assertTrue(re.fullmatch(r"[0-9a-f]{32}", token or ""))
+            claimed_token = next(token for state, token in leases if state == "claimed")
+            waiting_token = next(
+                token for state, token in leases if state == "in_progress"
+            )
+            self.assertIsNotNone(claimed_token)
+            self.assertTrue(re.fullmatch(r"[0-9a-f]{32}", claimed_token or ""))
+            self.assertIsNone(waiting_token)
+
+    def test_two_connections_atomically_seal_reply_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            seed = IndexStore(db_path)
+            state, token = seed.claim_message_lease("om_seal_concurrent")
+            self.assertEqual(state, "claimed")
+            seed.close()
+            barrier = threading.Barrier(2)
+
+            def seal() -> bool:
+                store = IndexStore(db_path)
+                try:
+                    barrier.wait(timeout=2)
+                    return store.begin_message_reply("om_seal_concurrent", token)
+                finally:
+                    store.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                sealed = list(executor.map(lambda _: seal(), range(2)))
+
+            self.assertEqual(sorted(sealed), [False, True])
+            store = IndexStore(db_path)
+            try:
+                self.assertEqual(
+                    tuple(
+                        store.connection.execute(
+                            "SELECT state,claim_token FROM processed_messages "
+                            "WHERE message_id = ?",
+                            ("om_seal_concurrent",),
+                        ).fetchone()
+                    ),
+                    ("replying", token),
+                )
+            finally:
+                store.close()
 
     def test_two_connections_atomically_claim_one_message(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1191,10 +1295,10 @@ class StoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
             try:
-                self.assertEqual(
-                    store.claim_message_state("om_done", now=100), "claimed"
-                )
-                store.complete_message("om_done")
+                state, token = store.claim_message_lease("om_done", now=100)
+                self.assertEqual(state, "claimed")
+                self.assertTrue(store.begin_message_reply("om_done", token))
+                self.assertTrue(store.complete_message("om_done", token=token))
                 self.assertEqual(
                     store.claim_message_state(
                         "om_done", in_progress_timeout_seconds=1, now=1000

@@ -12,10 +12,14 @@
 
 - 使用 SQLite FTS5/BM25 生成候选，并与字面检索混排；以 confidence 和 `RAG_MIN_RELEVANCE=0.42` 过滤泛词及无关命中。
 - 回答阶段使用严格的匿名结构化 JSON，仅把原文作为上下文；证据不足、来源泄漏或危险输出均 fail-closed。
-- DeepSeek 和飞书幂等读取请求支持有限重试；新增按模型、用途和日期聚合的 Token usage report。
+- 飞书幂等读取请求支持有限重试；新增按模型、用途和日期聚合的 Token usage report。
 - 按用户哈希执行分钟/日限流，检索支持 `RetrievalScope` 空间边界，为后续 ACL 接入保留 seam。
 - 长连接使用有界工作线程，并在完整处理后才返回 ACK；处理失败返回非成功状态以便飞书重投，同时保持 WebSocket 心跳不被慢模型调用阻塞。
-- 消息租约增加 UUID fencing token；过期接管后，旧工作器不能完成、释放或发送新租约的答复。发送前会复核所有权，但飞书回复接口缺少外部幂等键，因此不承诺跨网络故障下的严格 exactly-once。
+- 消息租约增加 UUID fencing token，并以 `in_progress -> replying` CAS 原子封口；封口后禁止接管，崩溃时按 at-most-once 处理，旧工作器和无 token 调用不能完成、释放或发送新租约的答复。
+- 增加 v0.4 到 v0.3 的安全回滚 CLI：只读预检后显式执行 SQLite 在线备份，再在事务内移除不兼容的 FTS v2 表；禁止直接用 v0.3 写入 v0.4 FTS。
+- DeepSeek Chat Completions 生成 POST 改为单次尝试；Token usage 仅统计成功响应，网络结果不明时的费用以服务商账单为准。
+- 输出脱敏补充密码、口令、密钥、API 密钥、访问令牌和令牌等中文标签，并保留正常制度说明的误杀回归测试。
+- `lark-oapi` 精确锁定到已测试的 `1.7.3`，新增真实私有 ACK 合约测试，SDK 升级必须显式验证。
 - 保持 `hybrid-v4` 切片策略；本版本不引入向量数据库，代码与测试已完成但尚未部署生产环境。
 
 ## 0.3.0 - 2026-08-30

@@ -238,7 +238,7 @@ async def test_superseded_worker_is_acked_200_without_reply_or_token() -> None:
             return "claimed", claim_token
 
         @staticmethod
-        def is_message_claim_owner(message_id: str, token: str) -> bool:
+        def begin_message_reply(message_id: str, token: str) -> bool:
             return False
 
         @staticmethod
@@ -365,7 +365,7 @@ def test_superseded_result_and_logs_never_expose_claim_token(caplog) -> None:
             return "claimed", claim_token
 
         @staticmethod
-        def is_message_claim_owner(message_id: str, token: str) -> bool:
+        def begin_message_reply(message_id: str, token: str) -> bool:
             return False
 
         @staticmethod

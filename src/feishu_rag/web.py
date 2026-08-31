@@ -89,7 +89,7 @@ def handle_event(
     claim_message = getattr(store, "claim_message", None)
     complete_message = getattr(store, "complete_message", None)
     release_message = getattr(store, "release_message", None)
-    is_message_claim_owner = getattr(store, "is_message_claim_owner", None)
+    begin_message_reply = getattr(store, "begin_message_reply", None)
     claimed = False
     owner_token: str | None = None
     token_fenced = False
@@ -97,7 +97,7 @@ def handle_event(
         if not all(
             callable(operation)
             for operation in (
-                is_message_claim_owner,
+                begin_message_reply,
                 complete_message,
                 release_message,
             )
@@ -142,11 +142,6 @@ def handle_event(
         else:
             complete_message(message_id)
 
-    def still_owns_claim() -> bool:
-        if not token_fenced:
-            return True
-        return bool(is_message_claim_owner(message_id, owner_token))
-
     per_minute = getattr(rag, "rate_limit_per_minute", 0)
     per_day = getattr(rag, "rate_limit_per_day", 0)
     status = "ok"
@@ -168,9 +163,9 @@ def handle_event(
     except Exception:
         release_owned_claim()
         raise
-    # 飞书回复接口没有可用的外部幂等键，因此在外部调用前做最后一次
-    # 租约复核；不跨网络调用持有 SQLite 写锁，属于防并发重投的最佳努力。
-    if not still_owns_claim():
+    # 回复前用单条 CAS 将租约原子封口；replying 不再允许过期接管。
+    # 进程若在封口后崩溃会少回复，但不会让另一工作器重复发送。
+    if token_fenced and not begin_message_reply(message_id, owner_token):
         return {"status": "superseded"}
     try:
         feishu.reply_text(message_id, answer_text)

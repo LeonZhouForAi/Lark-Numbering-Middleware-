@@ -8,7 +8,7 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any
 
-from .retry import RetryPolicy, run_with_retry
+from .retry import RetryPolicy
 
 
 _SQLITE_INT_MAX = 2**63 - 1
@@ -66,13 +66,6 @@ class DeepSeekClient:
         return f"DeepSeekClient(base_url={self.base_url!r}, model={self.model!r})"
 
     @staticmethod
-    def _retryable_exception(exc: Exception) -> bool:
-        return isinstance(
-            exc,
-            (_DeepSeekNetworkError, urllib.error.URLError, TimeoutError, OSError),
-        )
-
-    @staticmethod
     def _token_count(value: Any) -> int:
         return (
             value
@@ -115,17 +108,11 @@ class DeepSeekClient:
             )
 
         try:
-            status, raw = run_with_retry(
-                request,
-                self.retry_policy,
-                retry_result=lambda result: result[0] == 429
-                or 500 <= result[0] < 600,
-                retry_exception=self._retryable_exception,
-            )
+            status, raw = request()
         except Exception as exc:
-            if self._retryable_exception(exc):
-                raise DeepSeekError("无法连接 DeepSeek API，请检查服务器网络") from exc
-            raise
+            raise DeepSeekError(
+                "DeepSeek 请求结果不明，已停止自动重试；费用请以服务商账单为准"
+            ) from exc
         if status == 401:
             raise DeepSeekError("DeepSeek API Key 无效或已过期")
         if status == 429:

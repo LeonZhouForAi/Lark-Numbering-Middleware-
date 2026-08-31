@@ -335,6 +335,12 @@ def test_output_removes_zero_width_control_characters_and_numeric_citations() ->
         "**token** AbCdEf1234567890GhIjKl",
         "| client_secret | ZxCvBn1234567890QwErTy |",
         "token is AbCdEf1234567890GhIjKl",
+        "服务器密码为 Demo@1234",
+        "登录口令为 Login_2026@Abc",
+        "应用密钥为 AppKey_2026@Abc-def/ghi",
+        "API密钥为 DsKey.2026@Abc-def/ghi",
+        "访问令牌为 Access_2026@Abc-def/xyz",
+        "令牌为 Token_2026@Abc",
     ],
 )
 def test_dangerous_output_fails_closed(unsafe: str) -> None:
@@ -382,6 +388,23 @@ def test_normal_token_explanation_is_not_treated_as_a_bare_secret() -> None:
     answer = RagService(RecordingStore([_result()]), llm).answer("token 是什么")
 
     assert answer.text == "token 是模型计费单位,数量按响应统计。"
+
+
+@pytest.mark.parametrize(
+    "generated",
+    [
+        "服务器密码必须至少包含 12 个字符。",
+        "应用密钥由信息部门统一保管。",
+        "访问令牌有效期为 2 小时。",
+        "口令遗忘后请联系管理员重置。",
+    ],
+)
+def test_chinese_secret_labels_without_values_are_not_blocked(generated: str) -> None:
+    llm = FakeLLM({"answer": generated, "evidence_sufficient": True})
+
+    answer = RagService(RecordingStore([_result()]), llm).answer("安全规范是什么")
+
+    assert answer.text == generated
 
 
 class DeepSeekClientTests(unittest.TestCase):

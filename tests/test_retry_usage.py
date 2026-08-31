@@ -53,11 +53,11 @@ def test_retry_policy_defaults_and_exponential_delays() -> None:
     assert delays == [0.5, 1.0, 4.0]
 
 
-@pytest.mark.parametrize("first_status", [429, 500, 503])
-def test_deepseek_retries_retryable_http_statuses_with_injected_sleep(
-    first_status: int,
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_deepseek_generation_http_failures_are_single_attempt(
+    status: int,
 ) -> None:
-    transport = SequenceTransport([(first_status, b"{}"), (500, b"{}"), (200, SUCCESS)])
+    transport = SequenceTransport([(status, b"{}"), (200, SUCCESS)])
     delays = []
     client = DeepSeekClient(
         "secret",
@@ -65,27 +65,30 @@ def test_deepseek_retries_retryable_http_statuses_with_injected_sleep(
         retry_policy=RetryPolicy(sleep=delays.append),
     )
 
-    assert client.complete("system", "question") == "ok"
-    assert transport.calls == 3
-    assert delays == [0.5, 1.0]
-
-
-def test_deepseek_retries_network_errors_at_most_three_times_without_leaking_detail() -> None:
-    transport = SequenceTransport(
-        [OSError("secret request body"), TimeoutError("secret"), OSError("secret")]
-    )
-    delays = []
-    client = DeepSeekClient(
-        "secret",
-        transport=transport,
-        retry_policy=RetryPolicy(sleep=delays.append),
-    )
-
-    with pytest.raises(DeepSeekError) as error:
+    with pytest.raises(DeepSeekError):
         client.complete("system", "question")
 
-    assert transport.calls == 3
-    assert delays == [0.5, 1.0]
+    assert transport.calls == 1
+    assert delays == []
+
+
+def test_deepseek_unknown_transport_result_is_not_retried_or_counted() -> None:
+    transport = SequenceTransport([OSError("secret request body"), (200, SUCCESS)])
+    delays = []
+    sink = RecordingUsageSink()
+    client = DeepSeekClient(
+        "secret",
+        transport=transport,
+        retry_policy=RetryPolicy(sleep=delays.append),
+        usage_sink=sink,
+    )
+
+    with pytest.raises(DeepSeekError, match="结果不明") as error:
+        client.complete("system", "question")
+
+    assert transport.calls == 1
+    assert delays == []
+    assert sink.records == []
     assert "secret" not in str(error.value)
 
 

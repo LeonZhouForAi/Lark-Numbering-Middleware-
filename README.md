@@ -134,6 +134,26 @@ docker compose ps
 
 长连接模式由 `rag-events` 服务运行：在飞书后台选择“使用长连接接收事件”，订阅 `im.message.receive_v1` 后，该服务会主动连接飞书，不需要公网域名或开放 443 端口，也无需将 8010 端口暴露到公网。事件处理通过有界工作线程执行，但只有在完整 RAG 处理结束后才向飞书返回成功 ACK；异常返回失败状态以便重投。并发线程数和最大在途消息数分别由 `RAG_WORKER_THREADS`、`RAG_MAX_PENDING_MESSAGES` 控制。
 
+### 从 v0.4 回滚到 v0.3
+
+v0.4 的 `chunks_fts` 列结构与 v0.3 不兼容，不能直接用 v0.3 容器打开并继续写入。切换代码前必须停止问答、长连接和同步定时器，并使用 SQLite Backup API 生成一致性备份：
+
+```bash
+sudo systemctl stop feishu-rag-sync.timer
+sudo docker compose stop rag rag-events
+mkdir -p data/backups
+
+# 第一次只读预检，不修改数据库
+python scripts/prepare_v03_rollback.py data/rag.sqlite3 \
+  --backup data/backups/rag-before-v03.sqlite3
+
+# 核对路径后显式执行：先备份，再只删除 v2 chunks_fts
+python scripts/prepare_v03_rollback.py data/rag.sqlite3 \
+  --backup data/backups/rag-before-v03.sqlite3 --execute
+```
+
+备份路径必须位于已经存在的目录且不能已有同名文件，脚本永不覆盖备份。执行成功后再切换到 v0.3；v0.3 首次启动会创建旧 FTS 列，现有 `documents/chunks` 不会被删除。v0.3 的字面检索仍可使用；若需要完整重建旧 FTS，应在启动后执行一次全量同步。详细步骤见 [`docs/operations/v0.4-to-v0.3-rollback.md`](docs/operations/v0.4-to-v0.3-rollback.md)。
+
 ### 从飞书知识库同步
 
 在 `.env` 设置 `FEISHU_SPACE_ID` 后，可手动同步知识库节点和附件：
@@ -147,6 +167,8 @@ python -m feishu_rag.sync --db data/rag.sqlite3
 ```bash
 python scripts/report_usage.py data/rag.sqlite3 --input-price 1 --output-price 2
 ```
+
+该报表只汇总 DeepSeek 成功响应中返回的 `usage`，属于本地观测值而非服务商账单。网络中断、超时、429 或 5xx 等未返回可用 `usage` 的调用可能已经产生费用，但本地无法取得其 Token 数，因此不会进入报表；成本核对应以 DeepSeek 账单为准。
 
 你当前的三个知识库 ID 如下，可分别执行同步：
 
@@ -168,7 +190,7 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 - 提示词要求模型只依据召回资料回答，不补造金额、日期、审批人或制度条款。
 - `RAG_SEMANTIC_CHUNKING=true` 时使用本地结构切片加 DeepSeek 语义分组；失败自动回退本地切片。
 - 模型生成的标题、关键词和摘要只参与检索，最终回答上下文只包含原始正文。
-- DeepSeek 的 429、5xx 和网络错误，以及飞书幂等读取请求，按有限次数重试；发送回复等非幂等写入不重试。Token usage 可用上方 `report_usage.py` 命令查看。
+- DeepSeek Chat Completions 属于可能计费的生成 POST，429、5xx、网络中断和超时均只尝试一次，不自动重试；飞书幂等读取请求仍按有限次数重试，发送回复等非幂等写入也不重试。Token usage 可用上方 `report_usage.py` 命令查看。
 - 消息去重后按用户哈希执行固定分钟/日限流（默认每分钟 10 次、每天 200 次，设为 0 可禁用）；数据库不保存原始用户 ID。
 - `RetrievalScope` 对检索提供空间过滤 seam：未指定时检索全库，指定空间集合时严格限制候选范围；后续可在此接入更细粒度 ACL。
 
@@ -176,6 +198,7 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 
 - `.env`、SQLite 数据库和 `documents/` 均不提交 Git。
 - API Key 和 App Secret 只从环境变量读取，日志和对象 repr 不包含密钥。
+- 员工可见回答会拦截密码、口令、密钥、API 密钥、访问令牌等中英文凭据标签和值，并返回固定安全提示。
 - Webhook 开启 Encrypt Key 后强制校验签名。
 - 语义切片开启时，完整文档会在索引阶段按批次发送给 DeepSeek；回答阶段只发送命中的原始片段。
 - 切片策略版本固定为 `hybrid-v4`；修改策略版本后应重新索引现有文档。
@@ -189,5 +212,8 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 - 错误签名返回 HTTP 403。
 - 员工发送“报销怎么走”能收到不带来源区块的回答。
 - 缺少 API Key 时服务健康检查报配置不完整，且不会发起外部请求。
+- 回滚预检不修改数据库；带 `--execute` 才会创建独占备份并移除 v2 FTS。
 
 v0.4.0 发布状态：代码与测试已完成，尚未部署生产；仍使用 SQLite（含 FTS5/BM25）和 `hybrid-v4`，没有引入向量数据库。
+
+长连接适配器依赖 `lark-oapi==1.7.3` 的私有 ACK 契约。升级 SDK 必须显式修改锁定版本，并通过 `tests/test_lark_sdk_contract.py` 的真实 SDK 合约测试后才能发布。
