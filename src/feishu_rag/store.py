@@ -186,12 +186,12 @@ class IndexStore:
                     canonical_question TEXT NOT NULL,
                     answer TEXT NOT NULL,
                     source_signature TEXT NOT NULL,
-                    knowledge_revision INTEGER NOT NULL,
-                    state TEXT NOT NULL,
-                    direct_hits INTEGER NOT NULL DEFAULT 0,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    last_hit_at REAL,
+                    knowledge_revision INTEGER NOT NULL CHECK(knowledge_revision >= 0),
+                    state TEXT NOT NULL CHECK(state IN ('enabled', 'stale')),
+                    direct_hits INTEGER NOT NULL DEFAULT 0 CHECK(direct_hits >= 0),
+                    created_at REAL NOT NULL CHECK(created_at >= 0),
+                    updated_at REAL NOT NULL CHECK(updated_at >= 0),
+                    last_hit_at REAL CHECK(last_hit_at IS NULL OR last_hit_at >= 0),
                     UNIQUE(scope_key, intent_key)
                 )
                 """,
@@ -561,15 +561,19 @@ class IndexStore:
 
     def bump_knowledge_revision(self, now: float | None = None) -> int:
         timestamp = time.time() if now is None else float(now)
-        row = self.connection.execute(
-            "UPDATE knowledge_state "
-            "SET revision = revision + 1, updated_at = ? "
-            "WHERE singleton_id = 1 RETURNING revision",
-            (timestamp,),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("knowledge state is not initialized")
-        self.connection.commit()
+        try:
+            row = self.connection.execute(
+                "UPDATE knowledge_state "
+                "SET revision = revision + 1, updated_at = ? "
+                "WHERE singleton_id = 1 RETURNING revision",
+                (timestamp,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("knowledge state is not initialized")
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
         return int(row[0])
 
     def claim_rate_limit(

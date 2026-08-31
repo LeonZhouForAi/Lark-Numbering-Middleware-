@@ -136,13 +136,49 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_knowledge_revision_bump_rolls_back_when_commit_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            real_connection = store.connection
+
+            class FailingCommitConnection:
+                def __init__(self, connection: sqlite3.Connection):
+                    self._connection = connection
+                    self.rollback_called = False
+
+                def execute(self, statement, parameters=()):
+                    return self._connection.execute(statement, parameters)
+
+                def commit(self):
+                    raise sqlite3.OperationalError("simulated commit failure")
+
+                def rollback(self):
+                    self.rollback_called = True
+                    return self._connection.rollback()
+
+                def __getattr__(self, name):
+                    return getattr(self._connection, name)
+
+            failing_connection = FailingCommitConnection(real_connection)
+            store.connection = failing_connection
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    store.bump_knowledge_revision(now=10)
+                self.assertTrue(failing_connection.rollback_called)
+                store.connection = real_connection
+                self.assertEqual(store.knowledge_revision(), 0)
+                self.assertEqual(store.bump_knowledge_revision(now=11), 1)
+            finally:
+                store.connection = real_connection
+                store.close()
+
     def test_faq_schema_enforces_entry_and_observation_uniqueness(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
             try:
                 entry = (
                     "faq-1", "intent", "scope", "问题", "答案", "source", 0,
-                    "active", 0, 1.0, 1.0, None,
+                    "enabled", 0, 1.0, 1.0, None,
                 )
                 store.connection.execute(
                     "INSERT INTO faq_entries("
@@ -184,6 +220,153 @@ class StoreTests(unittest.TestCase):
                         ") VALUES(?,?,?,?,?,?,?,?)",
                         observation,
                     )
+            finally:
+                store.close()
+
+    def test_faq_entries_reject_invalid_state_and_negative_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                def insert_entry(
+                    entry_id: str,
+                    state: str = "enabled",
+                    knowledge_revision: int = 0,
+                    direct_hits: int = 0,
+                    created_at: float = 1.0,
+                    updated_at: float = 1.0,
+                    last_hit_at: float | None = None,
+                ) -> None:
+                    store.connection.execute(
+                        "INSERT INTO faq_entries("
+                        "id,intent_key,scope_key,canonical_question,answer,source_signature,"
+                        "knowledge_revision,state,direct_hits,created_at,updated_at,last_hit_at"
+                        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            entry_id,
+                            f"intent-{entry_id}",
+                            f"scope-{entry_id}",
+                            "问题",
+                            "答案",
+                            "source",
+                            knowledge_revision,
+                            state,
+                            direct_hits,
+                            created_at,
+                            updated_at,
+                            last_hit_at,
+                        ),
+                    )
+
+                with self.assertRaises(sqlite3.IntegrityError):
+                    insert_entry("invalid-state", state="active")
+                for field, value in (
+                    ("knowledge_revision", -1),
+                    ("direct_hits", -1),
+                    ("created_at", -1.0),
+                    ("updated_at", -1.0),
+                    ("last_hit_at", -1.0),
+                ):
+                    with self.subTest(field=field):
+                        kwargs = {field: value}
+                        with self.assertRaises(sqlite3.IntegrityError):
+                            insert_entry(f"invalid-{field}", **kwargs)
+            finally:
+                store.close()
+
+    def test_concurrent_knowledge_revision_bumps_are_contiguous(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            IndexStore(db_path).close()
+            barrier = threading.Barrier(2)
+
+            def bump() -> int:
+                store = IndexStore(db_path)
+                try:
+                    barrier.wait(timeout=2)
+                    return store.bump_knowledge_revision(now=100)
+                finally:
+                    store.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                revisions = list(executor.map(lambda _: bump(), range(2)))
+
+            self.assertEqual(sorted(revisions), [1, 2])
+            store = IndexStore(db_path)
+            try:
+                self.assertEqual(store.knowledge_revision(), 2)
+            finally:
+                store.close()
+
+    def test_fts_migration_failure_preserves_documents_and_faq_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            seed = sqlite3.connect(db_path)
+            seed.executescript(
+                """
+                CREATE TABLE documents (
+                    source_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE chunks (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES documents(source_id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    page INTEGER,
+                    section TEXT
+                );
+                INSERT INTO documents VALUES('legacy.txt', '旧文档', 'legacy.txt', 'v1', 0);
+                INSERT INTO chunks VALUES('legacy-chunk', 'legacy.txt', '旧文档', '旧内容', NULL, NULL);
+                """
+            )
+            seed.commit()
+            seed.close()
+
+            real_connect = sqlite3.connect(db_path, timeout=30.0)
+
+            class FailingFtsConnection:
+                def __init__(self, connection: sqlite3.Connection):
+                    self._connection = connection
+
+                def execute(self, statement, parameters=()):
+                    if "CREATE VIRTUAL TABLE" in statement:
+                        raise sqlite3.OperationalError("simulated FTS DDL failure")
+                    return self._connection.execute(statement, parameters)
+
+                @property
+                def row_factory(self):
+                    return self._connection.row_factory
+
+                @row_factory.setter
+                def row_factory(self, value):
+                    self._connection.row_factory = value
+
+                def __getattr__(self, name):
+                    return getattr(self._connection, name)
+
+            failing_connection = FailingFtsConnection(real_connect)
+            with patch(
+                "feishu_rag.store.sqlite3.connect",
+                return_value=failing_connection,
+            ):
+                store = IndexStore(db_path)
+            try:
+                self.assertFalse(store._fts_available)
+                self.assertEqual(store.count_documents(), 1)
+                self.assertEqual(store.count_chunks(), 1)
+                self.assertEqual(store.search("旧内容")[0].chunk.id, "legacy-chunk")
+                tables = {
+                    row[0]
+                    for row in store.connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                self.assertTrue(
+                    {"knowledge_state", "faq_entries", "faq_aliases"}.issubset(tables)
+                )
             finally:
                 store.close()
 
