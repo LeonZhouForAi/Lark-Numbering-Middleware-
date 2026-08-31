@@ -64,6 +64,31 @@ class SnapshotUnavailableStore(RecordingStore):
         raise RuntimeError("snapshot unavailable")
 
 
+class MutableRevisionStore(RecordingStore):
+    def __init__(self, results=None):
+        super().__init__(results)
+        self.revision = 0
+
+    def knowledge_revision(self):
+        return self.revision
+
+
+class BumpingLLM(FakeLLM):
+    def __init__(self, store, responses, bump_each_call=False):
+        super().__init__(responses[0])
+        self.store = store
+        self.responses = responses
+        self.bump_each_call = bump_each_call
+
+    def complete_json(self, system_prompt, user_prompt, *, purpose="chunking"):
+        response = self.responses[min(len(self.calls), len(self.responses) - 1)]
+        self.response = response
+        result = super().complete_json(system_prompt, user_prompt, purpose=purpose)
+        if self.bump_each_call or len(self.calls) == 1:
+            self.store.revision += 1
+        return result
+
+
 class FakeFaqService:
     def __init__(self, match=None):
         self.match = match
@@ -142,6 +167,85 @@ def _result(content="报销需要提交发票。"):
 
 
 class RagTests(unittest.TestCase):
+    def test_personal_identifier_question_skips_all_faq_operations(self):
+        store = RecordingStore([_result()])
+        faq = FakeFaqService()
+
+        answer = RagService(store, FakeLLM(), faq_service=faq).answer("张三的报销流程")
+
+        self.assertTrue(answer.text)
+        self.assertEqual(faq.lookup_calls, [])
+        self.assertEqual(faq.describe_calls, [])
+        self.assertEqual(faq.recorded, [])
+
+    def test_employee_phone_and_email_questions_skip_faq_operations(self):
+        for question in ("工号:a12345的报销流程", "联系 13812345678", "alice@example.com 的报销"):
+            with self.subTest(question=question):
+                faq = FakeFaqService()
+                RagService(RecordingStore([_result()]), FakeLLM(), faq_service=faq).answer(question)
+                self.assertEqual(faq.lookup_calls, [])
+                self.assertEqual(faq.describe_calls, [])
+                self.assertEqual(faq.recorded, [])
+
+    def test_revision_change_during_generation_retries_and_uses_new_answer(self):
+        store = MutableRevisionStore([_result()])
+        faq = FakeFaqService()
+        llm = BumpingLLM(
+            store,
+            [
+                {"answer": "旧资料答案", "evidence_sufficient": True},
+                {"answer": "新版答案", "evidence_sufficient": True},
+            ],
+        )
+
+        answer = RagService(store, llm, faq_service=faq).answer("报销流程")
+
+        self.assertEqual(answer.text, "新版答案")
+        self.assertEqual(len(llm.calls), 2)
+        self.assertEqual(len(store.calls), 2)
+        self.assertEqual(faq.recorded[0][0].knowledge_revision, 1)
+
+    def test_revision_changes_on_both_generations_returns_update_message_without_cache(self):
+        store = MutableRevisionStore([_result()])
+        faq = FakeFaqService()
+        llm = BumpingLLM(
+            store,
+            [{"answer": "旧资料答案", "evidence_sufficient": True}],
+            bump_each_call=True,
+        )
+
+        answer = RagService(store, llm, faq_service=faq).answer("报销流程")
+
+        self.assertEqual(answer.text, "资料正在更新，请稍后重试。")
+        self.assertEqual(len(llm.calls), 2)
+        self.assertEqual(faq.recorded, [])
+
+    def test_rejected_llm_answers_increment_rejected_metric_without_promotion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.upsert_document(
+                    "supplier", "供应商准入", "policy", "checksum",
+                    [Chunk("chunk-1", "supplier", "供应商准入", "供应商开发流程需提交准入材料。")],
+                )
+                faq = FaqService(store, True, 3, 15, 0.82, 0.80)
+                llm = FakeLLM({"answer": "模型无法确认", "evidence_sufficient": False})
+                rag = RagService(store, llm, faq_service=faq, min_relevance=0.1)
+                rag.answer("供应商开发流程是什么")
+                llm.response = {"answer": "访问 https://example.com", "evidence_sufficient": True}
+                rag.answer("供应商开发流程是什么")
+
+                rows = [
+                    row for row in store.query_faq_metrics()
+                    if row["scope_key"] == "global"
+                ]
+                self.assertEqual(sum(row["rejected_answers"] for row in rows), 2)
+                self.assertEqual(store.connection.execute(
+                    "SELECT COUNT(*) FROM faq_entries"
+                ).fetchone()[0], 0)
+            finally:
+                store.close()
+
     def test_faq_metrics_count_eligible_rag_and_direct_requests_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
@@ -231,8 +335,8 @@ class RagTests(unittest.TestCase):
 
                 answer = rag.answer("供应商开发流程是什么")
 
-                self.assertEqual(answer.text, "根据制度,员工需要先提交申请。")
-                self.assertEqual(store.knowledge_revision(), 1)
+                self.assertEqual(answer.text, "资料正在更新，请稍后重试。")
+                self.assertEqual(store.knowledge_revision(), 2)
                 self.assertEqual(store.connection.execute(
                     "SELECT COUNT(*) FROM faq_observation_daily"
                 ).fetchone()[0], 0)

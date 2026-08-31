@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Iterable
@@ -25,6 +27,23 @@ _SYNONYMS = (
     ("怎么办", "流程"),
     ("如何办理", "流程"),
     ("流程是什么", "流程"),
+)
+
+_PERSONAL_IDENTIFIER_RE = re.compile(
+    r"(?:姓名|名字)\s*[:：]\s*[\u4e00-\u9fff]{2,4}"
+    r"|(?:工号|员工号)\s*[:：]?\s*[A-Za-z]?\d{4,10}"
+    r"|(?<![A-Za-z0-9])[A-Za-z]\d{5,8}(?![A-Za-z0-9])"
+    r"|(?<!\d)1[3-9]\d{9}(?!\d)"
+    r"|(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9.-])"
+)
+_COMMON_SURNAMES = (
+    "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华"
+    "金魏陶姜戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方"
+    "俞任袁柳酆鲍史唐费廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅"
+    "皮卞齐康伍余元卜顾孟平黄和穆萧尹姚邵湛汪祁毛禹狄米贝明"
+)
+_PERSONAL_NAME_RE = re.compile(
+    rf"(?<![\u4e00-\u9fff])[{_COMMON_SURNAMES}][\u4e00-\u9fff]{{1,3}}\s*的"
 )
 
 
@@ -53,6 +72,16 @@ class FaqService:
         self.window_days = window_days
         self.min_text_similarity = min_text_similarity
         self.min_source_overlap = min_source_overlap
+
+    @staticmethod
+    def contains_personal_identifier(text: str) -> bool:
+        if not isinstance(text, str):
+            return False
+        normalized = unicodedata.normalize("NFKC", text)
+        return bool(
+            _PERSONAL_IDENTIFIER_RE.search(normalized)
+            or _PERSONAL_NAME_RE.search(normalized)
+        )
 
     @staticmethod
     def _scope_key(scope: RetrievalScope | None) -> str:
@@ -128,7 +157,9 @@ class FaqService:
         scope: RetrievalScope | None,
         *,
         knowledge_revision: int | None = None,
-    ) -> FaqObservation:
+    ) -> FaqObservation | None:
+        if self.contains_personal_identifier(question):
+            return None
         normalized_question, intent_key = self._question_features(question)
         source_ids = self._source_ids(results)
         source_signature = self._signature(source_ids)
@@ -147,7 +178,11 @@ class FaqService:
         )
 
     def lookup_observation(self, observation: FaqObservation) -> FaqMatch | None:
-        if not self.enabled:
+        if (
+            not self.enabled
+            or not isinstance(observation, FaqObservation)
+            or self.contains_personal_identifier(observation.normalized_question)
+        ):
             return None
         if (
             not observation.intent_key
@@ -219,8 +254,10 @@ class FaqService:
             or not observation.normalized_question
             or not observation.source_signature
             or not observation.scope_key
+            or self.contains_personal_identifier(observation.normalized_question)
             or not isinstance(answer, str)
             or not answer.strip()
+            or self.contains_personal_identifier(answer)
         ):
             return None
         now = datetime.now(timezone.utc)
@@ -238,6 +275,7 @@ class FaqService:
             not self.enabled
             or not isinstance(observation, FaqObservation)
             or not observation.scope_key
+            or self.contains_personal_identifier(observation.normalized_question)
         ):
             return
         now = datetime.now(timezone.utc)
@@ -250,3 +288,6 @@ class FaqService:
 
     def record_rag_answer(self, observation: FaqObservation) -> None:
         self._record_metric(observation, "rag_answers")
+
+    def record_rejected_answer(self, observation: FaqObservation) -> None:
+        self._record_metric(observation, "rejected_answers")
