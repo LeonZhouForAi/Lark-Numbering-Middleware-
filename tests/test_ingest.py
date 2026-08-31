@@ -344,6 +344,38 @@ class IngestTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_index_directory_bumps_revision_once_only_when_files_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "one.txt").write_text("第一份制度。", encoding="utf-8")
+            (root / "two.md").write_text("第二份制度。", encoding="utf-8")
+            store = IndexStore(root / "index.sqlite3")
+            try:
+                self.assertEqual(index_directory(root, store), 2)
+                self.assertEqual(store.knowledge_revision(), 1)
+
+                self.assertEqual(index_directory(root, store), 0)
+                self.assertEqual(store.knowledge_revision(), 1)
+            finally:
+                store.close()
+
+    def test_index_directory_does_not_bump_when_indexing_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "one.txt").write_text("第一份制度。", encoding="utf-8")
+            (root / "two.txt").write_text("第二份制度。", encoding="utf-8")
+            store = IndexStore(root / "index.sqlite3")
+            try:
+                with patch(
+                    "feishu_rag.ingest.index_file",
+                    side_effect=[True, RuntimeError("index failed")],
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "index failed"):
+                        index_directory(root, store)
+                self.assertEqual(store.knowledge_revision(), 0)
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

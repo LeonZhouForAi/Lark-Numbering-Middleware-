@@ -501,6 +501,124 @@ class FeishuSyncTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_sync_bumps_revision_once_for_changes_and_not_for_unchanged_snapshot(self):
+        client = FakeFeishuClient()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                first = sync_wiki_space("space-1", client, store)
+                self.assertEqual(first.indexed, 1)
+                self.assertEqual(store.knowledge_revision(), 1)
+
+                unchanged = sync_wiki_space("space-1", client, store)
+                self.assertEqual(unchanged.indexed, 0)
+                self.assertEqual(unchanged.deleted, 0)
+                self.assertEqual(store.knowledge_revision(), 1)
+
+                client.list_wiki_nodes = EmptyFeishuClient().list_wiki_nodes
+                deleted = sync_wiki_space("space-1", client, store)
+                self.assertEqual(deleted.deleted, 1)
+                self.assertEqual(store.knowledge_revision(), 2)
+            finally:
+                store.close()
+
+    def test_sync_does_not_bump_revision_after_mid_sync_failure(self):
+        client = PaginationFailureClient("second_page")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                with self.assertRaises(RuntimeError):
+                    sync_wiki_space("space-1", client, store)
+                self.assertEqual(store.count_documents(), 1)
+                self.assertEqual(store.knowledge_revision(), 0)
+            finally:
+                store.close()
+
+    def test_sync_does_not_bump_revision_after_download_failure(self):
+        client = MagicMock()
+        client.list_wiki_nodes.return_value = {
+            "data": {
+                "items": [
+                    {
+                        "node_token": "first-file",
+                        "obj_token": "first-token",
+                        "obj_type": "file",
+                        "title": "第一份.txt",
+                        "has_child": False,
+                    },
+                    {
+                        "node_token": "second-file",
+                        "obj_token": "second-token",
+                        "obj_type": "file",
+                        "title": "第二份.txt",
+                        "has_child": False,
+                    },
+                ],
+                "has_more": False,
+            }
+        }
+        client.download_file.side_effect = [
+            "第一份内容。".encode("utf-8"),
+            RuntimeError("download failed"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                with patch(
+                    "feishu_rag.sync.extract_sections",
+                    return_value=[Section(text="第一份内容。")],
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "download failed"):
+                        sync_wiki_space("space-1", client, store)
+                self.assertEqual(store.count_documents(), 1)
+                self.assertEqual(store.knowledge_revision(), 0)
+            finally:
+                store.close()
+
+    def test_sync_does_not_bump_revision_after_parse_failure(self):
+        client = MagicMock()
+        client.list_wiki_nodes.return_value = {
+            "data": {
+                "items": [
+                    {
+                        "node_token": "first-file",
+                        "obj_token": "first-token",
+                        "obj_type": "file",
+                        "title": "第一份.txt",
+                        "has_child": False,
+                    },
+                    {
+                        "node_token": "second-file",
+                        "obj_token": "second-token",
+                        "obj_type": "file",
+                        "title": "第二份.txt",
+                        "has_child": False,
+                    },
+                ],
+                "has_more": False,
+            }
+        }
+        client.download_file.side_effect = [
+            "第一份内容。".encode("utf-8"),
+            "第二份内容。".encode("utf-8"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                with patch(
+                    "feishu_rag.sync.extract_sections",
+                    side_effect=[
+                        [Section(text="第一份内容。")],
+                        RuntimeError("parse failed"),
+                    ],
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "parse failed"):
+                        sync_wiki_space("space-1", client, store)
+                self.assertEqual(store.count_documents(), 1)
+                self.assertEqual(store.knowledge_revision(), 0)
+            finally:
+                store.close()
+
     def test_successful_empty_space_prunes_only_that_space(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")

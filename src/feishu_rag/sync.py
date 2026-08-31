@@ -288,6 +288,8 @@ def sync_wiki_space(
             seen_page_tokens.add(next_token)
             page_token = next_token
     deleted = store.prune_documents(f"feishu:{space_id}:", retained_source_ids)
+    if indexed or deleted:
+        store.bump_knowledge_revision()
     return SyncResult(nodes_seen, indexed, skipped, deleted)
 
 

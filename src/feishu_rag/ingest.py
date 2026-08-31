@@ -226,6 +226,8 @@ def index_directory(
             chunk_model=chunk_model,
         ):
             indexed += 1
+    if indexed:
+        store.bump_knowledge_revision()
     return indexed
 
 
