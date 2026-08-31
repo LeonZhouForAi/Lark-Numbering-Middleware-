@@ -273,6 +273,134 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_existing_faq_entries_without_checks_are_migrated_and_keep_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            seed = sqlite3.connect(db_path)
+            seed.executescript(
+                """
+                CREATE TABLE faq_entries (
+                    id TEXT PRIMARY KEY,
+                    intent_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    canonical_question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    source_signature TEXT NOT NULL,
+                    knowledge_revision INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    direct_hits INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    last_hit_at REAL,
+                    UNIQUE(scope_key, intent_key)
+                );
+                CREATE TABLE faq_aliases (
+                    faq_id TEXT NOT NULL REFERENCES faq_entries(id) ON DELETE CASCADE,
+                    normalized_question TEXT NOT NULL,
+                    search_text TEXT NOT NULL,
+                    first_seen_at REAL NOT NULL,
+                    last_seen_at REAL NOT NULL,
+                    total_seen INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(faq_id, normalized_question)
+                );
+                INSERT INTO faq_entries VALUES(
+                    'faq-legacy', 'intent', 'scope', '问题', '答案', 'source',
+                    0, 'enabled', 2, 1.0, 2.0, 2.0
+                );
+                INSERT INTO faq_aliases VALUES(
+                    'faq-legacy', '问题', '问题', 1.0, 2.0, 2
+                );
+                """
+            )
+            seed.commit()
+            seed.close()
+
+            store = IndexStore(db_path)
+            try:
+                self.assertEqual(
+                    tuple(
+                        store.connection.execute(
+                            "SELECT id,state,direct_hits FROM faq_entries"
+                        ).fetchone()
+                    ),
+                    ("faq-legacy", "enabled", 2),
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT faq_id FROM faq_aliases"
+                    ).fetchone()[0],
+                    "faq-legacy",
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.connection.execute(
+                        "INSERT INTO faq_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            "faq-invalid-state", "intent-2", "scope-2", "问题",
+                            "答案", "source", 0, "active", 0, 1.0, 1.0, None,
+                        ),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.connection.execute(
+                        "INSERT INTO faq_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            "faq-invalid-revision", "intent-3", "scope-3", "问题",
+                            "答案", "source", -1, "enabled", 0, 1.0, 1.0, None,
+                        ),
+                    )
+            finally:
+                store.close()
+
+    def test_invalid_existing_faq_entry_aborts_migration_and_preserves_original_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            seed = sqlite3.connect(db_path)
+            seed.executescript(
+                """
+                CREATE TABLE faq_entries (
+                    id TEXT PRIMARY KEY,
+                    intent_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    canonical_question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    source_signature TEXT NOT NULL,
+                    knowledge_revision INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    direct_hits INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    last_hit_at REAL,
+                    UNIQUE(scope_key, intent_key)
+                );
+                INSERT INTO faq_entries VALUES(
+                    'faq-invalid', 'intent', 'scope', '问题', '答案', 'source',
+                    -1, 'enabled', 0, 1.0, 1.0, NULL
+                );
+                """
+            )
+            seed.commit()
+            seed.close()
+
+            with self.assertRaisesRegex(RuntimeError, "faq_entries"):
+                IndexStore(db_path)
+
+            check = sqlite3.connect(db_path)
+            try:
+                self.assertEqual(
+                    tuple(
+                        check.execute(
+                            "SELECT id,knowledge_revision,state FROM faq_entries"
+                        ).fetchone()
+                    ),
+                    ("faq-invalid", -1, "enabled"),
+                )
+                self.assertIsNotNone(
+                    check.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='table' AND name='faq_entries'"
+                    ).fetchone()[0]
+                )
+            finally:
+                check.close()
+
     def test_concurrent_knowledge_revision_bumps_are_contiguous(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "rag.sqlite3"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import sqlite3
 import time
@@ -34,6 +35,34 @@ _QUERY_STOP_WORDS = frozenset({"and", "or", "not", "near"})
 _FEISHU_SOURCE_RE = re.compile(r"^feishu:([^:]+):")
 _SQLITE_INT_MAX = 2**63 - 1
 _LOCK_RETRY_ATTEMPTS = 20
+_FAQ_ENTRIES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS faq_entries (
+    id TEXT PRIMARY KEY,
+    intent_key TEXT NOT NULL,
+    scope_key TEXT NOT NULL,
+    canonical_question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    source_signature TEXT NOT NULL,
+    knowledge_revision INTEGER NOT NULL CHECK(knowledge_revision >= 0),
+    state TEXT NOT NULL CHECK(state IN ('enabled', 'stale')),
+    direct_hits INTEGER NOT NULL DEFAULT 0 CHECK(direct_hits >= 0),
+    created_at REAL NOT NULL CHECK(created_at >= 0),
+    updated_at REAL NOT NULL CHECK(updated_at >= 0),
+    last_hit_at REAL CHECK(last_hit_at IS NULL OR last_hit_at >= 0),
+    UNIQUE(scope_key, intent_key)
+)
+"""
+_FAQ_ALIASES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS faq_aliases (
+    faq_id TEXT NOT NULL REFERENCES faq_entries(id) ON DELETE CASCADE,
+    normalized_question TEXT NOT NULL,
+    search_text TEXT NOT NULL,
+    first_seen_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    total_seen INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(faq_id, normalized_question)
+)
+"""
 
 
 def _normalize(text: str) -> str:
@@ -178,34 +207,8 @@ class IndexStore:
                     updated_at REAL NOT NULL
                 )
                 """,
-                """
-                CREATE TABLE IF NOT EXISTS faq_entries (
-                    id TEXT PRIMARY KEY,
-                    intent_key TEXT NOT NULL,
-                    scope_key TEXT NOT NULL,
-                    canonical_question TEXT NOT NULL,
-                    answer TEXT NOT NULL,
-                    source_signature TEXT NOT NULL,
-                    knowledge_revision INTEGER NOT NULL CHECK(knowledge_revision >= 0),
-                    state TEXT NOT NULL CHECK(state IN ('enabled', 'stale')),
-                    direct_hits INTEGER NOT NULL DEFAULT 0 CHECK(direct_hits >= 0),
-                    created_at REAL NOT NULL CHECK(created_at >= 0),
-                    updated_at REAL NOT NULL CHECK(updated_at >= 0),
-                    last_hit_at REAL CHECK(last_hit_at IS NULL OR last_hit_at >= 0),
-                    UNIQUE(scope_key, intent_key)
-                )
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS faq_aliases (
-                    faq_id TEXT NOT NULL REFERENCES faq_entries(id) ON DELETE CASCADE,
-                    normalized_question TEXT NOT NULL,
-                    search_text TEXT NOT NULL,
-                    first_seen_at REAL NOT NULL,
-                    last_seen_at REAL NOT NULL,
-                    total_seen INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY(faq_id, normalized_question)
-                )
-                """,
+                _FAQ_ENTRIES_SCHEMA,
+                _FAQ_ALIASES_SCHEMA,
                 """
                 CREATE TABLE IF NOT EXISTS faq_observation_daily (
                     intent_key TEXT NOT NULL,
@@ -245,6 +248,7 @@ class IndexStore:
                 "INSERT OR IGNORE INTO knowledge_state(singleton_id,revision,updated_at) "
                 "VALUES(1,0,0)"
             )
+            self._migrate_faq_entries_constraints()
 
             document_columns = {
                 row[1]
@@ -575,6 +579,162 @@ class IndexStore:
             self.connection.rollback()
             raise
         return int(row[0])
+
+    def _migrate_faq_entries_constraints(self) -> None:
+        table_row = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'faq_entries'"
+        ).fetchone()
+        if table_row is None:
+            return
+
+        table_sql = re.sub(r"\s+", "", (table_row[0] or "").casefold())
+        required_checks = (
+            "check(knowledge_revision>=0)",
+            "check(statein('enabled','stale'))",
+            "check(direct_hits>=0)",
+            "check(created_at>=0)",
+            "check(updated_at>=0)",
+            "check(last_hit_atisnullorlast_hit_at>=0)",
+        )
+        if all(check in table_sql for check in required_checks):
+            return
+
+        columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(faq_entries)").fetchall()
+        }
+        required_columns = {
+            "id",
+            "intent_key",
+            "scope_key",
+            "canonical_question",
+            "answer",
+            "source_signature",
+            "knowledge_revision",
+            "state",
+            "direct_hits",
+            "created_at",
+            "updated_at",
+            "last_hit_at",
+        }
+        missing_columns = sorted(required_columns - columns)
+        if missing_columns:
+            raise RuntimeError(
+                "faq_entries migration cannot preserve missing columns: "
+                + ", ".join(missing_columns)
+            )
+
+        rows = self.connection.execute(
+            "SELECT id,state,knowledge_revision,direct_hits,created_at,updated_at,last_hit_at "
+            "FROM faq_entries"
+        ).fetchall()
+        for row in rows:
+            if row["state"] not in {"enabled", "stale"}:
+                raise RuntimeError(
+                    f"faq_entries contains invalid state for id {row['id']!r}"
+                )
+            for field in (
+                "knowledge_revision",
+                "direct_hits",
+                "created_at",
+                "updated_at",
+                "last_hit_at",
+            ):
+                value = row[field]
+                if value is None and field == "last_hit_at":
+                    continue
+                try:
+                    numeric_value = float(value)
+                except (TypeError, ValueError):
+                    numeric_value = math.nan
+                if not math.isfinite(numeric_value) or numeric_value < 0:
+                    raise RuntimeError(
+                        f"faq_entries contains invalid {field} for id {row['id']!r}"
+                    )
+
+        alias_row = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'faq_aliases'"
+        ).fetchone()
+        alias_columns = (
+            {
+                row[1]
+                for row in self.connection.execute("PRAGMA table_info(faq_aliases)").fetchall()
+            }
+            if alias_row is not None
+            else set()
+        )
+        current_alias_columns = {
+            "faq_id",
+            "normalized_question",
+            "search_text",
+            "first_seen_at",
+            "last_seen_at",
+            "total_seen",
+        }
+        legacy_alias_columns = {
+            "faq_entry_id",
+            "normalized_question",
+            "alias_question",
+            "created_at",
+        }
+        if alias_row is not None and not (
+            current_alias_columns.issubset(alias_columns)
+            or legacy_alias_columns.issubset(alias_columns)
+        ):
+            raise RuntimeError(
+                "faq_aliases migration cannot preserve its existing columns"
+            )
+
+        def quoted(identifier: str) -> str:
+            return '"' + identifier.replace('"', '""') + '"'
+
+        legacy_name = f"faq_entries_legacy_{uuid.uuid4().hex}"
+        legacy_alias_name = f"faq_aliases_legacy_{uuid.uuid4().hex}"
+        self.connection.execute("DROP INDEX IF EXISTS idx_faq_entries_scope_state")
+        self.connection.execute(
+            "DROP INDEX IF EXISTS idx_faq_aliases_normalized_question"
+        )
+        if alias_row is not None:
+            self.connection.execute(
+                f"ALTER TABLE faq_aliases RENAME TO {quoted(legacy_alias_name)}"
+            )
+        self.connection.execute(
+            f"ALTER TABLE faq_entries RENAME TO {quoted(legacy_name)}"
+        )
+        self.connection.execute(_FAQ_ENTRIES_SCHEMA)
+        self.connection.execute(
+            "INSERT INTO faq_entries("
+            "id,intent_key,scope_key,canonical_question,answer,source_signature,"
+            "knowledge_revision,state,direct_hits,created_at,updated_at,last_hit_at"
+            f") SELECT id,intent_key,scope_key,canonical_question,answer,source_signature,"
+            f"knowledge_revision,state,direct_hits,created_at,updated_at,last_hit_at "
+            f"FROM {quoted(legacy_name)}"
+        )
+        if alias_row is not None:
+            self.connection.execute(_FAQ_ALIASES_SCHEMA)
+            if current_alias_columns.issubset(alias_columns):
+                alias_select = (
+                    "faq_id,normalized_question,search_text,first_seen_at,last_seen_at,total_seen"
+                )
+            else:
+                alias_select = (
+                    "faq_entry_id,normalized_question,alias_question,created_at,created_at,1"
+                )
+            self.connection.execute(
+                "INSERT INTO faq_aliases("
+                "faq_id,normalized_question,search_text,first_seen_at,last_seen_at,total_seen"
+                f") SELECT {alias_select} FROM {quoted(legacy_alias_name)}"
+            )
+            self.connection.execute(f"DROP TABLE {quoted(legacy_alias_name)}")
+        self.connection.execute(f"DROP TABLE {quoted(legacy_name)}")
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_faq_entries_scope_state "
+            "ON faq_entries(scope_key, state)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_faq_aliases_normalized_question "
+            "ON faq_aliases(normalized_question)"
+        )
 
     def claim_rate_limit(
         self,
