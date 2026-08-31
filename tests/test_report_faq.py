@@ -72,6 +72,31 @@ def test_report_faq_promotion_count_option_changes_summary(tmp_path, capsys, mon
     assert summary["hot_intents"] == 2
 
 
+def test_summary_does_not_combine_observations_across_source_versions(tmp_path):
+    store = IndexStore(tmp_path / "rag.sqlite3")
+    with store.connection:
+        for source, revision, count in (("source-a", 1, 2), ("source-b", 1, 2)):
+            store.connection.execute(
+                "INSERT INTO faq_observation_daily(intent_key, scope_key, day, count, normalized_question, source_signature, knowledge_revision) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("intent", "scope", "2026-08-31", count, f"q-{source}-{revision}", source, revision),
+            )
+    summary = store.query_faq_summary(cutoff_day="2026-08-17", promotion_count=3)
+    store.close()
+    assert summary["hot_intents"] == 0
+
+
+def test_summary_counts_one_qualifying_source_version(tmp_path):
+    store = IndexStore(tmp_path / "rag.sqlite3")
+    with store.connection:
+        store.connection.execute(
+            "INSERT INTO faq_observation_daily(intent_key, scope_key, day, count, normalized_question, source_signature, knowledge_revision) VALUES (?, ?, ?, 3, ?, ?, ?)",
+            ("intent", "scope", "2026-08-31", "q", "source-a", 1),
+        )
+    summary = store.query_faq_summary(cutoff_day="2026-08-17", promotion_count=3)
+    store.close()
+    assert summary["hot_intents"] == 1
+
+
 def test_report_faq_rejects_invalid_since_date(tmp_path, capsys):
     with pytest.raises(SystemExit) as exc:
         report_main([str(tmp_path / "db"), "--since", "2026-02-30"])

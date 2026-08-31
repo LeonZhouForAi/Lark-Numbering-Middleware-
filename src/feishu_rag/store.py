@@ -1197,9 +1197,11 @@ class IndexStore:
         if type(promotion_count) is not int or not 1 <= promotion_count <= 100:
             raise ValueError("promotion_count must be between 1 and 100")
         hot_intents = self.connection.execute(
-            "SELECT COUNT(*) FROM (SELECT scope_key, intent_key "
+            "SELECT COUNT(DISTINCT scope_key || char(31) || intent_key) FROM ("
+            "SELECT scope_key, intent_key, source_signature, knowledge_revision "
             "FROM faq_observation_daily WHERE day >= ? "
-            "GROUP BY scope_key, intent_key HAVING SUM(count) >= ?)",
+            "GROUP BY scope_key, intent_key, source_signature, knowledge_revision "
+            "HAVING SUM(count) >= ?)",
             (cutoff_day, promotion_count),
         ).fetchone()[0]
         counts = self.connection.execute(
