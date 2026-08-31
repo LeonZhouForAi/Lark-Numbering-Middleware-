@@ -46,6 +46,7 @@ class FaqMatch:
     entry_id: str
     answer: str
     intent_key: str
+    knowledge_revision: int = 0
 
 
 @dataclass(frozen=True)

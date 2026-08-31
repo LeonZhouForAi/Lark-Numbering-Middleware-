@@ -928,9 +928,38 @@ class StoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
             try:
-                with self.assertRaises(ValueError):
+                self.assertFalse(
                     store.record_faq_direct_hit("missing", now=1788134400.0)
+                )
                 self.assertEqual(store.query_faq_metrics(), [])
+            finally:
+                store.close()
+
+    def test_record_faq_direct_hit_rejects_stale_expected_revision_without_metric(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                observation = FaqObservation("intent", "global", "问题", "source-v1", 0)
+                for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
+                    match = store.record_faq_observation(
+                        observation, answer="答案", day=day, now=1.0, promotion_count=3
+                    )
+                store.bump_knowledge_revision(now=2.0)
+                self.assertFalse(
+                    store.record_faq_direct_hit(
+                        match.entry_id, expected_revision=0,
+                        day="2026-08-31", now=1788134400.0,
+                    )
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT direct_hits FROM faq_entries WHERE id = ?", (match.entry_id,)
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    sum(row["direct_hits"] for row in store.query_faq_metrics()), 0
+                )
             finally:
                 store.close()
 

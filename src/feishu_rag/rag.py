@@ -205,13 +205,24 @@ class RagService:
 
         if self.faq_service is not None:
             try:
-                match = self.faq_service.lookup(question, results, scope)
+                observation = self.faq_service.describe(question, results, scope)
+                lookup_observation = getattr(
+                    self.faq_service, "lookup_observation", None
+                )
+                if callable(lookup_observation):
+                    match = lookup_observation(observation)
+                else:
+                    match = self.faq_service.lookup(question, results, scope)
             except Exception:
+                observation = None
                 match = None
             if match is not None:
-                cleaned = self._clean_answer(match.answer)
-                self._record_direct_hit(match)
-                return RagAnswer(cleaned, [])
+                try:
+                    if self._record_direct_hit(match):
+                        cleaned = self._clean_answer(match.answer)
+                        return RagAnswer(cleaned, [])
+                except Exception:
+                    pass
 
         context, citations = self._context(results)
         system_prompt = (
@@ -231,23 +242,40 @@ class RagService:
         cleaned = self._clean_answer(generated)
         if (
             self.faq_service is not None
+            and observation is not None
             and cleaned not in {INSUFFICIENT_ANSWER, UNSAFE_ANSWER}
         ):
             try:
-                observation = self.faq_service.describe(question, results, scope)
                 self.faq_service.record_safe_answer(observation, cleaned)
             except Exception:
                 pass
         return RagAnswer(cleaned, citations)
 
-    def _record_direct_hit(self, match) -> None:
+    def _record_direct_hit(self, match) -> bool:
         entry_id = getattr(match, "entry_id", None)
+        expected_revision = getattr(match, "knowledge_revision", None)
         record_hit = getattr(self.store, "record_faq_direct_hit", None)
-        if callable(record_hit) and isinstance(entry_id, str) and entry_id:
-            record_hit(entry_id)
-            return
+        if callable(record_hit) and (
+            not isinstance(entry_id, str)
+            or not entry_id
+            or not isinstance(expected_revision, int)
+            or isinstance(expected_revision, bool)
+        ):
+            return False
+        if (
+            callable(record_hit)
+            and isinstance(entry_id, str)
+            and entry_id
+            and isinstance(expected_revision, int)
+            and not isinstance(expected_revision, bool)
+        ):
+            timestamp = datetime.now(timezone.utc).timestamp()
+            day = datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+            result = record_hit(entry_id, expected_revision, day, timestamp)
+            return result is not False
         record_metric = getattr(self.store, "record_faq_metric", None)
         if callable(record_metric):
             record_metric(
                 datetime.now(timezone.utc).date().isoformat(), "direct_hits"
             )
+        return True

@@ -45,6 +45,16 @@ class RecordingStore:
         return self.results
 
 
+class StaleDirectHitStore(RecordingStore):
+    def __init__(self, results=None):
+        super().__init__(results)
+        self.direct_hit_calls = []
+
+    def record_faq_direct_hit(self, *args):
+        self.direct_hit_calls.append(args)
+        return False
+
+
 class FakeFaqService:
     def __init__(self, match=None):
         self.match = match
@@ -73,6 +83,28 @@ class FakeFaqService:
         return None
 
 
+class FixedObservationFaqService(FakeFaqService):
+    def __init__(self):
+        super().__init__()
+        self.observation = FaqObservation(
+            intent_key="intent",
+            scope_key="global",
+            normalized_question="报销流程",
+            source_signature="source",
+            knowledge_revision=1,
+            source_ids=("source",),
+        )
+        self.observation_lookups = []
+
+    def describe(self, question, results, scope):
+        self.describe_calls.append((question, results, scope))
+        return self.observation
+
+    def lookup_observation(self, observation):
+        self.observation_lookups.append(observation)
+        return None
+
+
 def _result(content="报销需要提交发票。"):
     return SearchResult(
         Chunk(
@@ -88,6 +120,28 @@ def _result(content="报销需要提交发票。"):
 
 
 class RagTests(unittest.TestCase):
+    def test_stale_direct_hit_falls_back_to_llm(self):
+        store = StaleDirectHitStore([_result()])
+        faq = FakeFaqService(FaqMatch("faq-1", "旧缓存答案", "intent", 1))
+        llm = FakeLLM()
+
+        answer = RagService(store, llm, faq_service=faq).answer("报销流程")
+
+        self.assertNotEqual(answer.text, "旧缓存答案")
+        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(len(store.direct_hit_calls), 1)
+
+    def test_faq_observation_is_created_once_and_reused_for_lookup_and_recording(self):
+        store = RecordingStore([_result()])
+        faq = FixedObservationFaqService()
+
+        RagService(store, FakeLLM(), faq_service=faq).answer("报销流程")
+
+        self.assertEqual(len(faq.describe_calls), 1)
+        self.assertEqual(faq.observation_lookups, [faq.observation])
+        self.assertEqual(faq.recorded[0][0], faq.observation)
+        self.assertEqual(faq.recorded[0][1], "根据制度，员工需要先提交申请。".replace("，", ","))
+
     def test_faq_hit_reuses_search_results_and_skips_llm(self):
         store = RecordingStore([_result()])
         llm = FakeLLM()

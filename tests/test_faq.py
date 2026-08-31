@@ -35,13 +35,20 @@ class _FakeStore:
 
     def record_faq_observation(self, observation, **kwargs):
         self.recorded.append((observation, kwargs))
-        return FaqMatch("faq-1", kwargs["answer"], observation.intent_key)
+        return FaqMatch(
+            "faq-1", kwargs["answer"], observation.intent_key,
+            observation.knowledge_revision,
+        )
 
 
 class FaqModelsTests(unittest.TestCase):
     def test_faq_match_is_immutable(self):
-        match = FaqMatch(entry_id="faq-1", answer="answer", intent_key="reset-password")
+        match = FaqMatch(
+            entry_id="faq-1", answer="answer", intent_key="reset-password",
+            knowledge_revision=4,
+        )
         self.assertEqual(match.entry_id, "faq-1")
+        self.assertEqual(match.knowledge_revision, 4)
         with self.assertRaises(FrozenInstanceError):
             match.answer = "changed"
 
@@ -153,7 +160,7 @@ class FaqServiceTests(unittest.TestCase):
         ]
         self.assertEqual(
             service.lookup("供应商开发", _results("supplier"), None),
-            FaqMatch("current-faq", "新答案", observation.intent_key),
+            FaqMatch("current-faq", "新答案", observation.intent_key, observation.knowledge_revision),
         )
         self.assertEqual(store.marked, [])
 
@@ -194,7 +201,7 @@ class FaqServiceTests(unittest.TestCase):
         ]
         self.assertEqual(
             service.lookup("甲乙丙丁", results, None),
-            FaqMatch("best-alias", "正确答案", observation.intent_key),
+            FaqMatch("best-alias", "正确答案", observation.intent_key, observation.knowledge_revision),
         )
 
     def test_lookup_rejects_different_source_signature(self):
@@ -237,7 +244,7 @@ class FaqServiceTests(unittest.TestCase):
             "knowledge_revision": 4, "state": "enabled",
         }]
         match = service.lookup("供应商开发", _results("supplier"), None)
-        self.assertEqual(match, FaqMatch("faq-1", "答案", observation.intent_key))
+        self.assertEqual(match, FaqMatch("faq-1", "答案", observation.intent_key, observation.knowledge_revision))
 
     def test_record_safe_answer_forwards_promotion_configuration(self):
         store = _FakeStore()

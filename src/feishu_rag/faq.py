@@ -140,15 +140,9 @@ class FaqService:
             source_ids=source_ids,
         )
 
-    def lookup(
-        self,
-        question: str,
-        results: list[SearchResult],
-        scope: RetrievalScope | None,
-    ) -> FaqMatch | None:
+    def lookup_observation(self, observation: FaqObservation) -> FaqMatch | None:
         if not self.enabled:
             return None
-        observation = self.describe(question, results, scope)
         if (
             not observation.intent_key
             or not observation.normalized_question
@@ -196,8 +190,18 @@ class FaqService:
                 str(_row_value(candidate, "id")),
                 str(_row_value(candidate, "answer", "")),
                 observation.intent_key,
+                observation.knowledge_revision,
             )
         return None
+
+    def lookup(
+        self,
+        question: str,
+        results: list[SearchResult],
+        scope: RetrievalScope | None,
+    ) -> FaqMatch | None:
+        """Look up a FAQ while preserving the original public API."""
+        return self.lookup_observation(self.describe(question, results, scope))
 
     def record_safe_answer(
         self, observation: FaqObservation, answer: str

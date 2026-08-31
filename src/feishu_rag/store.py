@@ -895,7 +895,10 @@ class IndexStore:
                         (observation.scope_key, day),
                     )
                     self.connection.commit()
-                    return FaqMatch(existing["id"], safe_answer, observation.intent_key)
+                    return FaqMatch(
+                        existing["id"], safe_answer, observation.intent_key,
+                        observation.knowledge_revision,
+                    )
                 if (
                     existing["state"] == "enabled"
                     and existing["source_signature"] == observation.source_signature
@@ -970,7 +973,10 @@ class IndexStore:
                 (observation.scope_key, day),
             )
             self.connection.commit()
-            return FaqMatch(entry_id, safe_answer, observation.intent_key)
+            return FaqMatch(
+                entry_id, safe_answer, observation.intent_key,
+                observation.knowledge_revision,
+            )
         except Exception:
             self.connection.rollback()
             raise
@@ -1044,7 +1050,12 @@ class IndexStore:
                 (entry_id, question, _pretokenize(question), timestamp, timestamp),
             )
             self.connection.commit()
-            return FaqMatch(entry_id, safe_answer if should_refresh else entry["answer"], observation.intent_key)
+            return FaqMatch(
+                entry_id,
+                safe_answer if should_refresh else entry["answer"],
+                observation.intent_key,
+                observation.knowledge_revision,
+            )
         except Exception:
             self.connection.rollback()
             raise
@@ -1103,27 +1114,56 @@ class IndexStore:
             self.connection.rollback()
             raise
 
-    def record_faq_direct_hit(self, entry_id: str, now: float | None = None) -> None:
-        """Atomically count a direct FAQ hit on its entry and daily metrics."""
+    def record_faq_direct_hit(
+        self,
+        entry_id: str,
+        expected_revision: int | None = None,
+        day: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """Atomically count a current-version direct FAQ hit and its metrics."""
         if not isinstance(entry_id, str) or not entry_id.strip():
             raise ValueError("entry_id must not be empty")
         timestamp = time.time() if now is None else self._validate_faq_now(now)
-        day = datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+        metric_day = (
+            datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+            if day is None
+            else self._validate_faq_day(day).isoformat()
+        )
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ValueError("expected_revision must be a non-negative integer")
         self._begin_faq_transaction()
         try:
+            current_revision = self.connection.execute(
+                "SELECT revision FROM knowledge_state WHERE singleton_id = 1"
+            ).fetchone()
+            if current_revision is None:
+                raise RuntimeError("knowledge state is not initialized")
+            if expected_revision is None:
+                expected_revision = int(current_revision[0])
+            if expected_revision != current_revision[0]:
+                self.connection.commit()
+                return False
             row = self.connection.execute(
                 "UPDATE faq_entries SET direct_hits = direct_hits + 1, last_hit_at = ? "
-                "WHERE id = ? AND state = 'enabled' RETURNING scope_key",
-                (timestamp, entry_id),
+                "WHERE id = ? AND state = 'enabled' AND knowledge_revision = ? "
+                "RETURNING scope_key",
+                (timestamp, entry_id, expected_revision),
             ).fetchone()
             if row is None:
-                raise ValueError("FAQ entry does not exist or is not enabled")
+                self.connection.commit()
+                return False
             self.connection.execute(
                 "INSERT INTO faq_metrics_daily(scope_key,day,direct_hits) VALUES(?,?,1) "
                 "ON CONFLICT(scope_key,day) DO UPDATE SET direct_hits = direct_hits + 1",
-                (row[0], day),
+                (row[0], metric_day),
             )
             self.connection.commit()
+            return True
         except Exception:
             self.connection.rollback()
             raise
