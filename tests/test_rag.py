@@ -59,6 +59,11 @@ class StaleDirectHitStore(RecordingStore):
         return False
 
 
+class SnapshotUnavailableStore(RecordingStore):
+    def knowledge_revision(self):
+        raise RuntimeError("snapshot unavailable")
+
+
 class FakeFaqService:
     def __init__(self, match=None):
         self.match = match
@@ -137,6 +142,20 @@ def _result(content="报销需要提交发票。"):
 
 
 class RagTests(unittest.TestCase):
+    def test_snapshot_failure_falls_back_to_plain_rag_without_faq_calls(self):
+        store = SnapshotUnavailableStore([_result()])
+        faq = FakeFaqService()
+        llm = FakeLLM()
+
+        answer = RagService(store, llm, faq_service=faq).answer("报销流程")
+
+        self.assertEqual(answer.text, "根据制度,员工需要先提交申请。")
+        self.assertEqual(len(store.calls), 1)
+        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(faq.lookup_calls, [])
+        self.assertEqual(faq.describe_calls, [])
+        self.assertEqual(faq.recorded, [])
+
     def test_revision_snapshot_before_search_fences_faq_observation_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             from feishu_rag.store import IndexStore

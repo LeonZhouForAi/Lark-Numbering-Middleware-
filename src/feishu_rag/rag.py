@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -67,6 +68,8 @@ _BARE_NAMED_SECRET_RE = re.compile(
     r"(?:\s*(?:is|是|为|[:=])\s*|\s+)"
     r"(?P<value>[a-z0-9@_+./=-]{8,})"
 )
+
+logger = logging.getLogger(__name__)
 
 
 class RagResponseError(ValueError):
@@ -194,9 +197,18 @@ class RagService:
             return RagAnswer("请输入要查询的问题。", [])
         if len(question) > self.question_max_chars:
             return RagAnswer(f"问题过长，请精简到 {self.question_max_chars} 字以内。", [])
+        faq_active = self.faq_service is not None and bool(
+            getattr(self.faq_service, "enabled", True)
+        )
         snapshot_revision = None
-        if self.faq_service is not None:
-            snapshot_revision = self.store.knowledge_revision()
+        if faq_active:
+            try:
+                snapshot_revision = self.store.knowledge_revision()
+            except Exception as exc:
+                logger.warning(
+                    "faq_snapshot_failed error_type=%s", type(exc).__name__
+                )
+                faq_active = False
         results = self.store.search(
             question,
             top_k=self.top_k,
@@ -206,7 +218,7 @@ class RagService:
         if not results:
             return RagAnswer("知识库中暂无依据，请换一种问法或联系文控管理员。", [])
 
-        if self.faq_service is not None:
+        if faq_active:
             try:
                 observation = self.faq_service.describe(
                     question,
@@ -249,7 +261,7 @@ class RagService:
             return RagAnswer(INSUFFICIENT_ANSWER, citations)
         cleaned = self._clean_answer(generated)
         if (
-            self.faq_service is not None
+            faq_active
             and observation is not None
             and cleaned not in {INSUFFICIENT_ANSWER, UNSAFE_ANSWER}
         ):
