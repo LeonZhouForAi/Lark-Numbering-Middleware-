@@ -1,7 +1,37 @@
 import unittest
 from dataclasses import FrozenInstanceError
 
-from feishu_rag.models import FaqMatch, FaqObservation
+from feishu_rag.faq import FaqService
+from feishu_rag.models import Chunk, FaqMatch, FaqObservation, RetrievalScope, SearchResult
+
+
+def _results(*source_ids: str) -> list[SearchResult]:
+    return [
+        SearchResult(Chunk(f"{source_id}-chunk", source_id, "供应商准入", "流程内容"), 0.95)
+        for source_id in source_ids
+    ]
+
+
+class _FakeStore:
+    def __init__(self, candidates=None, revision=4):
+        self.candidates = list(candidates or [])
+        self.revision = revision
+        self.recorded = []
+        self.marked = []
+
+    def knowledge_revision(self):
+        return self.revision
+
+    def find_faq_candidates(self, scope_key, normalized_question):
+        return self.candidates
+
+    def mark_faq_stale_before_revision(self, revision):
+        self.marked.append(revision)
+        return 1
+
+    def record_faq_observation(self, observation, **kwargs):
+        self.recorded.append((observation, kwargs))
+        return FaqMatch("faq-1", kwargs["answer"], observation.intent_key)
 
 
 class FaqModelsTests(unittest.TestCase):
@@ -23,6 +53,130 @@ class FaqModelsTests(unittest.TestCase):
         self.assertEqual(observation.normalized_question, "密码怎么重置")
         with self.assertRaises(FrozenInstanceError):
             observation.scope_key = "space-b"
+
+
+class FaqServiceTests(unittest.TestCase):
+    def _service(self, store=None, **kwargs):
+        return FaqService(
+            store or _FakeStore(),
+            enabled=True,
+            promotion_count=3,
+            window_days=15,
+            min_text_similarity=0.82,
+            min_source_overlap=0.80,
+            **kwargs,
+        )
+
+    def test_supplier_synonyms_share_intent(self):
+        service = self._service()
+        first = service.describe("供应商开发流程是什么", _results("supplier"), None)
+        second = service.describe("新供应商怎么导入", _results("supplier"), None)
+        self.assertEqual(first.intent_key, second.intent_key)
+
+    def test_scope_keys_are_isolated_and_order_independent(self):
+        service = self._service()
+        first = service.describe(
+            "采购审批流程", _results("finance"), RetrievalScope(frozenset({"b", "a"}))
+        )
+        second = service.describe(
+            "采购审批流程", _results("finance"), RetrievalScope(frozenset({"a", "b"}))
+        )
+        other = service.describe(
+            "采购审批流程", _results("finance"), RetrievalScope(frozenset({"a"}))
+        )
+        self.assertEqual(first.scope_key, second.scope_key)
+        self.assertNotEqual(first.scope_key, other.scope_key)
+
+    def test_source_signature_is_stable_and_uses_first_three_unique_sources(self):
+        service = self._service()
+        first = service.describe("供应商开发", _results("c", "a", "b", "d", "a"), None)
+        second = service.describe("供应商开发", _results("a", "b", "c", "d"), None)
+        self.assertEqual(first.source_signature, second.source_signature)
+
+    def test_nfkc_and_question_shells_are_normalized(self):
+        service = self._service()
+        first = service.describe("ＡＢＣ是什么", _results("supplier"), None)
+        second = service.describe("abc", _results("supplier"), None)
+        self.assertEqual(first.intent_key, second.intent_key)
+
+    def test_no_results_are_not_recorded(self):
+        store = _FakeStore()
+        service = self._service(store)
+        observation = service.describe("供应商开发", [], None)
+        self.assertIsNone(service.record_safe_answer(observation, "答案"))
+        self.assertEqual(store.recorded, [])
+
+    def test_disabled_service_does_not_record(self):
+        store = _FakeStore()
+        service = FaqService(store, False, 3, 15, 0.82, 0.8)
+        observation = service.describe("供应商开发", _results("supplier"), None)
+        self.assertIsNone(service.lookup("供应商开发", _results("supplier"), None))
+        self.assertIsNone(service.record_safe_answer(observation, "答案"))
+        self.assertEqual(store.recorded, [])
+
+    def test_lookup_requires_current_revision_and_marks_old_entry_stale(self):
+        store = _FakeStore(
+            [{
+                "id": "faq-1", "intent_key": "wrong", "answer": "旧答案",
+                "normalized_question": "供应商开发", "search_text": "供应商 开发",
+                "source_signature": "old", "knowledge_revision": 3, "state": "enabled",
+            }],
+            revision=4,
+        )
+        service = self._service(store)
+        self.assertIsNone(service.lookup("供应商开发", _results("supplier"), None))
+        self.assertEqual(store.marked, [4])
+
+    def test_lookup_rejects_different_source_signature(self):
+        store = _FakeStore()
+        service = self._service(store)
+        observation = service.describe("供应商开发", _results("supplier"), None)
+        store.candidates = [{
+            "id": "faq-1", "intent_key": observation.intent_key, "answer": "答案",
+            "normalized_question": observation.normalized_question,
+            "search_text": observation.normalized_question,
+            "source_signature": "other", "knowledge_revision": 4, "state": "enabled",
+        }]
+        self.assertIsNone(service.lookup("供应商开发", _results("supplier"), None))
+
+    def test_lookup_rejects_low_source_overlap_even_when_text_is_similar(self):
+        service = self._service()
+        observation = service.describe("供应商开发", _results("source-a", "source-c"), None)
+        service.store.candidates = [{
+            "id": "faq-1", "intent_key": observation.intent_key, "answer": "答案",
+            "normalized_question": observation.normalized_question,
+            "search_text": observation.normalized_question,
+            "source_signature": "other", "source_ids": ["source-a", "source-b"],
+            "knowledge_revision": 4, "state": "enabled",
+        }]
+        self.assertIsNone(
+            service.lookup("供应商开发", _results("source-a", "source-c"), None)
+        )
+
+    def test_lookup_accepts_current_matching_entry(self):
+        service = self._service()
+        observation = service.describe("供应商开发", _results("supplier"), None)
+        store = service.store
+        store.candidates = [{
+            "id": "faq-1", "intent_key": observation.intent_key, "answer": "答案",
+            "normalized_question": observation.normalized_question,
+            "search_text": " ".join(observation.normalized_question.split()),
+            "source_signature": observation.source_signature,
+            "knowledge_revision": 4, "state": "enabled",
+        }]
+        match = service.lookup("供应商开发", _results("supplier"), None)
+        self.assertEqual(match, FaqMatch("faq-1", "答案", observation.intent_key))
+
+    def test_record_safe_answer_forwards_promotion_configuration(self):
+        store = _FakeStore()
+        service = FaqService(store, True, 7, 30, 0.82, 0.8)
+        observation = service.describe("供应商开发", _results("supplier"), None)
+        match = service.record_safe_answer(observation, "安全答案")
+        self.assertIsNotNone(match)
+        _, kwargs = store.recorded[0]
+        self.assertEqual(kwargs["promotion_count"], 7)
+        self.assertEqual(kwargs["window_days"], 30)
+        self.assertRegex(kwargs["day"], r"^\d{4}-\d{2}-\d{2}$")
 
 
 if __name__ == "__main__":
