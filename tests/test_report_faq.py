@@ -12,11 +12,11 @@ def _seed(path):
     store = IndexStore(path)
     with store.connection:
         store.connection.execute(
-            "INSERT INTO faq_metrics_daily(scope_key, day, eligible_questions, rag_answers, direct_hits, promotions, refreshes, rejected_answers) VALUES (?, ?, 4, 4, 2, 1, 1, 1)",
+            "INSERT INTO faq_metrics_daily(scope_key, day, eligible_questions, rag_answers, direct_hits, promotions, refreshes, rejected_answers) VALUES (?, ?, 4, 3, 2, 1, 1, 1)",
             ("space-hash", "2026-08-31"),
         )
         store.connection.execute(
-            "INSERT INTO faq_metrics_daily(scope_key, day, direct_hits, refreshes) VALUES (?, ?, 4, 2)",
+            "INSERT INTO faq_metrics_daily(scope_key, day, eligible_questions, direct_hits, refreshes) VALUES (?, ?, 8, 4, 2)",
             ("space-hash", "2026-08-20"),
         )
         store.connection.execute(
@@ -58,6 +58,7 @@ def test_report_faq_outputs_only_aggregate_metrics(tmp_path, capsys):
         "estimated_deepseek_requests_saved": 6,
         "faq_refreshes": 3,
         "current_invalid_faqs": 1,
+        "direct_hit_rate": 0.5,
     }
 
 

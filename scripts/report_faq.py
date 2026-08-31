@@ -48,14 +48,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         store.close()
     print("day\tscope_key\teligible_questions\trag_answers\tdirect_hits\tdirect_hit_rate\tpromotions\trefreshes\trejected_answers")
     for row in rows:
+        eligible_questions = int(row["eligible_questions"])
         rag_answers = int(row["rag_answers"])
         output = {
             "day": row["day"],
             "scope_key": row["scope_key"],
-            "eligible_questions": int(row["eligible_questions"]),
+            "eligible_questions": eligible_questions,
             "rag_answers": rag_answers,
             "direct_hits": int(row["direct_hits"]),
-            "direct_hit_rate": (int(row["direct_hits"]) / rag_answers) if rag_answers else 0.0,
+            "direct_hit_rate": (int(row["direct_hits"]) / eligible_questions)
+            if eligible_questions
+            else 0.0,
             "promotions": int(row["promotions"]),
             "refreshes": int(row["refreshes"]),
             "rejected_answers": int(row["rejected_answers"]),

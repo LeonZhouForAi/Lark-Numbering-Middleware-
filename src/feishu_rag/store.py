@@ -1207,18 +1207,21 @@ class IndexStore:
         ).fetchall()
         states = {str(row[0]): int(row[1]) for row in counts}
         totals = self.connection.execute(
-            "SELECT COALESCE(SUM(direct_hits), 0), COALESCE(SUM(refreshes), 0) "
+            "SELECT COALESCE(SUM(eligible_questions), 0), COALESCE(SUM(direct_hits), 0), "
+            "COALESCE(SUM(refreshes), 0) "
             "FROM faq_metrics_daily WHERE day >= ?",
             (cutoff_day,),
         ).fetchone()
         stale = states.get("stale", 0)
+        eligible = int(totals[0])
         return {
             "hot_intents": int(hot_intents),
             "enabled_faqs": states.get("enabled", 0),
             "stale_faqs": stale,
-            "estimated_deepseek_requests_saved": int(totals[0]),
-            "faq_refreshes": int(totals[1]),
+            "estimated_deepseek_requests_saved": int(totals[1]),
+            "faq_refreshes": int(totals[2]),
             "current_invalid_faqs": stale,
+            "direct_hit_rate": (int(totals[1]) / eligible) if eligible else 0.0,
         }
 
     def cleanup_faq(self, *, cutoff_day: str, stale_cutoff: float) -> dict[str, int]:
