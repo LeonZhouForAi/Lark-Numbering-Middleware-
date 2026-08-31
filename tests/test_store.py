@@ -8,11 +8,136 @@ from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
-from feishu_rag.models import Chunk, RetrievalScope
+from feishu_rag.models import Chunk, FaqObservation, RetrievalScope
 from feishu_rag.store import IndexStore, PreparedDocument, _pretokenize, _tokens
 
 
 class StoreTests(unittest.TestCase):
+    def test_faq_observation_promotes_on_third_recent_hit_and_returns_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                observation = FaqObservation("supplier-intake", "global", "source-v1", 0)
+                self.assertIsNone(
+                    store.record_faq_observation(
+                        observation, answer="安全答案", day="2026-08-17", now=1.0,
+                        normalized_question="供应商开发流程",
+                    )
+                )
+                self.assertIsNone(
+                    store.record_faq_observation(
+                        observation, answer="安全答案", day="2026-08-18", now=2.0,
+                        normalized_question="供应商开发流程",
+                    )
+                )
+                match = store.record_faq_observation(
+                    observation, answer="安全答案", day="2026-08-31", now=3.0,
+                    normalized_question="供应商开发流程",
+                )
+                self.assertIsNotNone(match)
+                self.assertEqual(match.answer, "安全答案")
+                self.assertEqual(
+                    store.connection.execute("SELECT COUNT(*) FROM faq_entries").fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    store.connection.execute("SELECT total_seen FROM faq_aliases").fetchone()[0],
+                    3,
+                )
+            finally:
+                store.close()
+
+    def test_faq_observation_does_not_mix_sources_or_expired_days(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                first = FaqObservation("intent", "global", "source-v1", 0)
+                second = FaqObservation("intent", "global", "source-v2", 0)
+                store.record_faq_observation(first, answer="a", day="2026-08-01", now=1.0)
+                store.record_faq_observation(first, answer="a", day="2026-08-17", now=2.0)
+                self.assertIsNone(
+                    store.record_faq_observation(second, answer="b", day="2026-08-31", now=3.0)
+                )
+                self.assertEqual(
+                    store.connection.execute("SELECT COUNT(*) FROM faq_entries").fetchone()[0],
+                    0,
+                )
+            finally:
+                store.close()
+
+    def test_faq_observation_concurrent_third_hit_creates_one_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            seed = IndexStore(db_path)
+            observation = FaqObservation("intent", "global", "source-v1", 0)
+            seed.record_faq_observation(observation, answer="a", day="2026-08-29", now=1.0)
+            seed.record_faq_observation(observation, answer="a", day="2026-08-30", now=2.0)
+            seed.close()
+            barrier = threading.Barrier(2)
+
+            def observe():
+                store = IndexStore(db_path)
+                try:
+                    barrier.wait(timeout=2)
+                    return store.record_faq_observation(
+                        observation, answer="a", day="2026-08-31", now=3.0,
+                    )
+                finally:
+                    store.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                matches = list(executor.map(lambda _: observe(), range(2)))
+            self.assertEqual(sum(match is not None for match in matches), 1)
+            store = IndexStore(db_path)
+            try:
+                self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM faq_entries").fetchone()[0], 1)
+            finally:
+                store.close()
+
+    def test_faq_refresh_replaces_stale_content_without_clearing_hits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                observation = FaqObservation("intent", "global", "source-v1", 0)
+                for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
+                    match = store.record_faq_observation(
+                        observation, answer="旧答案", day=day, now=1.0,
+                        normalized_question="问题",
+                    )
+                entry_id = match.entry_id
+                store.connection.execute("UPDATE faq_entries SET direct_hits=4,state='stale' WHERE id=?", (entry_id,))
+                refreshed = store.refresh_stale_faq(
+                    entry_id,
+                    FaqObservation("intent", "global", "source-v2", 1),
+                    answer="新答案",
+                    now=5.0,
+                )
+                self.assertEqual(refreshed.answer, "新答案")
+                self.assertEqual(
+                    tuple(store.connection.execute("SELECT source_signature,knowledge_revision,state,direct_hits FROM faq_entries WHERE id=?", (entry_id,)).fetchone()),
+                    ("source-v2", 1, "enabled", 4),
+                )
+            finally:
+                store.close()
+
+    def test_faq_metrics_validate_fields_aggregate_and_cleanup_preserves_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.record_faq_metric("2026-08-31", "direct_hits")
+                store.record_faq_metric("2026-08-31", "direct_hits")
+                with self.assertRaises(ValueError):
+                    store.record_faq_metric("2026-08-31", "scope_key")
+                metrics = store.query_faq_metrics(since_day="2026-08-31")
+                self.assertEqual(metrics[0]["direct_hits"], 2)
+                observation = FaqObservation("intent", "global", "source-v1", 0)
+                for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
+                    store.record_faq_observation(observation, answer="a", day=day, now=1.0, normalized_question="q")
+                removed = store.cleanup_faq(cutoff_day="2026-08-30", stale_cutoff=0.0)
+                self.assertGreaterEqual(removed["observations"], 1)
+                self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM faq_entries").fetchone()[0], 1)
+            finally:
+                store.close()
     def test_empty_database_creates_faq_schema_and_initial_revision(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")

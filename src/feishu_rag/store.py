@@ -9,13 +9,13 @@ import time
 import unicodedata
 import uuid
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Collection, Iterable
 
-from .models import Chunk, RetrievalScope, SearchResult
+from .models import Chunk, FaqMatch, FaqObservation, RetrievalScope, SearchResult
 
 
 _TOKEN_RE = re.compile(r"[\u4e00-\u9fff]+|[a-z0-9_]+")
@@ -36,6 +36,18 @@ _QUERY_STOP_WORDS = frozenset({"and", "or", "not", "near"})
 _FEISHU_SOURCE_RE = re.compile(r"^feishu:([^:]+):")
 _SQLITE_INT_MAX = 2**63 - 1
 _LOCK_RETRY_ATTEMPTS = 20
+_FAQ_PROMOTION_COUNT = 3
+_FAQ_WINDOW_DAYS = 15
+_FAQ_METRIC_FIELDS = frozenset(
+    {
+        "eligible_questions",
+        "rag_answers",
+        "direct_hits",
+        "promotions",
+        "refreshes",
+        "rejected_answers",
+    }
+)
 _FAQ_ENTRIES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS faq_entries (
     id TEXT PRIMARY KEY,
@@ -665,6 +677,390 @@ class IndexStore:
             self.connection.rollback()
             raise
         return int(row[0])
+
+    @staticmethod
+    def _validate_faq_day(day: str) -> date:
+        if not isinstance(day, str):
+            raise ValueError("day must be an ISO date")
+        try:
+            return date.fromisoformat(day)
+        except ValueError as exc:
+            raise ValueError("day must be an ISO date") from exc
+
+    @staticmethod
+    def _validate_faq_now(now: float) -> float:
+        try:
+            timestamp = float(now)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("now must be finite and non-negative") from exc
+        if not math.isfinite(timestamp) or timestamp < 0:
+            raise ValueError("now must be finite and non-negative")
+        return timestamp
+
+    @staticmethod
+    def _validate_faq_observation(observation: FaqObservation) -> None:
+        if not isinstance(observation, FaqObservation):
+            raise ValueError("observation must be a FaqObservation")
+        for field in ("intent_key", "scope_key", "source_signature"):
+            value = getattr(observation, field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field} must not be empty")
+        if (
+            isinstance(observation.knowledge_revision, bool)
+            or not isinstance(observation.knowledge_revision, int)
+            or observation.knowledge_revision < 0
+        ):
+            raise ValueError("knowledge_revision must be a non-negative integer")
+
+    @staticmethod
+    def _faq_question(observation: FaqObservation, normalized_question: str | None) -> str:
+        question = normalized_question
+        if question is None:
+            question = getattr(observation, "normalized_question", None)
+        if question is None:
+            # FaqObservation intentionally contains no employee/message data.  The
+            # stable intent is the only safe fallback when an older caller does not
+            # provide its normalized wording.
+            question = observation.intent_key
+        if not isinstance(question, str):
+            raise ValueError("normalized_question must be a string")
+        question = _normalize(question)
+        if not question:
+            raise ValueError("normalized_question must not be empty")
+        return question
+
+    @staticmethod
+    def _faq_answer(answer: str) -> str:
+        if not isinstance(answer, str) or not answer.strip():
+            raise ValueError("answer must not be empty")
+        return answer
+
+    def _begin_faq_transaction(self) -> None:
+        if not self.connection.in_transaction:
+            _execute_with_lock_retry(self.connection, "BEGIN IMMEDIATE")
+
+    def find_faq_candidates(
+        self, scope_key: str, normalized_question: str
+    ) -> list[sqlite3.Row]:
+        """Return enabled FAQ aliases belonging to one access scope."""
+        if not isinstance(scope_key, str) or not scope_key.strip():
+            raise ValueError("scope_key must not be empty")
+        question = _normalize(normalized_question)
+        if not question:
+            return []
+        return list(
+            self.connection.execute(
+                "SELECT e.id, e.intent_key, e.scope_key, e.canonical_question, "
+                "e.answer, e.source_signature, e.knowledge_revision, e.state, "
+                "e.direct_hits, e.created_at, e.updated_at, e.last_hit_at, "
+                "a.faq_id, a.normalized_question, a.search_text, a.first_seen_at, "
+                "a.last_seen_at, a.total_seen "
+                "FROM faq_entries AS e "
+                "JOIN faq_aliases AS a ON a.faq_id = e.id "
+                "WHERE e.scope_key = ? AND e.state = 'enabled' "
+                "AND a.normalized_question = ? "
+                "ORDER BY e.id",
+                (scope_key, question),
+            ).fetchall()
+        )
+
+    def record_faq_observation(
+        self,
+        observation: FaqObservation,
+        *,
+        answer: str,
+        day: str,
+        now: float,
+        normalized_question: str | None = None,
+        window_days: int = _FAQ_WINDOW_DAYS,
+    ) -> FaqMatch | None:
+        """Atomically record an observation and promote its FAQ on hit three."""
+        self._validate_faq_observation(observation)
+        safe_answer = self._faq_answer(answer)
+        current_day = self._validate_faq_day(day)
+        timestamp = self._validate_faq_now(now)
+        question = self._faq_question(observation, normalized_question)
+        if (
+            isinstance(window_days, bool)
+            or not isinstance(window_days, int)
+            or window_days <= 0
+        ):
+            raise ValueError("window_days must be a positive integer")
+        first_day = (current_day - timedelta(days=window_days - 1)).isoformat()
+
+        self._begin_faq_transaction()
+        try:
+            self.connection.execute(
+                "INSERT INTO faq_observation_daily("
+                "intent_key,scope_key,day,count,normalized_question,source_signature,"
+                "knowledge_revision,latest_safe_answer"
+                ") VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(scope_key,intent_key,source_signature,knowledge_revision,day) "
+                "DO UPDATE SET latest_safe_answer = excluded.latest_safe_answer",
+                (
+                    observation.intent_key,
+                    observation.scope_key,
+                    day,
+                    1,
+                    question,
+                    observation.source_signature,
+                    observation.knowledge_revision,
+                    safe_answer,
+                ),
+            )
+            self.connection.execute(
+                "INSERT INTO faq_metrics_daily(scope_key,day,eligible_questions) "
+                "VALUES(?,?,1) ON CONFLICT(scope_key,day) DO UPDATE SET "
+                "eligible_questions = eligible_questions + 1",
+                (observation.scope_key, day),
+            )
+            total = self.connection.execute(
+                "SELECT COALESCE(SUM(count), 0) FROM faq_observation_daily "
+                "WHERE scope_key = ? AND intent_key = ? AND source_signature = ? "
+                "AND knowledge_revision = ? AND day >= ? AND day <= ?",
+                (
+                    observation.scope_key,
+                    observation.intent_key,
+                    observation.source_signature,
+                    observation.knowledge_revision,
+                    first_day,
+                    day,
+                ),
+            ).fetchone()[0]
+
+            existing = self.connection.execute(
+                "SELECT * FROM faq_entries WHERE scope_key = ? AND intent_key = ?",
+                (observation.scope_key, observation.intent_key),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["state"] == "enabled"
+                    and existing["source_signature"] == observation.source_signature
+                    and existing["knowledge_revision"] == observation.knowledge_revision
+                ):
+                    self.connection.execute(
+                        "INSERT INTO faq_aliases("
+                        "faq_id,normalized_question,search_text,first_seen_at,last_seen_at,total_seen"
+                        ") VALUES(?,?,?,?,?,1) ON CONFLICT(faq_id,normalized_question) DO UPDATE SET "
+                        "search_text = excluded.search_text, last_seen_at = excluded.last_seen_at, "
+                        "total_seen = total_seen + 1",
+                        (existing["id"], question, _pretokenize(question), timestamp, timestamp),
+                    )
+                self.connection.commit()
+                return None
+
+            if total < _FAQ_PROMOTION_COUNT:
+                self.connection.commit()
+                return None
+
+            entry_id = str(uuid.uuid4())
+            self.connection.execute(
+                "INSERT INTO faq_entries("
+                "id,intent_key,scope_key,canonical_question,answer,source_signature,"
+                "knowledge_revision,state,direct_hits,created_at,updated_at,last_hit_at"
+                ") VALUES(?,?,?,?,?,?,?,'enabled',0,?,?,NULL)",
+                (
+                    entry_id,
+                    observation.intent_key,
+                    observation.scope_key,
+                    question,
+                    safe_answer,
+                    observation.source_signature,
+                    observation.knowledge_revision,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            rows = self.connection.execute(
+                "SELECT normalized_question, SUM(count) AS total_seen "
+                "FROM faq_observation_daily WHERE scope_key = ? AND intent_key = ? "
+                "AND source_signature = ? AND knowledge_revision = ? "
+                "AND day >= ? AND day <= ? GROUP BY normalized_question",
+                (
+                    observation.scope_key,
+                    observation.intent_key,
+                    observation.source_signature,
+                    observation.knowledge_revision,
+                    first_day,
+                    day,
+                ),
+            ).fetchall()
+            for row in rows:
+                alias_question = row["normalized_question"]
+                self.connection.execute(
+                    "INSERT INTO faq_aliases("
+                    "faq_id,normalized_question,search_text,first_seen_at,last_seen_at,total_seen"
+                    ") VALUES(?,?,?,?,?,?)",
+                    (
+                        entry_id,
+                        alias_question,
+                        _pretokenize(alias_question),
+                        timestamp,
+                        timestamp,
+                        int(row["total_seen"]),
+                    ),
+                )
+            self.connection.execute(
+                "INSERT INTO faq_metrics_daily(scope_key,day,promotions) VALUES(?,?,1) "
+                "ON CONFLICT(scope_key,day) DO UPDATE SET promotions = promotions + 1",
+                (observation.scope_key, day),
+            )
+            self.connection.commit()
+            return FaqMatch(entry_id, safe_answer, observation.intent_key)
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def refresh_stale_faq(
+        self,
+        entry_id: str,
+        observation: FaqObservation,
+        *,
+        answer: str,
+        now: float,
+        normalized_question: str | None = None,
+    ) -> FaqMatch:
+        """Refresh one stale/versioned FAQ in place while preserving hit history."""
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            raise ValueError("entry_id must not be empty")
+        self._validate_faq_observation(observation)
+        safe_answer = self._faq_answer(answer)
+        timestamp = self._validate_faq_now(now)
+        question = self._faq_question(observation, normalized_question)
+        self._begin_faq_transaction()
+        try:
+            entry = self.connection.execute(
+                "SELECT * FROM faq_entries WHERE id = ?", (entry_id,)
+            ).fetchone()
+            if entry is None:
+                raise ValueError("FAQ entry does not exist")
+            if (
+                entry["scope_key"] != observation.scope_key
+                or entry["intent_key"] != observation.intent_key
+            ):
+                raise ValueError("observation does not match FAQ scope or intent")
+            should_refresh = (
+                entry["state"] == "stale"
+                or entry["knowledge_revision"] != observation.knowledge_revision
+            )
+            if should_refresh:
+                self.connection.execute(
+                    "UPDATE faq_entries SET canonical_question = ?, answer = ?, "
+                    "source_signature = ?, knowledge_revision = ?, state = 'enabled', "
+                    "updated_at = ? WHERE id = ?",
+                    (
+                        question,
+                        safe_answer,
+                        observation.source_signature,
+                        observation.knowledge_revision,
+                        timestamp,
+                        entry_id,
+                    ),
+                )
+                self.connection.execute(
+                    "INSERT INTO faq_metrics_daily(scope_key,day,refreshes) VALUES(?,?,1) "
+                    "ON CONFLICT(scope_key,day) DO UPDATE SET refreshes = refreshes + 1",
+                    (observation.scope_key, datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()),
+                )
+            if normalized_question is not None:
+                self.connection.execute(
+                    "INSERT INTO faq_aliases("
+                    "faq_id,normalized_question,search_text,first_seen_at,last_seen_at,total_seen"
+                    ") VALUES(?,?,?,?,?,1) ON CONFLICT(faq_id,normalized_question) DO UPDATE SET "
+                    "last_seen_at = excluded.last_seen_at, total_seen = total_seen + 1",
+                    (entry_id, question, _pretokenize(question), timestamp, timestamp),
+                )
+            self.connection.commit()
+            return FaqMatch(entry_id, safe_answer if should_refresh else entry["answer"], observation.intent_key)
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def mark_faq_stale_before_revision(self, revision: int) -> int:
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ValueError("revision must be a non-negative integer")
+        self._begin_faq_transaction()
+        try:
+            cursor = self.connection.execute(
+                "UPDATE faq_entries SET state = 'stale', updated_at = ? "
+                "WHERE state = 'enabled' AND knowledge_revision < ?",
+                (time.time(), revision),
+            )
+            self.connection.commit()
+            return cursor.rowcount
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def record_faq_metric(self, day: str, field: str) -> None:
+        self._validate_faq_day(day)
+        if field not in _FAQ_METRIC_FIELDS:
+            raise ValueError("unsupported FAQ metric field")
+        statements = {
+            "eligible_questions": (
+                "INSERT INTO faq_metrics_daily(scope_key,day,eligible_questions) VALUES('',?,1) "
+                "ON CONFLICT(scope_key,day) DO UPDATE SET eligible_questions = eligible_questions + 1"
+            ),
+            "rag_answers": (
+                "INSERT INTO faq_metrics_daily(scope_key,day,rag_answers) VALUES('',?,1) "
+                "ON CONFLICT(scope_key,day) DO UPDATE SET rag_answers = rag_answers + 1"
+            ),
+            "direct_hits": (
+                "INSERT INTO faq_metrics_daily(scope_key,day,direct_hits) VALUES('',?,1) "
+                "ON CONFLICT(scope_key,day) DO UPDATE SET direct_hits = direct_hits + 1"
+            ),
+            "promotions": (
+                "INSERT INTO faq_metrics_daily(scope_key,day,promotions) VALUES('',?,1) "
+                "ON CONFLICT(scope_key,day) DO UPDATE SET promotions = promotions + 1"
+            ),
+            "refreshes": (
+                "INSERT INTO faq_metrics_daily(scope_key,day,refreshes) VALUES('',?,1) "
+                "ON CONFLICT(scope_key,day) DO UPDATE SET refreshes = refreshes + 1"
+            ),
+            "rejected_answers": (
+                "INSERT INTO faq_metrics_daily(scope_key,day,rejected_answers) VALUES('',?,1) "
+                "ON CONFLICT(scope_key,day) DO UPDATE SET rejected_answers = rejected_answers + 1"
+            ),
+        }
+        self._begin_faq_transaction()
+        try:
+            self.connection.execute(statements[field], (day,))
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def query_faq_metrics(self, *, since_day: str | None = None) -> list[dict[str, object]]:
+        if since_day is not None:
+            self._validate_faq_day(since_day)
+        statement = (
+            "SELECT scope_key,day,eligible_questions,rag_answers,direct_hits,promotions,"
+            "refreshes,rejected_answers FROM faq_metrics_daily"
+        )
+        parameters: tuple[object, ...] = ()
+        if since_day is not None:
+            statement += " WHERE day >= ?"
+            parameters = (since_day,)
+        statement += " ORDER BY day, scope_key"
+        return [dict(row) for row in self.connection.execute(statement, parameters).fetchall()]
+
+    def cleanup_faq(self, *, cutoff_day: str, stale_cutoff: float) -> dict[str, int]:
+        self._validate_faq_day(cutoff_day)
+        cutoff = self._validate_faq_now(stale_cutoff)
+        self._begin_faq_transaction()
+        try:
+            observations = self.connection.execute(
+                "DELETE FROM faq_observation_daily WHERE day < ?", (cutoff_day,)
+            ).rowcount
+            stale_entries = self.connection.execute(
+                "DELETE FROM faq_entries WHERE state = 'stale' AND updated_at < ?",
+                (cutoff,),
+            ).rowcount
+            self.connection.commit()
+            return {"observations": observations, "stale_entries": stale_entries}
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def _migrate_faq_entries_constraints(self) -> None:
         table_row = self.connection.execute(
