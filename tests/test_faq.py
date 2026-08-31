@@ -1,8 +1,12 @@
 import unittest
 from dataclasses import FrozenInstanceError
+import json
+import tempfile
+from pathlib import Path
 
 from feishu_rag.faq import FaqService
 from feishu_rag.models import Chunk, FaqMatch, FaqObservation, RetrievalScope, SearchResult
+from feishu_rag.store import IndexStore
 
 
 def _results(*source_ids: str) -> list[SearchResult]:
@@ -22,7 +26,7 @@ class _FakeStore:
     def knowledge_revision(self):
         return self.revision
 
-    def find_faq_candidates(self, scope_key, normalized_question):
+    def find_faq_candidates(self, scope_key):
         return self.candidates
 
     def mark_faq_stale_before_revision(self, revision):
@@ -51,6 +55,7 @@ class FaqModelsTests(unittest.TestCase):
         )
         self.assertEqual(observation.knowledge_revision, 4)
         self.assertEqual(observation.normalized_question, "密码怎么重置")
+        self.assertEqual(observation.source_ids, ())
         with self.assertRaises(FrozenInstanceError):
             observation.scope_key = "space-b"
 
@@ -147,6 +152,7 @@ class FaqServiceTests(unittest.TestCase):
             "normalized_question": observation.normalized_question,
             "search_text": observation.normalized_question,
             "source_signature": "other", "source_ids": ["source-a", "source-b"],
+            "source_ids_json": json.dumps(["source-a", "source-b"]),
             "knowledge_revision": 4, "state": "enabled",
         }]
         self.assertIsNone(
@@ -162,6 +168,7 @@ class FaqServiceTests(unittest.TestCase):
             "normalized_question": observation.normalized_question,
             "search_text": " ".join(observation.normalized_question.split()),
             "source_signature": observation.source_signature,
+            "source_ids_json": json.dumps(list(observation.source_ids)),
             "knowledge_revision": 4, "state": "enabled",
         }]
         match = service.lookup("供应商开发", _results("supplier"), None)
@@ -177,6 +184,58 @@ class FaqServiceTests(unittest.TestCase):
         self.assertEqual(kwargs["promotion_count"], 7)
         self.assertEqual(kwargs["window_days"], 30)
         self.assertRegex(kwargs["day"], r"^\d{4}-\d{2}-\d{2}$")
+
+    def test_describe_persists_sorted_first_three_unique_source_ids(self):
+        service = self._service()
+        observation = service.describe("供应商开发", _results("c", "a", "b", "d", "a"), None)
+        self.assertEqual(observation.source_ids, ("a", "b", "c"))
+
+    def test_non_string_question_is_rejected_safely(self):
+        service = self._service()
+        self.assertIsNone(service.lookup(None, _results("supplier"), None))
+
+    def test_real_store_lookup_survives_service_restart_and_uses_all_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "faq.sqlite3"
+            store = IndexStore(db_path)
+            try:
+                service = FaqService(store, True, 2, 15, 0.70, 0.80)
+                results = _results("supplier-a", "supplier-b")
+                observation = service.describe("供应商开发流程是什么", results, None)
+                service.record_safe_answer(observation, "安全答案")
+                service.record_safe_answer(observation, "安全答案")
+                alias = service.describe("供应商开发怎么做", results, None)
+                service.record_safe_answer(alias, "安全答案")
+                store.close()
+
+                restarted = IndexStore(db_path)
+                try:
+                    fresh_service = FaqService(restarted, True, 2, 15, 0.70, 0.80)
+                    match = fresh_service.lookup("供应商开发怎么执行", results, None)
+                    self.assertIsNotNone(match)
+                finally:
+                    restarted.close()
+            finally:
+                if store.connection is not None:
+                    try:
+                        store.close()
+                    except Exception:
+                        pass
+
+    def test_real_store_lookup_rejects_invalid_persisted_source_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "faq.sqlite3")
+            try:
+                service = FaqService(store, True, 1, 15, 0.5, 0.8)
+                observation = service.describe("供应商开发", _results("supplier"), None)
+                service.record_safe_answer(observation, "安全答案")
+                store.connection.execute(
+                    "UPDATE faq_entries SET source_ids_json = ?", ("not-json",)
+                )
+                store.connection.commit()
+                self.assertIsNone(service.lookup("供应商开发", _results("supplier"), None))
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

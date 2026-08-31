@@ -13,6 +13,30 @@ from feishu_rag.store import IndexStore, PreparedDocument, _pretokenize, _tokens
 
 
 class StoreTests(unittest.TestCase):
+    def test_faq_source_ids_are_persisted_as_sorted_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                observation = FaqObservation(
+                    "intent", "global", "问题", "source-v1", 0,
+                    source_ids=("source-b", "source-a", "source-b"),
+                )
+                match = store.record_faq_observation(
+                    observation, answer="答案", day="2026-08-31", now=1.0,
+                    promotion_count=1,
+                )
+                self.assertIsNotNone(match)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT source_ids_json FROM faq_entries"
+                    ).fetchone()[0],
+                    '["source-a","source-b"]',
+                )
+                candidate = store.find_faq_candidates("global")[0]
+                self.assertEqual(candidate["source_ids_json"], '["source-a","source-b"]')
+            finally:
+                store.close()
+
     def test_faq_promotion_count_is_configurable_and_bounded(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
@@ -131,8 +155,8 @@ class StoreTests(unittest.TestCase):
                 )
                 for observation in observations:
                     self.assertEqual(
-                        len(store.find_faq_candidates("global", observation.normalized_question)),
-                        1,
+                        len(store.find_faq_candidates("global")),
+                        3,
                     )
             finally:
                 store.close()
@@ -405,7 +429,7 @@ class StoreTests(unittest.TestCase):
                         "total_seen",
                     }.issubset(columns)
                 )
-                self.assertEqual(len(store.find_faq_candidates("global", "问题")), 1)
+                self.assertEqual(len(store.find_faq_candidates("global")), 1)
                 foreign_key = next(
                     row
                     for row in store.connection.execute("PRAGMA foreign_key_list(faq_aliases)").fetchall()
@@ -595,10 +619,10 @@ class StoreTests(unittest.TestCase):
                     "供应商开发流程是什么",
                 )
                 self.assertEqual(
-                    len(store.find_faq_candidates("global", "供应商开发流程是什么")),
+                    len(store.find_faq_candidates("global")),
                     1,
                 )
-                self.assertEqual(store.find_faq_candidates("global", "intent-hash"), [])
+                self.assertEqual(len(store.find_faq_candidates("global")), 1)
             finally:
                 store.close()
 
@@ -1210,20 +1234,26 @@ class StoreTests(unittest.TestCase):
                     ).fetchone()[0],
                     "faq-legacy",
                 )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT source_ids_json FROM faq_entries"
+                    ).fetchone()[0],
+                    "[]",
+                )
                 with self.assertRaises(sqlite3.IntegrityError):
                     store.connection.execute(
-                        "INSERT INTO faq_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "INSERT INTO faq_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             "faq-invalid-state", "intent-2", "scope-2", "问题",
-                            "答案", "source", 0, "active", 0, 1.0, 1.0, None,
+                            "答案", "source", "[]", 0, "active", 0, 1.0, 1.0, None,
                         ),
                     )
                 with self.assertRaises(sqlite3.IntegrityError):
                     store.connection.execute(
-                        "INSERT INTO faq_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "INSERT INTO faq_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             "faq-invalid-revision", "intent-3", "scope-3", "问题",
-                            "答案", "source", -1, "enabled", 0, 1.0, 1.0, None,
+                            "答案", "source", "[]", -1, "enabled", 0, 1.0, 1.0, None,
                         ),
                     )
             finally:

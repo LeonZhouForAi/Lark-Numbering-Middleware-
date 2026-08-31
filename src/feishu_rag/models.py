@@ -57,3 +57,4 @@ class FaqObservation:
     normalized_question: str
     source_signature: str
     knowledge_revision: int
+    source_ids: tuple[str, ...] = ()

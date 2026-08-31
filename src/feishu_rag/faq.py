@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Iterable
 
 from .models import FaqMatch, FaqObservation, RetrievalScope, SearchResult
-from .store import _core_terms, _meaningful_query, _normalize, _pretokenize, _tokens
+from .store import _core_terms, _meaningful_query, _normalize, _tokens
 
 
 # These replacements are deliberately small and reviewable.  They are used
@@ -52,11 +53,6 @@ class FaqService:
         self.window_days = window_days
         self.min_text_similarity = min_text_similarity
         self.min_source_overlap = min_source_overlap
-        # A signature is intentionally still persisted as a digest.  Keeping
-        # the selected source sets in-process lets us calculate Jaccard when a
-        # service observes both sides; an entry loaded after restart falls back
-        # to the safe exact-signature check.
-        self._source_sets: dict[str, frozenset[str]] = {}
 
     @staticmethod
     def _scope_key(scope: RetrievalScope | None) -> str:
@@ -69,6 +65,8 @@ class FaqService:
 
     @staticmethod
     def _question_features(question: str) -> tuple[str, str]:
+        if not isinstance(question, str):
+            return "", ""
         text = _normalize(question)
         for source, target in _SYNONYMS:
             text = text.replace(source, f" {target} ")
@@ -103,21 +101,23 @@ class FaqService:
     def _token_set(text: str) -> set[str]:
         return set(_tokens(text)) if text else set()
 
-    def _source_overlap(self, candidate: Any, current_signature: str) -> float:
-        candidate_signature = _row_value(candidate, "source_signature", "")
-        if candidate_signature == current_signature:
-            return 1.0
-
-        candidate_ids = _row_value(candidate, "source_ids")
-        if isinstance(candidate_ids, str):
-            candidate_ids = [item for item in candidate_ids.split(",") if item]
-        if candidate_ids is not None:
-            candidate_set = frozenset(str(item) for item in candidate_ids)
-        else:
-            candidate_set = self._source_sets.get(str(candidate_signature))
-        current_set = self._source_sets.get(current_signature)
-        if candidate_set is None or current_set is None:
+    @staticmethod
+    def _source_overlap(candidate: Any, current_source_ids: tuple[str, ...]) -> float:
+        source_ids_json = _row_value(candidate, "source_ids_json")
+        if not isinstance(source_ids_json, str):
             return 0.0
+        try:
+            candidate_ids = json.loads(source_ids_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return 0.0
+        if (
+            not isinstance(candidate_ids, list)
+            or not candidate_ids
+            or any(not isinstance(source_id, str) or not source_id for source_id in candidate_ids)
+        ):
+            return 0.0
+        candidate_set = frozenset(candidate_ids)
+        current_set = frozenset(current_source_ids)
         union = candidate_set | current_set
         return len(candidate_set & current_set) / len(union) if union else 1.0
 
@@ -130,8 +130,6 @@ class FaqService:
         normalized_question, intent_key = self._question_features(question)
         source_ids = self._source_ids(results)
         source_signature = self._signature(source_ids)
-        if source_signature:
-            self._source_sets[source_signature] = frozenset(source_ids)
         scope_key = self._scope_key(scope)
         return FaqObservation(
             intent_key=intent_key,
@@ -139,6 +137,7 @@ class FaqService:
             normalized_question=normalized_question,
             source_signature=source_signature,
             knowledge_revision=int(self.store.knowledge_revision()),
+            source_ids=source_ids,
         )
 
     def lookup(
@@ -158,9 +157,7 @@ class FaqService:
         ):
             return None
 
-        candidates = self.store.find_faq_candidates(
-            observation.scope_key, observation.normalized_question
-        )
+        candidates = self.store.find_faq_candidates(observation.scope_key)
         current_revision = observation.knowledge_revision
         for candidate in candidates:
             if _row_value(candidate, "state", "enabled") != "enabled":
@@ -168,16 +165,11 @@ class FaqService:
             if _row_value(candidate, "knowledge_revision") != current_revision:
                 self.store.mark_faq_stale_before_revision(current_revision)
                 return None
-            if _row_value(candidate, "intent_key") != observation.intent_key:
-                continue
             candidate_question = _row_value(
                 candidate, "normalized_question", observation.normalized_question
             )
-            candidate_search_text = _row_value(candidate, "search_text", "")
-            if not candidate_search_text:
-                candidate_search_text = _pretokenize(candidate_question)
             text_terms = self._token_set(observation.normalized_question)
-            candidate_terms = self._token_set(candidate_search_text)
+            candidate_terms = self._token_set(candidate_question)
             union = text_terms | candidate_terms
             text_similarity = (
                 len(text_terms & candidate_terms) / len(union) if union else 0.0
@@ -185,7 +177,7 @@ class FaqService:
             if text_similarity < self.min_text_similarity:
                 continue
             if (
-                self._source_overlap(candidate, observation.source_signature)
+                self._source_overlap(candidate, observation.source_ids)
                 < self.min_source_overlap
             ):
                 continue

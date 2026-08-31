@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import sqlite3
@@ -56,6 +57,7 @@ CREATE TABLE IF NOT EXISTS faq_entries (
     canonical_question TEXT NOT NULL,
     answer TEXT NOT NULL,
     source_signature TEXT NOT NULL,
+    source_ids_json TEXT NOT NULL DEFAULT '[]',
     knowledge_revision INTEGER NOT NULL CHECK(knowledge_revision >= 0),
     state TEXT NOT NULL CHECK(state IN ('enabled', 'stale')),
     direct_hits INTEGER NOT NULL DEFAULT 0 CHECK(direct_hits >= 0),
@@ -726,6 +728,19 @@ class IndexStore:
             or observation.knowledge_revision < 0
         ):
             raise ValueError("knowledge_revision must be a non-negative integer")
+        if not isinstance(observation.source_ids, tuple) or any(
+            not isinstance(source_id, str) or not source_id.strip()
+            for source_id in observation.source_ids
+        ):
+            raise ValueError("source_ids must be a tuple of non-empty strings")
+
+    @staticmethod
+    def _faq_source_ids_json(observation: FaqObservation) -> str:
+        return json.dumps(
+            sorted(set(observation.source_ids)),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
     @staticmethod
     def _faq_question(observation: FaqObservation) -> str:
@@ -744,28 +759,22 @@ class IndexStore:
         if not self.connection.in_transaction:
             _execute_with_lock_retry(self.connection, "BEGIN IMMEDIATE")
 
-    def find_faq_candidates(
-        self, scope_key: str, normalized_question: str
-    ) -> list[sqlite3.Row]:
-        """Return enabled FAQ aliases belonging to one access scope."""
+    def find_faq_candidates(self, scope_key: str) -> list[sqlite3.Row]:
+        """Return all FAQ aliases belonging to one access scope."""
         if not isinstance(scope_key, str) or not scope_key.strip():
             raise ValueError("scope_key must not be empty")
-        question = _normalize(normalized_question)
-        if not question:
-            return []
         return list(
             self.connection.execute(
                 "SELECT e.id, e.intent_key, e.scope_key, e.canonical_question, "
-                "e.answer, e.source_signature, e.knowledge_revision, e.state, "
+                "e.answer, e.source_signature, e.source_ids_json, e.knowledge_revision, e.state, "
                 "e.direct_hits, e.created_at, e.updated_at, e.last_hit_at, "
                 "a.faq_id, a.normalized_question, a.search_text, a.first_seen_at, "
                 "a.last_seen_at, a.total_seen "
                 "FROM faq_entries AS e "
                 "JOIN faq_aliases AS a ON a.faq_id = e.id "
-                "WHERE e.scope_key = ? AND e.state = 'enabled' "
-                "AND a.normalized_question = ? "
-                "ORDER BY e.id",
-                (scope_key, question),
+                "WHERE e.scope_key = ? "
+                "ORDER BY e.id, a.normalized_question",
+                (scope_key,),
             ).fetchall()
         )
 
@@ -785,6 +794,7 @@ class IndexStore:
         current_day = self._validate_faq_day(day)
         timestamp = self._validate_faq_now(now)
         question = self._faq_question(observation)
+        source_ids_json = self._faq_source_ids_json(observation)
         if (
             isinstance(promotion_count, bool)
             or not isinstance(promotion_count, int)
@@ -859,12 +869,13 @@ class IndexStore:
                 ):
                     self.connection.execute(
                         "UPDATE faq_entries SET canonical_question = ?, answer = ?, "
-                        "source_signature = ?, knowledge_revision = ?, state = 'enabled', "
+                        "source_signature = ?, source_ids_json = ?, knowledge_revision = ?, state = 'enabled', "
                         "updated_at = ? WHERE id = ?",
                         (
                             question,
                             safe_answer,
                             observation.source_signature,
+                            source_ids_json,
                             observation.knowledge_revision,
                             timestamp,
                             existing["id"],
@@ -908,9 +919,9 @@ class IndexStore:
             entry_id = str(uuid.uuid4())
             self.connection.execute(
                 "INSERT INTO faq_entries("
-                "id,intent_key,scope_key,canonical_question,answer,source_signature,"
+                "id,intent_key,scope_key,canonical_question,answer,source_signature,source_ids_json,"
                 "knowledge_revision,state,direct_hits,created_at,updated_at,last_hit_at"
-                ") VALUES(?,?,?,?,?,?,?,'enabled',0,?,?,NULL)",
+                ") VALUES(?,?,?,?,?,?,?,?,'enabled',0,?,?,NULL)",
                 (
                     entry_id,
                     observation.intent_key,
@@ -918,6 +929,7 @@ class IndexStore:
                     question,
                     safe_answer,
                     observation.source_signature,
+                    source_ids_json,
                     observation.knowledge_revision,
                     timestamp,
                     timestamp,
@@ -978,6 +990,7 @@ class IndexStore:
         safe_answer = self._faq_answer(answer)
         timestamp = self._validate_faq_now(now)
         question = self._faq_question(observation)
+        source_ids_json = self._faq_source_ids_json(observation)
         self._begin_faq_transaction()
         try:
             current_revision_row = self.connection.execute(
@@ -1006,12 +1019,13 @@ class IndexStore:
             if should_refresh:
                 self.connection.execute(
                     "UPDATE faq_entries SET canonical_question = ?, answer = ?, "
-                    "source_signature = ?, knowledge_revision = ?, state = 'enabled', "
+                    "source_signature = ?, source_ids_json = ?, knowledge_revision = ?, state = 'enabled', "
                     "updated_at = ? WHERE id = ?",
                     (
                         question,
                         safe_answer,
                         observation.source_signature,
+                        source_ids_json,
                         observation.knowledge_revision,
                         timestamp,
                         entry_id,
@@ -1195,6 +1209,18 @@ class IndexStore:
         if table_row is None:
             return
 
+        columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(faq_entries)").fetchall()
+        }
+        source_column = next(
+            (
+                row
+                for row in self.connection.execute("PRAGMA table_info(faq_entries)").fetchall()
+                if row[1] == "source_ids_json"
+            ),
+            None,
+        )
         table_sql = re.sub(r"\s+", "", (table_row[0] or "").casefold())
         required_checks = (
             "check(knowledge_revision>=0)",
@@ -1204,17 +1230,23 @@ class IndexStore:
             "check(updated_at>=0)",
             "check(last_hit_atisnullorlast_hit_at>=0)",
         )
-        if (
+        valid_schema = (
             all(check in table_sql for check in required_checks)
             and self._faq_scope_intent_unique_constraint_present()
-        ):
+            and (
+                source_column is None
+                or (bool(source_column[3]) and source_column[4] == "'[]'")
+            )
+        )
+        if valid_schema and "source_ids_json" not in columns:
+            self.connection.execute(
+                "ALTER TABLE faq_entries ADD COLUMN source_ids_json TEXT NOT NULL DEFAULT '[]'"
+            )
+            columns.add("source_ids_json")
+        if valid_schema:
             self._migrate_faq_aliases_constraints()
             return
 
-        columns = {
-            row[1]
-            for row in self.connection.execute("PRAGMA table_info(faq_entries)").fetchall()
-        }
         required_columns = {
             "id",
             "intent_key",
@@ -1314,11 +1346,14 @@ class IndexStore:
             f"ALTER TABLE faq_entries RENAME TO {quoted(legacy_name)}"
         )
         self.connection.execute(_FAQ_ENTRIES_SCHEMA)
+        source_ids_select = (
+            "source_ids_json" if "source_ids_json" in columns else "'[]'"
+        )
         self.connection.execute(
             "INSERT INTO faq_entries("
-            "id,intent_key,scope_key,canonical_question,answer,source_signature,"
+            "id,intent_key,scope_key,canonical_question,answer,source_signature,source_ids_json,"
             "knowledge_revision,state,direct_hits,created_at,updated_at,last_hit_at"
-            f") SELECT id,intent_key,scope_key,canonical_question,answer,source_signature,"
+            f") SELECT id,intent_key,scope_key,canonical_question,answer,source_signature,{source_ids_select},"
             f"knowledge_revision,state,direct_hits,created_at,updated_at,last_hit_at "
             f"FROM {quoted(legacy_name)}"
         )
