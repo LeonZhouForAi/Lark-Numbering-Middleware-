@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Sequence
 
@@ -29,6 +29,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     store = IndexStore(args.db)
     try:
         rows = store.query_faq_metrics(since_day=args.since)
+        cutoff_day = (date.today() - timedelta(days=15)).isoformat()
+        summary = store.query_faq_summary(cutoff_day=cutoff_day)
     finally:
         store.close()
     print("day\tscope_key\teligible_questions\trag_answers\tdirect_hits\tdirect_hit_rate\tpromotions\trefreshes\trejected_answers")
@@ -46,6 +48,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "rejected_answers": int(row["rejected_answers"]),
         }
         print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
+    print("summary\t" + json.dumps(summary, separators=(",", ":")))
     return 0
 
 

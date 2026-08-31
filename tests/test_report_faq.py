@@ -16,8 +16,24 @@ def _seed(path):
             ("space-hash", "2026-08-31"),
         )
         store.connection.execute(
+            "INSERT INTO faq_metrics_daily(scope_key, day, direct_hits, refreshes) VALUES (?, ?, 4, 2)",
+            ("space-hash", "2026-08-20"),
+        )
+        store.connection.execute(
             "INSERT INTO faq_entries(id, intent_key, scope_key, canonical_question, answer, source_signature, source_ids_json, knowledge_revision, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'enabled', 1, 1)",
             ("id", "intent", "space-hash", "内部问题", "标准答案", "sig", "[]"),
+        )
+        store.connection.execute(
+            "INSERT INTO faq_entries(id, intent_key, scope_key, canonical_question, answer, source_signature, source_ids_json, knowledge_revision, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'stale', 1, 1)",
+            ("stale", "old-intent", "space-hash", "另一个问题", "另一个答案", "sig", "[]"),
+        )
+        store.connection.execute(
+            "INSERT INTO faq_observation_daily(intent_key, scope_key, day, count, normalized_question, source_signature, knowledge_revision) VALUES (?, ?, ?, 1, ?, ?, 0)",
+            ("intent", "space-hash", "2026-08-31", "q", "sig"),
+        )
+        store.connection.execute(
+            "INSERT INTO faq_observation_daily(intent_key, scope_key, day, count, normalized_question, source_signature, knowledge_revision) VALUES (?, ?, ?, 1, ?, ?, 0)",
+            ("second-intent", "space-hash", "2026-08-20", "q2", "sig"),
         )
     store.close()
 
@@ -32,7 +48,17 @@ def test_report_faq_outputs_only_aggregate_metrics(tmp_path, capsys):
     assert "标准答案" not in output
     assert "内部问题" not in output
     assert "source" not in output.lower()
-    assert json.loads(output.splitlines()[1])["direct_hit_rate"] == pytest.approx(2 / 3)
+    daily = [json.loads(line) for line in output.splitlines()[1:] if not line.startswith("summary\t")]
+    assert next(row for row in daily if row["day"] == "2026-08-31")["direct_hit_rate"] == pytest.approx(2 / 3)
+    summary = json.loads(next(line.split("\t", 1)[1] for line in output.splitlines() if line.startswith("summary\t")))
+    assert summary == {
+        "hot_intents": 2,
+        "enabled_faqs": 1,
+        "stale_faqs": 1,
+        "estimated_deepseek_requests_saved": 6,
+        "faq_refreshes": 3,
+        "current_invalid_faqs": 1,
+    }
 
 
 def test_report_faq_rejects_invalid_since_date(tmp_path, capsys):

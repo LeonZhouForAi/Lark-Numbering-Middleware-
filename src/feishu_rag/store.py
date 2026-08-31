@@ -1182,6 +1182,32 @@ class IndexStore:
         statement += " ORDER BY day, scope_key"
         return [dict(row) for row in self.connection.execute(statement, parameters).fetchall()]
 
+    def query_faq_summary(self, *, cutoff_day: str) -> dict[str, int]:
+        """Return anonymous FAQ operations totals for a date window."""
+        self._validate_faq_day(cutoff_day)
+        hot_intents = self.connection.execute(
+            "SELECT COUNT(DISTINCT intent_key) FROM faq_observation_daily WHERE day >= ?",
+            (cutoff_day,),
+        ).fetchone()[0]
+        counts = self.connection.execute(
+            "SELECT state, COUNT(*) FROM faq_entries GROUP BY state"
+        ).fetchall()
+        states = {str(row[0]): int(row[1]) for row in counts}
+        totals = self.connection.execute(
+            "SELECT COALESCE(SUM(direct_hits), 0), COALESCE(SUM(refreshes), 0) "
+            "FROM faq_metrics_daily WHERE day >= ?",
+            (cutoff_day,),
+        ).fetchone()
+        stale = states.get("stale", 0)
+        return {
+            "hot_intents": int(hot_intents),
+            "enabled_faqs": states.get("enabled", 0),
+            "stale_faqs": stale,
+            "estimated_deepseek_requests_saved": int(totals[0]),
+            "faq_refreshes": int(totals[1]),
+            "current_invalid_faqs": stale,
+        }
+
     def cleanup_faq(self, *, cutoff_day: str, stale_cutoff: float) -> dict[str, int]:
         self._validate_faq_day(cutoff_day)
         cutoff = self._validate_faq_now(stale_cutoff)
