@@ -847,12 +847,6 @@ class IndexStore:
                     safe_answer,
                 ),
             )
-            self.connection.execute(
-                "INSERT INTO faq_metrics_daily(scope_key,day,eligible_questions) "
-                "VALUES(?,?,1) ON CONFLICT(scope_key,day) DO UPDATE SET "
-                "eligible_questions = eligible_questions + 1",
-                (observation.scope_key, day),
-            )
             total = self.connection.execute(
                 "SELECT COALESCE(SUM(count), 0) FROM faq_observation_daily "
                 "WHERE scope_key = ? AND intent_key = ? AND source_signature = ? "
@@ -1085,39 +1079,41 @@ class IndexStore:
             self.connection.rollback()
             raise
 
-    def record_faq_metric(self, day: str, field: str) -> None:
+    def record_faq_metric(self, day: str, field: str, *, scope_key: str = "") -> None:
         self._validate_faq_day(day)
         if field not in _FAQ_METRIC_FIELDS:
             raise ValueError("unsupported FAQ metric field")
+        if not isinstance(scope_key, str):
+            raise ValueError("scope_key must be a string")
         statements = {
             "eligible_questions": (
-                "INSERT INTO faq_metrics_daily(scope_key,day,eligible_questions) VALUES('',?,1) "
+                "INSERT INTO faq_metrics_daily(scope_key,day,eligible_questions) VALUES(?,?,1) "
                 "ON CONFLICT(scope_key,day) DO UPDATE SET eligible_questions = eligible_questions + 1"
             ),
             "rag_answers": (
-                "INSERT INTO faq_metrics_daily(scope_key,day,rag_answers) VALUES('',?,1) "
+                "INSERT INTO faq_metrics_daily(scope_key,day,rag_answers) VALUES(?,?,1) "
                 "ON CONFLICT(scope_key,day) DO UPDATE SET rag_answers = rag_answers + 1"
             ),
             "direct_hits": (
-                "INSERT INTO faq_metrics_daily(scope_key,day,direct_hits) VALUES('',?,1) "
+                "INSERT INTO faq_metrics_daily(scope_key,day,direct_hits) VALUES(?,?,1) "
                 "ON CONFLICT(scope_key,day) DO UPDATE SET direct_hits = direct_hits + 1"
             ),
             "promotions": (
-                "INSERT INTO faq_metrics_daily(scope_key,day,promotions) VALUES('',?,1) "
+                "INSERT INTO faq_metrics_daily(scope_key,day,promotions) VALUES(?,?,1) "
                 "ON CONFLICT(scope_key,day) DO UPDATE SET promotions = promotions + 1"
             ),
             "refreshes": (
-                "INSERT INTO faq_metrics_daily(scope_key,day,refreshes) VALUES('',?,1) "
+                "INSERT INTO faq_metrics_daily(scope_key,day,refreshes) VALUES(?,?,1) "
                 "ON CONFLICT(scope_key,day) DO UPDATE SET refreshes = refreshes + 1"
             ),
             "rejected_answers": (
-                "INSERT INTO faq_metrics_daily(scope_key,day,rejected_answers) VALUES('',?,1) "
+                "INSERT INTO faq_metrics_daily(scope_key,day,rejected_answers) VALUES(?,?,1) "
                 "ON CONFLICT(scope_key,day) DO UPDATE SET rejected_answers = rejected_answers + 1"
             ),
         }
         self._begin_faq_transaction()
         try:
-            self.connection.execute(statements[field], (day,))
+            self.connection.execute(statements[field], (scope_key, day))
             self.connection.commit()
         except Exception:
             self.connection.rollback()

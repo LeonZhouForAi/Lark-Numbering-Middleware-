@@ -232,3 +232,21 @@ class FaqService:
             promotion_count=self.promotion_count,
             window_days=self.window_days,
         )
+
+    def _record_metric(self, observation: FaqObservation, field: str) -> None:
+        if (
+            not self.enabled
+            or not isinstance(observation, FaqObservation)
+            or not observation.scope_key
+        ):
+            return
+        now = datetime.now(timezone.utc)
+        self.store.record_faq_metric(
+            now.date().isoformat(), field, scope_key=observation.scope_key
+        )
+
+    def record_eligible(self, observation: FaqObservation) -> None:
+        self._record_metric(observation, "eligible_questions")
+
+    def record_rag_answer(self, observation: FaqObservation) -> None:
+        self._record_metric(observation, "rag_answers")

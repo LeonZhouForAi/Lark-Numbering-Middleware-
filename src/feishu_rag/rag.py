@@ -226,6 +226,10 @@ class RagService:
                     scope,
                     knowledge_revision=snapshot_revision,
                 )
+                try:
+                    self.faq_service.record_eligible(observation)
+                except Exception:
+                    pass
                 lookup_observation = getattr(
                     self.faq_service, "lookup_observation", None
                 )
@@ -254,6 +258,11 @@ class RagService:
             "只返回 JSON 对象，且只能包含 answer 字符串和 evidence_sufficient 布尔值。"
         )
         user_prompt = f"问题：{question}\n\n资料 JSON：{context}"
+        if faq_active and observation is not None:
+            try:
+                self.faq_service.record_rag_answer(observation)
+            except Exception:
+                pass
         generated, evidence_sufficient = self._validated_answer(
             self.llm.complete_json(system_prompt, user_prompt, purpose="answer")
         )

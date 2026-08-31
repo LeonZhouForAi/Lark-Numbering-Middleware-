@@ -893,6 +893,9 @@ class StoreTests(unittest.TestCase):
                     match = store.record_faq_observation(
                         observation, answer="答案", day=day, now=1.0, promotion_count=3
                     )
+                store.record_faq_metric(
+                    "2026-08-31", "eligible_questions", scope_key="global"
+                )
                 store.record_faq_direct_hit(match.entry_id, now=1788134400.0)
                 row = next(
                     row for row in store.query_faq_metrics(since_day="2026-08-31")
@@ -914,6 +917,9 @@ class StoreTests(unittest.TestCase):
                     match = store.record_faq_observation(
                         observation, answer="答案", day=day, now=1.0, promotion_count=3
                     )
+                store.record_faq_metric(
+                    "2026-08-31", "eligible_questions", scope_key=scope_key
+                )
                 store.record_faq_direct_hit(match.entry_id, now=1788134400.0)
                 row = next(
                     row for row in store.query_faq_metrics(since_day="2026-08-31")

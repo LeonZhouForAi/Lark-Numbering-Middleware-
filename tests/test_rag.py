@@ -142,6 +142,63 @@ def _result(content="报销需要提交发票。"):
 
 
 class RagTests(unittest.TestCase):
+    def test_faq_metrics_count_eligible_rag_and_direct_requests_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.upsert_document(
+                    "supplier", "供应商准入", "policy", "checksum",
+                    [Chunk("chunk-1", "supplier", "供应商准入", "供应商开发流程需提交准入材料。")],
+                )
+                llm = FakeLLM()
+                faq = FaqService(store, True, 3, 15, 0.82, 0.80)
+                rag = RagService(store, llm, faq_service=faq, min_relevance=0.1)
+
+                for _ in range(3):
+                    rag.answer("供应商开发流程是什么")
+                rag.answer("新供应商怎么导入")
+
+                rows = [
+                    row for row in store.query_faq_metrics()
+                    if row["scope_key"] == "global"
+                ]
+                self.assertEqual(sum(row["eligible_questions"] for row in rows), 4)
+                self.assertEqual(sum(row["rag_answers"] for row in rows), 3)
+                self.assertEqual(sum(row["direct_hits"] for row in rows), 1)
+                self.assertEqual(len(llm.calls), 3)
+            finally:
+                store.close()
+
+    def test_unsafe_llm_answer_counts_rag_request_without_faq_promotion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.upsert_document(
+                    "supplier", "供应商准入", "policy", "checksum",
+                    [Chunk("chunk-1", "supplier", "供应商准入", "供应商开发流程需提交准入材料。")],
+                )
+                faq = FaqService(store, True, 3, 15, 0.82, 0.80)
+                rag = RagService(
+                    store,
+                    FakeLLM({"answer": "访问 https://example.com", "evidence_sufficient": True}),
+                    faq_service=faq,
+                    min_relevance=0.1,
+                )
+
+                rag.answer("供应商开发流程是什么")
+
+                rows = [
+                    row for row in store.query_faq_metrics()
+                    if row["scope_key"] == "global"
+                ]
+                self.assertEqual(sum(row["eligible_questions"] for row in rows), 1)
+                self.assertEqual(sum(row["rag_answers"] for row in rows), 1)
+                self.assertEqual(store.connection.execute(
+                    "SELECT COUNT(*) FROM faq_entries"
+                ).fetchone()[0], 0)
+            finally:
+                store.close()
+
     def test_snapshot_failure_falls_back_to_plain_rag_without_faq_calls(self):
         store = SnapshotUnavailableStore([_result()])
         faq = FakeFaqService()
