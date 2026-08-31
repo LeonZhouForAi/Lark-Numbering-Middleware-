@@ -6,6 +6,7 @@ import re
 import sqlite3
 import time
 import unicodedata
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -144,7 +145,9 @@ class IndexStore:
                 """
                 CREATE TABLE IF NOT EXISTS processed_messages (
                     message_id TEXT PRIMARY KEY,
-                    processed_at REAL NOT NULL
+                    processed_at REAL NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'completed',
+                    claim_token TEXT NOT NULL DEFAULT ''
                 )
                 """,
                 """
@@ -199,6 +202,23 @@ class IndexStore:
             if "search_text" not in chunk_columns:
                 self.connection.execute(
                     "ALTER TABLE chunks ADD COLUMN search_text TEXT NOT NULL DEFAULT ''"
+                )
+
+            processed_message_columns = {
+                row[1]
+                for row in self.connection.execute(
+                    "PRAGMA table_info(processed_messages)"
+                ).fetchall()
+            }
+            if "state" not in processed_message_columns:
+                self.connection.execute(
+                    "ALTER TABLE processed_messages "
+                    "ADD COLUMN state TEXT NOT NULL DEFAULT 'completed'"
+                )
+            if "claim_token" not in processed_message_columns:
+                self.connection.execute(
+                    "ALTER TABLE processed_messages "
+                    "ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
                 )
 
             fts_savepoint = "initialize_fts"
@@ -624,19 +644,146 @@ class IndexStore:
             )
         return cursor.rowcount == 1
 
-    def claim_message(self, message_id: str, retention_seconds: int = 7 * 24 * 60 * 60) -> bool:
-        cutoff = time.time() - retention_seconds
-        with self.connection:
-            self.connection.execute("DELETE FROM processed_messages WHERE processed_at < ?", (cutoff,))
-            cursor = self.connection.execute(
-                "INSERT OR IGNORE INTO processed_messages(message_id, processed_at) VALUES(?, ?)",
-                (message_id, time.time()),
+    def claim_message_lease(
+        self,
+        message_id: str,
+        retention_seconds: int = 7 * 24 * 60 * 60,
+        in_progress_timeout_seconds: int = 10 * 60,
+        *,
+        now: float | None = None,
+    ) -> tuple[str, str | None]:
+        if (
+            isinstance(retention_seconds, bool)
+            or not isinstance(retention_seconds, (int, float))
+            or retention_seconds <= 0
+        ):
+            raise ValueError("retention_seconds must be positive")
+        if (
+            isinstance(in_progress_timeout_seconds, bool)
+            or not isinstance(in_progress_timeout_seconds, (int, float))
+            or in_progress_timeout_seconds <= 0
+            or in_progress_timeout_seconds >= retention_seconds
+        ):
+            raise ValueError(
+                "in_progress_timeout_seconds must be positive and less than retention_seconds"
             )
+        now = time.time() if now is None else now
+        _execute_with_lock_retry(self.connection, "BEGIN IMMEDIATE")
+        try:
+            self.connection.execute(
+                "DELETE FROM processed_messages WHERE processed_at < ?",
+                (now - retention_seconds,),
+            )
+            claim_token = uuid.uuid4().hex
+            cursor = self.connection.execute(
+                "INSERT OR IGNORE INTO processed_messages("
+                "message_id,processed_at,state,claim_token"
+                ") VALUES(?,?,'in_progress',?)",
+                (message_id, now, claim_token),
+            )
+            if cursor.rowcount == 1:
+                state = "claimed"
+            else:
+                claim_token = uuid.uuid4().hex
+                cursor = self.connection.execute(
+                    "UPDATE processed_messages "
+                    "SET processed_at = ?, claim_token = ? "
+                    "WHERE message_id = ? AND state = 'in_progress' "
+                    "AND processed_at <= ?",
+                    (
+                        now,
+                        claim_token,
+                        message_id,
+                        now - in_progress_timeout_seconds,
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    self.connection.commit()
+                    return "claimed", claim_token
+                row = self.connection.execute(
+                    "SELECT state,claim_token FROM processed_messages WHERE message_id = ?",
+                    (message_id,),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("message claim state disappeared")
+                state = str(row[0])
+                claim_token = str(row[1]) or None
+            self.connection.commit()
+            if state == "claimed":
+                return state, claim_token
+            if state == "in_progress":
+                return state, claim_token
+            if state == "completed":
+                return state, None
+            raise RuntimeError("invalid message claim state")
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def claim_message_state(
+        self,
+        message_id: str,
+        retention_seconds: int = 7 * 24 * 60 * 60,
+        in_progress_timeout_seconds: int = 10 * 60,
+        *,
+        now: float | None = None,
+    ) -> str:
+        state, _ = self.claim_message_lease(
+            message_id,
+            retention_seconds,
+            in_progress_timeout_seconds,
+            now=now,
+        )
+        return state
+
+    def claim_message(self, message_id: str, retention_seconds: int = 7 * 24 * 60 * 60) -> bool:
+        return self.claim_message_state(message_id, retention_seconds) == "claimed"
+
+    def is_message_claim_owner(self, message_id: str, token: str | None) -> bool:
+        if token is None:
+            return False
+        row = self.connection.execute(
+            "SELECT 1 FROM processed_messages "
+            "WHERE message_id = ? AND state = 'in_progress' AND claim_token = ?",
+            (message_id, token),
+        ).fetchone()
+        return row is not None
+
+    def complete_message(self, message_id: str, token: str | None = None) -> bool:
+        with self.connection:
+            if token is None:
+                # 仅为旧调用方保留；生产消息处理始终传入租约 token。
+                cursor = self.connection.execute(
+                    "UPDATE processed_messages "
+                    "SET state = 'completed', processed_at = ?, claim_token = '' "
+                    "WHERE message_id = ?",
+                    (time.time(), message_id),
+                )
+            else:
+                cursor = self.connection.execute(
+                    "UPDATE processed_messages "
+                    "SET state = 'completed', processed_at = ?, claim_token = '' "
+                    "WHERE message_id = ? AND state = 'in_progress' "
+                    "AND claim_token = ?",
+                    (time.time(), message_id, token),
+                )
         return cursor.rowcount == 1
 
-    def release_message(self, message_id: str) -> None:
+    def release_message(self, message_id: str, token: str | None = None) -> bool:
         with self.connection:
-            self.connection.execute("DELETE FROM processed_messages WHERE message_id = ?", (message_id,))
+            if token is None:
+                # 仅为旧调用方保留；生产消息处理始终传入租约 token。
+                cursor = self.connection.execute(
+                    "DELETE FROM processed_messages WHERE message_id = ?", (message_id,)
+                )
+            else:
+                cursor = self.connection.execute(
+                    "DELETE FROM processed_messages "
+                    "WHERE message_id = ? AND state = 'in_progress' "
+                    "AND claim_token = ?",
+                    (message_id, token),
+                )
+        return cursor.rowcount == 1
 
     def count_chunks(self, source_id: str | None = None) -> int:
         if source_id is None:

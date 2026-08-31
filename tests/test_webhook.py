@@ -1,10 +1,16 @@
 import hashlib
 import json
 import tempfile
+import threading
+import time
 import unittest
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
+from pathlib import Path
 
+from fastapi.testclient import TestClient
+
+from feishu_rag.config import Settings
 from feishu_rag.feishu_client import (
     FeishuAPIError,
     FeishuClient,
@@ -12,7 +18,7 @@ from feishu_rag.feishu_client import (
 )
 from feishu_rag.rag import RagAnswer
 from feishu_rag.store import IndexStore
-from feishu_rag.web import handle_event, verify_signature
+from feishu_rag.web import create_app, handle_event, verify_signature
 
 
 RATE_LIMIT_ANSWER = "请求过于频繁，请稍后再试。"
@@ -144,6 +150,225 @@ class WebhookTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_in_progress_message_is_returned_for_retry_without_answering(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                self.assertEqual(store.claim_message_state("om_busy"), "claimed")
+                rag = FakeRag(store)
+                feishu = FakeFeishu()
+
+                result = handle_event(
+                    self._payload("om_busy"), rag, feishu, verification_token="verify"
+                )
+
+                self.assertEqual(result, {"status": "in_progress"})
+                self.assertEqual(rag.questions, [])
+                self.assertEqual(feishu.replies, [])
+            finally:
+                store.close()
+
+    def test_failed_concurrent_processing_releases_claim_for_third_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            IndexStore(db_path).close()
+            retry_store = IndexStore(db_path)
+            started = threading.Event()
+            release = threading.Event()
+
+            class BlockingFailingRag(FakeRag):
+                def answer(self, question):
+                    self.questions.append(question)
+                    started.set()
+                    release.wait(timeout=2)
+                    raise RuntimeError("model unavailable")
+
+            retry_rag = FakeRag(retry_store)
+            feishu = FakeFeishu()
+            payload = self._payload("om_retry_after_failure")
+
+            def first_call():
+                first_store = IndexStore(db_path)
+                try:
+                    return handle_event(
+                        payload,
+                        BlockingFailingRag(first_store),
+                        feishu,
+                        "verify",
+                    )
+                finally:
+                    first_store.close()
+
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    first = executor.submit(first_call)
+                    self.assertTrue(started.wait(timeout=2))
+                    self.assertEqual(
+                        handle_event(payload, retry_rag, feishu, "verify"),
+                        {"status": "in_progress"},
+                    )
+                    release.set()
+                    with self.assertRaisesRegex(RuntimeError, "model unavailable"):
+                        first.result(timeout=2)
+
+                self.assertEqual(
+                    handle_event(payload, retry_rag, feishu, "verify"),
+                    {"status": "ok"},
+                )
+                self.assertEqual(retry_rag.questions, ["报销怎么走"])
+                self.assertEqual(
+                    feishu.replies,
+                    [("om_retry_after_failure", "请先提交申请。")],
+                )
+            finally:
+                release.set()
+                retry_store.close()
+
+    def test_stale_slow_worker_never_replies_or_changes_new_owner_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            first_store = IndexStore(db_path)
+            takeover_store = IndexStore(db_path)
+            feishu = FakeFeishu()
+            payload = self._payload("om_stale_worker")
+
+            class TakeoverDuringAnswerRag(FakeRag):
+                def answer(self, question):
+                    self.questions.append(question)
+                    first_store.connection.execute(
+                        "UPDATE processed_messages SET processed_at = ? "
+                        "WHERE message_id = ?",
+                        (time.time() - 601, "om_stale_worker"),
+                    )
+                    first_store.connection.commit()
+                    self.takeover = takeover_store.claim_message_lease(
+                        "om_stale_worker"
+                    )
+                    return RagAnswer("旧工作器的答案", [])
+
+            rag = TakeoverDuringAnswerRag(first_store)
+            try:
+                result = handle_event(payload, rag, feishu, verification_token="verify")
+
+                self.assertEqual(result, {"status": "superseded"})
+                self.assertEqual(feishu.replies, [])
+                self.assertEqual(rag.takeover[0], "claimed")
+                new_token = rag.takeover[1]
+                self.assertIsNotNone(new_token)
+                row = takeover_store.connection.execute(
+                    "SELECT state,claim_token FROM processed_messages WHERE message_id = ?",
+                    ("om_stale_worker",),
+                ).fetchone()
+                self.assertEqual(tuple(row), ("in_progress", new_token))
+                self.assertNotIn(new_token or "", json.dumps(result))
+            finally:
+                first_store.close()
+                takeover_store.close()
+
+    def test_rate_limit_reply_is_suppressed_after_lease_loss(self):
+        class LostOwnerStore:
+            token = "0123456789abcdef0123456789abcdef"
+
+            @classmethod
+            def claim_message_lease(cls, message_id):
+                return "claimed", cls.token
+
+            @staticmethod
+            def claim_rate_limit(actor_id, per_minute, per_day):
+                return False
+
+            @staticmethod
+            def is_message_claim_owner(message_id, token):
+                return False
+
+            @staticmethod
+            def complete_message(message_id, token=None):
+                raise AssertionError("superseded worker must not complete the new owner")
+
+            @staticmethod
+            def release_message(message_id, token=None):
+                raise AssertionError("superseded worker must not release the new owner")
+
+        store = LostOwnerStore()
+        rag = FakeRag(store, per_minute=1, per_day=1)
+        feishu = FakeFeishu()
+
+        result = handle_event(
+            self._payload("om_lost_rate_limit", {"open_id": "ou_limited"}),
+            rag,
+            feishu,
+            verification_token="verify",
+        )
+
+        self.assertEqual(result, {"status": "superseded"})
+        self.assertEqual(feishu.replies, [])
+        self.assertNotIn(store.token, json.dumps(result))
+
+    def test_incomplete_lease_store_is_rejected_before_claiming(self):
+        class IncompleteLeaseStore:
+            claims = 0
+
+            @classmethod
+            def claim_message_lease(cls, message_id):
+                cls.claims += 1
+                return "claimed", "0123456789abcdef0123456789abcdef"
+
+            @staticmethod
+            def is_message_claim_owner(message_id, token):
+                return True
+
+        store = IncompleteLeaseStore()
+        rag = FakeRag(store)
+
+        with self.assertRaisesRegex(RuntimeError, "lease"):
+            handle_event(
+                self._payload("om_incomplete_lease"),
+                rag,
+                FakeFeishu(),
+                verification_token="verify",
+            )
+
+        self.assertEqual(store.claims, 0)
+        self.assertEqual(rag.questions, [])
+
+    def test_webhook_returns_503_while_same_message_is_in_progress(self):
+        class BusyStore:
+            @staticmethod
+            def claim_message_state(message_id):
+                return "in_progress"
+
+        settings = Settings(
+            deepseek_api_key="key",
+            feishu_app_id="app",
+            feishu_app_secret="secret",
+            feishu_verification_token="verify",
+            feishu_encrypt_key="encrypt-key",
+        )
+        body = json.dumps(
+            self._payload("om_http_busy"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        timestamp = "1700000000"
+        nonce = "nonce"
+        signature = hashlib.sha256(
+            (timestamp + nonce + "encrypt-key" + body).encode("utf-8")
+        ).hexdigest()
+        client = TestClient(create_app(settings, FakeRag(BusyStore()), FakeFeishu()))
+
+        response = client.post(
+            "/webhook/feishu",
+            content=body.encode("utf-8"),
+            headers={
+                "x-lark-request-timestamp": timestamp,
+                "x-lark-request-nonce": nonce,
+                "x-lark-signature": signature,
+                "content-type": "application/json",
+            },
+        )
+
+        self.assertEqual(response.status_code, 503)
+
     def test_ambiguous_reply_failure_keeps_claim_and_prevents_duplicate_reply(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
@@ -165,6 +390,13 @@ class WebhookTests(unittest.TestCase):
 
                 with self.assertRaises(ConnectionError):
                     handle_event(payload, rag, feishu, verification_token="verify")
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT state FROM processed_messages WHERE message_id = ?",
+                        ("om_ambiguous",),
+                    ).fetchone()[0],
+                    "completed",
+                )
                 second = handle_event(
                     payload, rag, feishu, verification_token="verify"
                 )

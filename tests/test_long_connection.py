@@ -186,6 +186,103 @@ async def test_handler_exception_is_acked_as_redacted_500() -> None:
 
 
 @pytest.mark.asyncio
+async def test_in_progress_redelivery_is_acked_500() -> None:
+    class InProgressStore(ClosingStore):
+        @staticmethod
+        def claim_message_state(message_id: str) -> str:
+            return "in_progress"
+
+    stores: list[InProgressStore] = []
+
+    def resources():
+        store = InProgressStore()
+        stores.append(store)
+        rag = FakeRag()
+        rag.store = store
+        return store, rag
+
+    class EventHandler:
+        def _do_without_validation(self, payload: bytes) -> None:
+            long_connection._handle_marshaled_message(
+                payload.decode("utf-8"), resources, FakeFeishu()
+            )
+
+    sensitive = "不应出现在确认帧里的员工问题"
+    raw_event = _raw_event("om_in_progress")
+    raw_event["event"]["message"]["content"] = json.dumps(
+        {"text": sensitive}, ensure_ascii=False
+    )
+    client = _ack_client(EventHandler())
+    client._write_message = AsyncMock()
+    try:
+        await client._handle_data_frame(
+            _event_frame(json.dumps(raw_event, ensure_ascii=False).encode("utf-8"))
+        )
+    finally:
+        client.shutdown()
+
+    code, payload, _ = _ack_code(client._write_message.await_args.args[0])
+    assert code == 500
+    assert sensitive.encode("utf-8") not in payload
+    assert len(stores) == 1
+    assert stores[0].closed
+
+
+@pytest.mark.asyncio
+async def test_superseded_worker_is_acked_200_without_reply_or_token() -> None:
+    claim_token = "00112233445566778899aabbccddeeff"
+
+    class SupersededStore(ClosingStore):
+        @staticmethod
+        def claim_message_lease(message_id: str) -> tuple[str, str]:
+            return "claimed", claim_token
+
+        @staticmethod
+        def is_message_claim_owner(message_id: str, token: str) -> bool:
+            return False
+
+        @staticmethod
+        def complete_message(message_id: str, token: str | None = None) -> bool:
+            raise AssertionError("superseded worker must not complete a claim")
+
+        @staticmethod
+        def release_message(message_id: str, token: str | None = None) -> bool:
+            raise AssertionError("superseded worker must not release a claim")
+
+    stores: list[SupersededStore] = []
+    feishu = FakeFeishu()
+
+    def resources():
+        store = SupersededStore()
+        stores.append(store)
+        rag = FakeRag()
+        rag.store = store
+        return store, rag
+
+    class EventHandler:
+        def _do_without_validation(self, payload: bytes) -> None:
+            long_connection._handle_marshaled_message(
+                payload.decode("utf-8"), resources, feishu
+            )
+
+    client = _ack_client(EventHandler())
+    client._write_message = AsyncMock()
+    try:
+        await client._handle_data_frame(
+            _event_frame(json.dumps(_raw_event("om_superseded_ack")).encode("utf-8"))
+        )
+    finally:
+        client.shutdown()
+
+    code, payload, _ = _ack_code(client._write_message.await_args.args[0])
+    assert code == 200
+    assert feishu.reply is None
+    assert claim_token.encode() not in payload
+    assert len(stores) == 1
+    assert stores[0].closed
+
+
+@pytest.mark.asyncio
 async def test_capacity_full_is_acked_503_and_recovers_after_completion() -> None:
     started = threading.Event()
     release = threading.Event()
@@ -257,6 +354,38 @@ def test_safe_message_handler_returns_error_and_redacts_question(caplog) -> None
     assert "message_handler_failed" in caplog.text
     assert "RuntimeError" in caplog.text
     assert question not in caplog.text
+
+
+def test_superseded_result_and_logs_never_expose_claim_token(caplog) -> None:
+    claim_token = "fedcba9876543210fedcba9876543210"
+
+    class SupersededStore:
+        @staticmethod
+        def claim_message_lease(message_id: str) -> tuple[str, str]:
+            return "claimed", claim_token
+
+        @staticmethod
+        def is_message_claim_owner(message_id: str, token: str) -> bool:
+            return False
+
+        @staticmethod
+        def complete_message(message_id: str, token: str | None = None) -> bool:
+            raise AssertionError("superseded worker must not complete a claim")
+
+        @staticmethod
+        def release_message(message_id: str, token: str | None = None) -> bool:
+            raise AssertionError("superseded worker must not release a claim")
+
+    rag = FakeRag()
+    rag.store = SupersededStore()
+    event = _raw_event("om_superseded")["event"]
+
+    with caplog.at_level(logging.WARNING, logger="feishu_rag.long_connection"):
+        result = _safe_handle_message(event, rag, FakeFeishu())
+
+    assert result == {"status": "superseded"}
+    assert claim_token not in json.dumps(result)
+    assert claim_token not in caplog.text
 
 
 def test_concurrent_tasks_use_distinct_stores_and_close_each_one() -> None:

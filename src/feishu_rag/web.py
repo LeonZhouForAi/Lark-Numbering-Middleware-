@@ -84,13 +84,69 @@ def handle_event(
     if not isinstance(message_id, str) or not message_id:
         raise ValueError("飞书消息缺少 message_id")
     store = getattr(rag, "store", None)
+    claim_message_lease = getattr(store, "claim_message_lease", None)
+    claim_message_state = getattr(store, "claim_message_state", None)
     claim_message = getattr(store, "claim_message", None)
+    complete_message = getattr(store, "complete_message", None)
     release_message = getattr(store, "release_message", None)
+    is_message_claim_owner = getattr(store, "is_message_claim_owner", None)
     claimed = False
-    if callable(claim_message):
+    owner_token: str | None = None
+    token_fenced = False
+    if callable(claim_message_lease):
+        if not all(
+            callable(operation)
+            for operation in (
+                is_message_claim_owner,
+                complete_message,
+                release_message,
+            )
+        ):
+            raise RuntimeError("message lease requires ownership and finalization operations")
+        claim_state, owner_token = claim_message_lease(message_id)
+        if claim_state == "completed":
+            return {"status": "duplicate"}
+        if claim_state == "in_progress":
+            return {"status": "in_progress"}
+        if claim_state != "claimed" or owner_token is None:
+            raise RuntimeError("invalid message claim lease")
+        claimed = True
+        token_fenced = True
+    elif callable(claim_message_state):
+        claim_state = claim_message_state(message_id)
+        if claim_state == "completed":
+            return {"status": "duplicate"}
+        if claim_state == "in_progress":
+            return {"status": "in_progress"}
+        if claim_state != "claimed":
+            raise RuntimeError("invalid message claim state")
+        claimed = True
+    elif callable(claim_message):
         if not claim_message(message_id):
             return {"status": "duplicate"}
         claimed = True
+
+    def release_owned_claim() -> None:
+        if not claimed or not callable(release_message):
+            return
+        if token_fenced:
+            release_message(message_id, token=owner_token)
+        else:
+            release_message(message_id)
+
+    def complete_owned_claim() -> None:
+        if not claimed or not callable(complete_message):
+            return
+        if token_fenced:
+            complete_message(message_id, token=owner_token)
+        else:
+            complete_message(message_id)
+
+    def still_owns_claim() -> bool:
+        if not token_fenced:
+            return True
+        return bool(is_message_claim_owner(message_id, owner_token))
+
     per_minute = getattr(rag, "rate_limit_per_minute", 0)
     per_day = getattr(rag, "rate_limit_per_day", 0)
     status = "ok"
@@ -110,15 +166,21 @@ def handle_event(
         else:
             answer_text = rag.answer(question).text
     except Exception:
-        if claimed and callable(release_message):
-            release_message(message_id)
+        release_owned_claim()
         raise
+    # 飞书回复接口没有可用的外部幂等键，因此在外部调用前做最后一次
+    # 租约复核；不跨网络调用持有 SQLite 写锁，属于防并发重投的最佳努力。
+    if not still_owns_claim():
+        return {"status": "superseded"}
     try:
         feishu.reply_text(message_id, answer_text)
     except FeishuReplyNotSentError:
-        if claimed and callable(release_message):
-            release_message(message_id)
+        release_owned_claim()
         raise
+    except Exception:
+        complete_owned_claim()
+        raise
+    complete_owned_claim()
     return {"status": status}
 
 
@@ -181,7 +243,10 @@ def create_app(
             raise HTTPException(status_code=403, detail="签名校验失败")
         try:
             payload = json.loads(body.decode("utf-8"))
-            return handle_event(payload, rag, feishu, verification_token)  # type: ignore[arg-type]
+            result = handle_event(payload, rag, feishu, verification_token)  # type: ignore[arg-type]
+            if result.get("status") == "in_progress":
+                raise HTTPException(status_code=503, detail="消息仍在处理中")
+            return result
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except (ValueError, json.JSONDecodeError) as exc:

@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import tempfile
 import threading
@@ -987,6 +988,261 @@ class StoreTests(unittest.TestCase):
                 self.assertFalse(store.claim_message("om_duplicate"))
                 store.release_message("om_duplicate")
                 self.assertTrue(store.claim_message("om_duplicate"))
+            finally:
+                store.close()
+
+    def test_message_claim_state_tracks_in_progress_and_completed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                self.assertEqual(store.claim_message_state("om_state"), "claimed")
+                self.assertEqual(store.claim_message_state("om_state"), "in_progress")
+
+                store.complete_message("om_state")
+
+                self.assertEqual(store.claim_message_state("om_state"), "completed")
+                store.release_message("om_state")
+                self.assertEqual(store.claim_message_state("om_state"), "claimed")
+            finally:
+                store.close()
+
+    def test_initialization_migrates_legacy_processed_messages_as_completed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            connection = sqlite3.connect(db_path)
+            connection.executescript(
+                """
+                CREATE TABLE processed_messages (
+                    message_id TEXT PRIMARY KEY,
+                    processed_at REAL NOT NULL
+                );
+                INSERT INTO processed_messages VALUES('om_legacy', 1);
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            store = IndexStore(db_path)
+            try:
+                state_column = next(
+                    row
+                    for row in store.connection.execute(
+                        "PRAGMA table_info(processed_messages)"
+                    ).fetchall()
+                    if row[1] == "state"
+                )
+                self.assertEqual(state_column[2], "TEXT")
+                self.assertEqual(state_column[3], 1)
+                self.assertEqual(state_column[4], "'completed'")
+                token_column = next(
+                    row
+                    for row in store.connection.execute(
+                        "PRAGMA table_info(processed_messages)"
+                    ).fetchall()
+                    if row[1] == "claim_token"
+                )
+                self.assertEqual(token_column[2], "TEXT")
+                self.assertEqual(token_column[3], 1)
+                self.assertEqual(token_column[4], "''")
+                self.assertEqual(
+                    store.claim_message_state("om_legacy", retention_seconds=10**12),
+                    "completed",
+                )
+                self.assertEqual(
+                    store.claim_message_lease(
+                        "om_legacy", retention_seconds=10**12
+                    ),
+                    ("completed", None),
+                )
+            finally:
+                store.close()
+
+    def test_message_lease_rotates_token_and_fences_stale_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                state, first_token = store.claim_message_lease("om_fenced", now=100)
+                self.assertEqual(state, "claimed")
+                self.assertIsNotNone(first_token)
+                self.assertRegex(first_token or "", r"^[0-9a-f]{32}$")
+                self.assertEqual(
+                    store.claim_message_lease("om_fenced", now=101),
+                    ("in_progress", first_token),
+                )
+
+                state, second_token = store.claim_message_lease(
+                    "om_fenced",
+                    in_progress_timeout_seconds=600,
+                    now=701,
+                )
+                self.assertEqual(state, "claimed")
+                self.assertIsNotNone(second_token)
+                self.assertNotEqual(second_token, first_token)
+                self.assertTrue(store.is_message_claim_owner("om_fenced", second_token))
+                self.assertFalse(store.is_message_claim_owner("om_fenced", first_token))
+
+                self.assertFalse(store.complete_message("om_fenced", token=first_token))
+                self.assertFalse(store.release_message("om_fenced", token=first_token))
+                row = store.connection.execute(
+                    "SELECT state,claim_token FROM processed_messages WHERE message_id = ?",
+                    ("om_fenced",),
+                ).fetchone()
+                self.assertEqual(tuple(row), ("in_progress", second_token))
+
+                self.assertTrue(store.complete_message("om_fenced", token=second_token))
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT claim_token FROM processed_messages WHERE message_id = ?",
+                        ("om_fenced",),
+                    ).fetchone()[0],
+                    "",
+                )
+                self.assertEqual(
+                    store.claim_message_lease("om_fenced", now=702),
+                    ("completed", None),
+                )
+            finally:
+                store.close()
+
+    def test_two_connections_share_only_the_current_atomic_lease_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            IndexStore(db_path).close()
+            barrier = threading.Barrier(2)
+
+            def claim() -> tuple[str, str | None]:
+                store = IndexStore(db_path)
+                try:
+                    barrier.wait(timeout=2)
+                    return store.claim_message_lease("om_token_concurrent")
+                finally:
+                    store.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                leases = list(executor.map(lambda _: claim(), range(2)))
+
+            self.assertEqual(sorted(state for state, _ in leases), ["claimed", "in_progress"])
+            tokens = {token for _, token in leases}
+            self.assertEqual(len(tokens), 1)
+            token = tokens.pop()
+            self.assertIsNotNone(token)
+            self.assertTrue(re.fullmatch(r"[0-9a-f]{32}", token or ""))
+
+    def test_two_connections_atomically_claim_one_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            IndexStore(db_path).close()
+            barrier = threading.Barrier(2)
+
+            def claim() -> str:
+                store = IndexStore(db_path)
+                try:
+                    barrier.wait(timeout=2)
+                    return store.claim_message_state("om_concurrent")
+                finally:
+                    store.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                states = list(executor.map(lambda _: claim(), range(2)))
+
+            self.assertEqual(sorted(states), ["claimed", "in_progress"])
+
+    def test_expired_in_progress_message_can_be_reclaimed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                self.assertEqual(
+                    store.claim_message_state("om_expired", now=100), "claimed"
+                )
+                self.assertEqual(
+                    store.claim_message_state(
+                        "om_expired", in_progress_timeout_seconds=600, now=701
+                    ),
+                    "claimed",
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT state, processed_at FROM processed_messages "
+                        "WHERE message_id = ?",
+                        ("om_expired",),
+                    ).fetchone()[0:2],
+                    ("in_progress", 701),
+                )
+            finally:
+                store.close()
+
+    def test_non_expired_in_progress_message_is_not_reclaimed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                self.assertEqual(
+                    store.claim_message_state("om_active", now=100), "claimed"
+                )
+                self.assertEqual(
+                    store.claim_message_state(
+                        "om_active", in_progress_timeout_seconds=600, now=699
+                    ),
+                    "in_progress",
+                )
+            finally:
+                store.close()
+
+    def test_completed_message_is_not_reclaimed_after_lease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                self.assertEqual(
+                    store.claim_message_state("om_done", now=100), "claimed"
+                )
+                store.complete_message("om_done")
+                self.assertEqual(
+                    store.claim_message_state(
+                        "om_done", in_progress_timeout_seconds=1, now=1000
+                    ),
+                    "completed",
+                )
+            finally:
+                store.close()
+
+    def test_two_connections_expired_message_have_one_reclaimer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            seed = IndexStore(db_path)
+            try:
+                self.assertEqual(seed.claim_message_state("om_expired_concurrent", now=100), "claimed")
+            finally:
+                seed.close()
+            barrier = threading.Barrier(2)
+
+            def reclaim() -> str:
+                store = IndexStore(db_path)
+                try:
+                    barrier.wait(timeout=2)
+                    return store.claim_message_state(
+                        "om_expired_concurrent",
+                        in_progress_timeout_seconds=600,
+                        now=701,
+                    )
+                finally:
+                    store.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                states = list(executor.map(lambda _: reclaim(), range(2)))
+
+            self.assertEqual(sorted(states), ["claimed", "in_progress"])
+
+    def test_message_claim_state_rejects_invalid_retention_and_lease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                for retention, lease in ((0, 1), (1, 0), (1, 1), (True, 1), (10, False)):
+                    with self.subTest(retention=retention, lease=lease):
+                        with self.assertRaises(ValueError):
+                            store.claim_message_state(
+                                "om_invalid",
+                                retention_seconds=retention,
+                                in_progress_timeout_seconds=lease,
+                            )
             finally:
                 store.close()
 

@@ -178,7 +178,7 @@ def _handle_marshaled_message(
         event = raw.get("event", raw) if isinstance(raw, dict) else {}
         store, rag = resource_factory()
         result = _safe_handle_message(event, rag, feishu)
-        if result.get("status") == "error":
+        if result.get("status") in {"error", "in_progress"}:
             raise MessageProcessingError("message processing failed")
     except MessageProcessingError:
         raise
