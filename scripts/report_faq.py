@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date, datetime, timedelta
+import os
+from datetime import date, datetime
 from pathlib import Path
 from typing import Sequence
 
-from feishu_rag.store import IndexStore
+from feishu_rag.store import IndexStore, faq_window_cutoff
 
 
 def _date(value: str) -> str:
@@ -21,16 +22,28 @@ def _date(value: str) -> str:
     return value
 
 
+def _promotion_count(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("promotion count must be an integer from 1 to 100") from exc
+    if not 1 <= count <= 100:
+        raise argparse.ArgumentTypeError("promotion count must be an integer from 1 to 100")
+    return count
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="报告匿名 FAQ 聚合指标")
     parser.add_argument("db", type=Path)
     parser.add_argument("--since", type=_date)
+    default_promotion = os.environ.get("RAG_FAQ_PROMOTION_COUNT", "3")
+    parser.add_argument("--promotion-count", type=_promotion_count, default=_promotion_count(default_promotion))
     args = parser.parse_args(argv)
     store = IndexStore(args.db)
     try:
         rows = store.query_faq_metrics(since_day=args.since)
-        cutoff_day = (date.today() - timedelta(days=15)).isoformat()
-        summary = store.query_faq_summary(cutoff_day=cutoff_day)
+        cutoff_day = faq_window_cutoff(date.today())
+        summary = store.query_faq_summary(cutoff_day=cutoff_day, promotion_count=args.promotion_count)
     finally:
         store.close()
     print("day\tscope_key\teligible_questions\trag_answers\tdirect_hits\tdirect_hit_rate\tpromotions\trefreshes\trejected_answers")

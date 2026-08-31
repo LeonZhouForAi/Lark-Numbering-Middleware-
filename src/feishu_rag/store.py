@@ -49,6 +49,15 @@ _FAQ_METRIC_FIELDS = frozenset(
         "rejected_answers",
     }
 )
+
+
+def faq_window_cutoff(today: date, window_days: int = _FAQ_WINDOW_DAYS) -> str:
+    """Return inclusive natural-day cutoff (today plus the preceding days)."""
+    if type(window_days) is not int or not 1 <= window_days <= 365:
+        raise ValueError("window_days must be between 1 and 365")
+    return (today - timedelta(days=window_days - 1)).isoformat()
+
+
 _FAQ_ENTRIES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS faq_entries (
     id TEXT PRIMARY KEY,
@@ -1182,12 +1191,16 @@ class IndexStore:
         statement += " ORDER BY day, scope_key"
         return [dict(row) for row in self.connection.execute(statement, parameters).fetchall()]
 
-    def query_faq_summary(self, *, cutoff_day: str) -> dict[str, int]:
+    def query_faq_summary(self, *, cutoff_day: str, promotion_count: int = _FAQ_PROMOTION_COUNT) -> dict[str, int]:
         """Return anonymous FAQ operations totals for a date window."""
         self._validate_faq_day(cutoff_day)
+        if type(promotion_count) is not int or not 1 <= promotion_count <= 100:
+            raise ValueError("promotion_count must be between 1 and 100")
         hot_intents = self.connection.execute(
-            "SELECT COUNT(DISTINCT intent_key) FROM faq_observation_daily WHERE day >= ?",
-            (cutoff_day,),
+            "SELECT COUNT(*) FROM (SELECT scope_key, intent_key "
+            "FROM faq_observation_daily WHERE day >= ? "
+            "GROUP BY scope_key, intent_key HAVING SUM(count) >= ?)",
+            (cutoff_day, promotion_count),
         ).fetchone()[0]
         counts = self.connection.execute(
             "SELECT state, COUNT(*) FROM faq_entries GROUP BY state"

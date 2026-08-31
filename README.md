@@ -173,10 +173,13 @@ FAQ 运维指标仅输出按日期和匿名范围聚合的数量（不包含问�
 ```bash
 python scripts/report_faq.py data/rag.sqlite3
 python scripts/report_faq.py data/rag.sqlite3 --since 2026-08-01
+python scripts/report_faq.py data/rag.sqlite3 --promotion-count 3
 python scripts/cleanup_faq.py data/rag.sqlite3 --today 2026-08-31
 ```
 
 FAQ 在最近 15 天内同一意图/同义问法第 3 次安全回答后晋级，第 4 次起可直接回复；知识库资料更新后，首个安全回答会刷新旧条目。可将 `RAG_FAQ_ENABLED=false` 关闭 FAQ 功能，其余阈值由 `.env` 中的 `RAG_FAQ_PROMOTION_COUNT`、`RAG_FAQ_WINDOW_DAYS`、`RAG_FAQ_MIN_TEXT_SIMILARITY` 和 `RAG_FAQ_MIN_SOURCE_OVERLAP` 控制。
+
+报表摘要中的“估算节省 DeepSeek 请求数”按 FAQ 直接命中次数统计，并非账单数据；`--promotion-count` 缺省读取 `RAG_FAQ_PROMOTION_COUNT`（未设置时为 3）。
 
 该报表只汇总 DeepSeek 成功响应中返回的 `usage`，属于本地观测值而非服务商账单。网络中断、超时、429 或 5xx 等未返回可用 `usage` 的调用可能已经产生费用，但本地无法取得其 Token 数，因此不会进入报表；成本核对应以 DeepSeek 账单为准。
 

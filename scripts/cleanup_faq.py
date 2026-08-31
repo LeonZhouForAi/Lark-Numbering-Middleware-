@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import argparse
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Sequence
 
-from feishu_rag.store import IndexStore
+from feishu_rag.store import IndexStore, faq_window_cutoff
 
 _WINDOW_DAYS = 15
 
@@ -29,7 +29,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--today", type=_date, default=date.today().isoformat())
     args = parser.parse_args(argv)
     today = date.fromisoformat(args.today)
-    cutoff_day = (today - timedelta(days=_WINDOW_DAYS)).isoformat()
+    cutoff_day = faq_window_cutoff(today, _WINDOW_DAYS)
     store = IndexStore(args.db)
     try:
         deleted = store.cleanup_faq(
