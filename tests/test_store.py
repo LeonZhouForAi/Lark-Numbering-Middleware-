@@ -8,6 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
+from feishu_rag.faq import FaqService
 from feishu_rag.models import Chunk, FaqObservation, RetrievalScope
 from feishu_rag.store import IndexStore, PreparedDocument, _pretokenize, _tokens
 
@@ -880,6 +881,56 @@ class StoreTests(unittest.TestCase):
                 )
                 metrics = store.query_faq_metrics(since_day="2024-01-01")
                 self.assertEqual(sum(int(row["direct_hits"]) for row in metrics), 1)
+            finally:
+                store.close()
+
+    def test_record_faq_direct_hit_aggregates_global_scope_with_eligibility(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                observation = FaqObservation("intent", "global", "问题", "source-v1", 0)
+                for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
+                    match = store.record_faq_observation(
+                        observation, answer="答案", day=day, now=1.0, promotion_count=3
+                    )
+                store.record_faq_direct_hit(match.entry_id, now=1788134400.0)
+                row = next(
+                    row for row in store.query_faq_metrics(since_day="2026-08-31")
+                    if row["scope_key"] == "global"
+                )
+                self.assertEqual(row["eligible_questions"], 1)
+                self.assertEqual(row["direct_hits"], 1)
+            finally:
+                store.close()
+
+    def test_record_faq_direct_hit_aggregates_restricted_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                scope = RetrievalScope(frozenset({"space-a"}))
+                scope_key = FaqService._scope_key(scope)
+                observation = FaqObservation("intent", scope_key, "问题", "source-v1", 0)
+                for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
+                    match = store.record_faq_observation(
+                        observation, answer="答案", day=day, now=1.0, promotion_count=3
+                    )
+                store.record_faq_direct_hit(match.entry_id, now=1788134400.0)
+                row = next(
+                    row for row in store.query_faq_metrics(since_day="2026-08-31")
+                    if row["scope_key"] == scope_key
+                )
+                self.assertEqual(row["eligible_questions"], 1)
+                self.assertEqual(row["direct_hits"], 1)
+            finally:
+                store.close()
+
+    def test_record_faq_direct_hit_unknown_entry_does_not_create_metric(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                with self.assertRaises(ValueError):
+                    store.record_faq_direct_hit("missing", now=1788134400.0)
+                self.assertEqual(store.query_faq_metrics(), [])
             finally:
                 store.close()
 

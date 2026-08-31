@@ -1111,17 +1111,17 @@ class IndexStore:
         day = datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
         self._begin_faq_transaction()
         try:
-            cursor = self.connection.execute(
+            row = self.connection.execute(
                 "UPDATE faq_entries SET direct_hits = direct_hits + 1, last_hit_at = ? "
-                "WHERE id = ? AND state = 'enabled'",
+                "WHERE id = ? AND state = 'enabled' RETURNING scope_key",
                 (timestamp, entry_id),
-            )
-            if cursor.rowcount != 1:
+            ).fetchone()
+            if row is None:
                 raise ValueError("FAQ entry does not exist or is not enabled")
             self.connection.execute(
-                "INSERT INTO faq_metrics_daily(scope_key,day,direct_hits) VALUES('',?,1) "
+                "INSERT INTO faq_metrics_daily(scope_key,day,direct_hits) VALUES(?,?,1) "
                 "ON CONFLICT(scope_key,day) DO UPDATE SET direct_hits = direct_hits + 1",
-                (day,),
+                (row[0], day),
             )
             self.connection.commit()
         except Exception:

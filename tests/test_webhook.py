@@ -7,7 +7,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -79,6 +79,7 @@ class WebhookTests(unittest.TestCase):
             rag_faq_min_source_overlap=0.7,
         )
         with (
+            patch("feishu_rag.web.IndexStore", return_value=MagicMock()) as store_type,
             patch("feishu_rag.web.FaqService") as faq_type,
             patch("feishu_rag.web.RagService") as rag_type,
             patch("feishu_rag.web.DeepSeekClient"),
@@ -87,7 +88,7 @@ class WebhookTests(unittest.TestCase):
             create_app(settings)
 
         faq_type.assert_called_once_with(
-            rag_type.call_args.args[0], False, 7, 30, 0.9, 0.7
+            store_type.return_value, False, 7, 30, 0.9, 0.7
         )
         self.assertIs(rag_type.call_args.kwargs["faq_service"], faq_type.return_value)
 
