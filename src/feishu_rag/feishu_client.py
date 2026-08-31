@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -64,6 +65,7 @@ class FeishuClient:
         self.retry_policy = retry_policy or RetryPolicy()
         self._tenant_token = ""
         self._tenant_token_expires_at = 0.0
+        self._tenant_token_lock = threading.Lock()
 
     def __repr__(self) -> str:
         return f"FeishuClient(app_id={self.app_id!r}, base_url={self.base_url!r})"
@@ -139,21 +141,24 @@ class FeishuClient:
     def tenant_access_token(self) -> str:
         if self._tenant_token and time.time() < self._tenant_token_expires_at - 60:
             return self._tenant_token
-        data = self._raw_request(
-            "POST",
-            "/open-apis/auth/v3/tenant_access_token/internal",
-            {"app_id": self.app_id, "app_secret": self._app_secret},
-            retryable=True,
-        )
-        token = data.get("tenant_access_token")
-        if not isinstance(token, str) or not token:
-            raise FeishuAPIError("飞书没有返回 tenant_access_token")
-        expire = data.get("expire")
-        if type(expire) is not int or not 0 < expire <= 7 * 24 * 3600:
-            raise FeishuAPIError("飞书返回了无效的 token 有效期")
-        self._tenant_token = token
-        self._tenant_token_expires_at = time.time() + expire
-        return token
+        with self._tenant_token_lock:
+            if self._tenant_token and time.time() < self._tenant_token_expires_at - 60:
+                return self._tenant_token
+            data = self._raw_request(
+                "POST",
+                "/open-apis/auth/v3/tenant_access_token/internal",
+                {"app_id": self.app_id, "app_secret": self._app_secret},
+                retryable=True,
+            )
+            token = data.get("tenant_access_token")
+            if not isinstance(token, str) or not token:
+                raise FeishuAPIError("飞书没有返回 tenant_access_token")
+            expire = data.get("expire")
+            if type(expire) is not int or not 0 < expire <= 7 * 24 * 3600:
+                raise FeishuAPIError("飞书返回了无效的 token 有效期")
+            self._tenant_token = token
+            self._tenant_token_expires_at = time.time() + expire
+            return token
 
     def reply_text(self, message_id: str, text: str) -> None:
         try:

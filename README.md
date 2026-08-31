@@ -77,6 +77,8 @@ RAG_MIN_RELEVANCE=0.42
 RAG_QUESTION_MAX_CHARS=500
 RAG_RATE_LIMIT_PER_MINUTE=10
 RAG_RATE_LIMIT_PER_DAY=200
+RAG_WORKER_THREADS=4
+RAG_MAX_PENDING_MESSAGES=32
 API_RETRY_MAX_ATTEMPTS=3
 API_RETRY_BASE_DELAY=0.5
 ```
@@ -130,7 +132,7 @@ docker compose ps
 
 飞书 Webhook 必须通过 HTTPS 暴露。建议在服务前放置公司网关、Caddy 或 Nginx，只开放 443。容器内部使用 8000，Docker 默认映射为服务器的 8010 端口（可通过 `RAG_HOST_PORT` 修改）。
 
-长连接模式由 `rag-events` 服务运行：在飞书后台选择“使用长连接接收事件”，订阅 `im.message.receive_v1` 后，该服务会主动连接飞书，不需要公网域名或开放 443 端口，也无需将 8010 端口暴露到公网。
+长连接模式由 `rag-events` 服务运行：在飞书后台选择“使用长连接接收事件”，订阅 `im.message.receive_v1` 后，该服务会主动连接飞书，不需要公网域名或开放 443 端口，也无需将 8010 端口暴露到公网。事件处理通过有界工作线程执行，但只有在完整 RAG 处理结束后才向飞书返回成功 ACK；异常返回失败状态以便重投。并发线程数和最大在途消息数分别由 `RAG_WORKER_THREADS`、`RAG_MAX_PENDING_MESSAGES` 控制。
 
 ### 从飞书知识库同步
 

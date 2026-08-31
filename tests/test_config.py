@@ -168,6 +168,55 @@ class SettingsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, name):
                     Settings.from_env()
 
+    def test_rag_worker_threads_defaults_to_four_and_accepts_bounds(self):
+        with patch.dict(os.environ, self._base_env(), clear=True):
+            self.assertEqual(Settings.from_env().rag_worker_threads, 4)
+
+        for value in ("1", "32"):
+            env = self._base_env()
+            env["RAG_WORKER_THREADS"] = value
+            with self.subTest(value=value), patch.dict(os.environ, env, clear=True):
+                self.assertEqual(Settings.from_env().rag_worker_threads, int(value))
+
+    def test_rag_worker_threads_must_be_an_integer_from_one_to_32(self):
+        for value in ("0", "33", "-1", "1.5", "not-an-integer", ""):
+            env = self._base_env()
+            env["RAG_WORKER_THREADS"] = value
+            with self.subTest(value=value), patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(ConfigError, "RAG_WORKER_THREADS"):
+                    Settings.from_env()
+
+    def test_max_pending_messages_defaults_to_32_and_accepts_bounds(self):
+        with patch.dict(os.environ, self._base_env(), clear=True):
+            self.assertEqual(Settings.from_env().rag_max_pending_messages, 32)
+
+        for workers, pending in (("1", "1"), ("32", "1000")):
+            env = self._base_env()
+            env.update(RAG_WORKER_THREADS=workers, RAG_MAX_PENDING_MESSAGES=pending)
+            with self.subTest(workers=workers, pending=pending), patch.dict(
+                os.environ, env, clear=True
+            ):
+                self.assertEqual(
+                    Settings.from_env().rag_max_pending_messages, int(pending)
+                )
+
+    def test_max_pending_messages_must_cover_workers_and_be_one_to_1000(self):
+        for workers, pending in (
+            ("4", "0"),
+            ("4", "1001"),
+            ("4", "3"),
+            ("4", "1.5"),
+            ("4", "not-an-integer"),
+            ("4", ""),
+        ):
+            env = self._base_env()
+            env.update(RAG_WORKER_THREADS=workers, RAG_MAX_PENDING_MESSAGES=pending)
+            with self.subTest(workers=workers, pending=pending), patch.dict(
+                os.environ, env, clear=True
+            ):
+                with self.assertRaisesRegex(ConfigError, "RAG_MAX_PENDING_MESSAGES"):
+                    Settings.from_env()
+
 
 if __name__ == "__main__":
     unittest.main()

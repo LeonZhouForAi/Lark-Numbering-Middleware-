@@ -46,6 +46,8 @@ class Settings:
     rag_question_max_chars: int = 500
     rag_rate_limit_per_minute: int = 10
     rag_rate_limit_per_day: int = 200
+    rag_worker_threads: int = 4
+    rag_max_pending_messages: int = 32
     rag_max_chars: int = 900
     rag_enable_ocr: bool = True
     rag_semantic_chunking: bool = True
@@ -90,6 +92,22 @@ class Settings:
             raise ConfigError("API_RETRY_BASE_DELAY 必须是有限非负数")
         if question_max_chars < 1:
             raise ConfigError("RAG_QUESTION_MAX_CHARS 必须是正整数")
+        try:
+            worker_threads = int(env.get("RAG_WORKER_THREADS", "4"))
+        except ValueError as exc:
+            raise ConfigError("RAG_WORKER_THREADS 必须是 1 到 32 的整数") from exc
+        if not 1 <= worker_threads <= 32:
+            raise ConfigError("RAG_WORKER_THREADS 必须在 1 到 32 之间")
+        try:
+            max_pending_messages = int(env.get("RAG_MAX_PENDING_MESSAGES", "32"))
+        except ValueError as exc:
+            raise ConfigError(
+                "RAG_MAX_PENDING_MESSAGES 必须是 1 到 1000 的整数"
+            ) from exc
+        if not worker_threads <= max_pending_messages <= 1000:
+            raise ConfigError(
+                "RAG_MAX_PENDING_MESSAGES 必须在 RAG_WORKER_THREADS 到 1000 之间"
+            )
         rate_limits: dict[str, int] = {}
         for name, default in (
             ("RAG_RATE_LIMIT_PER_MINUTE", "10"),
@@ -130,6 +148,8 @@ class Settings:
             rag_question_max_chars=question_max_chars,
             rag_rate_limit_per_minute=rate_limits["RAG_RATE_LIMIT_PER_MINUTE"],
             rag_rate_limit_per_day=rate_limits["RAG_RATE_LIMIT_PER_DAY"],
+            rag_worker_threads=worker_threads,
+            rag_max_pending_messages=max_pending_messages,
             rag_max_chars=max_chars,
             rag_enable_ocr=_as_bool(env.get("RAG_ENABLE_OCR", "true"), "RAG_ENABLE_OCR"),
             rag_semantic_chunking=_as_bool(
@@ -155,6 +175,8 @@ class Settings:
             f"rag_question_max_chars={self.rag_question_max_chars!r}, "
             f"rag_rate_limit_per_minute={self.rag_rate_limit_per_minute!r}, "
             f"rag_rate_limit_per_day={self.rag_rate_limit_per_day!r}, "
+            f"rag_worker_threads={self.rag_worker_threads!r}, "
+            f"rag_max_pending_messages={self.rag_max_pending_messages!r}, "
             f"rag_max_chars={self.rag_max_chars!r}, "
             f"rag_semantic_chunking={self.rag_semantic_chunking!r}, "
             f"deepseek_chunk_model={self.deepseek_chunk_model!r}, "
