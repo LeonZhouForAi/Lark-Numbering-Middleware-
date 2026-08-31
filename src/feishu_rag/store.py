@@ -787,6 +787,14 @@ class IndexStore:
 
         self._begin_faq_transaction()
         try:
+            current_revision_row = self.connection.execute(
+                "SELECT revision FROM knowledge_state WHERE singleton_id = 1"
+            ).fetchone()
+            if current_revision_row is None:
+                raise RuntimeError("knowledge state is not initialized")
+            if observation.knowledge_revision != current_revision_row[0]:
+                self.connection.commit()
+                return None
             self.connection.execute(
                 "INSERT INTO faq_observation_daily("
                 "intent_key,scope_key,day,count,normalized_question,source_signature,"
@@ -958,6 +966,13 @@ class IndexStore:
         question = self._faq_question(observation)
         self._begin_faq_transaction()
         try:
+            current_revision_row = self.connection.execute(
+                "SELECT revision FROM knowledge_state WHERE singleton_id = 1"
+            ).fetchone()
+            if current_revision_row is None:
+                raise RuntimeError("knowledge state is not initialized")
+            if observation.knowledge_revision != current_revision_row[0]:
+                raise ValueError("observation knowledge revision does not match current revision")
             entry = self.connection.execute(
                 "SELECT * FROM faq_entries WHERE id = ?", (entry_id,)
             ).fetchone()

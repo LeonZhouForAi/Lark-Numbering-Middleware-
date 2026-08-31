@@ -100,6 +100,7 @@ class StoreTests(unittest.TestCase):
                 store.connection.execute(
                     "UPDATE faq_entries SET direct_hits = 7 WHERE id = ?", (entry_id,)
                 )
+                store.bump_knowledge_revision(now=1.5)
                 refreshed = store.record_faq_observation(
                     FaqObservation("intent", "global", "问题", "source-v2", 1),
                     answer="新答案",
@@ -115,6 +116,97 @@ class StoreTests(unittest.TestCase):
                     ).fetchone()),
                     ("新答案", "source-v2", 1, "enabled", 7),
                 )
+            finally:
+                store.close()
+
+    def test_record_observation_rejects_late_revision_without_any_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                old = FaqObservation("intent", "global", "问题", "source-v1", 0)
+                for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
+                    match = store.record_faq_observation(old, answer="旧答案", day=day, now=1.0)
+                entry_id = match.entry_id
+                store.connection.execute(
+                    "UPDATE faq_entries SET direct_hits = 7 WHERE id = ?", (entry_id,)
+                )
+                store.bump_knowledge_revision(now=2.0)
+                self.assertEqual(store.mark_faq_stale_before_revision(1), 1)
+                before_entry = tuple(store.connection.execute(
+                    "SELECT answer,state,knowledge_revision,direct_hits FROM faq_entries WHERE id = ?",
+                    (entry_id,),
+                ).fetchone())
+                before_counts = tuple(store.connection.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(count), 0) FROM faq_observation_daily"
+                ).fetchone())
+                before_metrics = tuple(store.connection.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(refreshes), 0) FROM faq_metrics_daily"
+                ).fetchone())
+                self.assertIsNone(
+                    store.record_faq_observation(
+                        old, answer="迟到答案", day="2026-09-01", now=3.0
+                    )
+                )
+                self.assertEqual(tuple(store.connection.execute(
+                    "SELECT answer,state,knowledge_revision,direct_hits FROM faq_entries WHERE id = ?",
+                    (entry_id,),
+                ).fetchone()), before_entry)
+                self.assertEqual(tuple(store.connection.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(count), 0) FROM faq_observation_daily"
+                ).fetchone()), before_counts)
+                self.assertEqual(tuple(store.connection.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(refreshes), 0) FROM faq_metrics_daily"
+                ).fetchone()), before_metrics)
+                refreshed = store.record_faq_observation(
+                    FaqObservation("intent", "global", "source-v2", "问题", 1),
+                    answer="新答案", day="2026-09-01", now=4.0,
+                )
+                self.assertIsNotNone(refreshed)
+                self.assertEqual(
+                    tuple(store.connection.execute(
+                        "SELECT answer,state,knowledge_revision,direct_hits FROM faq_entries WHERE id = ?",
+                        (entry_id,),
+                    ).fetchone()),
+                    ("新答案", "enabled", 1, 7),
+                )
+            finally:
+                store.close()
+
+    def test_manual_faq_refresh_rejects_late_revision_and_accepts_current_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                old = FaqObservation("intent", "global", "问题", "source-v1", 0)
+                for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
+                    match = store.record_faq_observation(old, answer="旧答案", day=day, now=1.0)
+                entry_id = match.entry_id
+                store.connection.execute(
+                    "UPDATE faq_entries SET direct_hits = 7 WHERE id = ?", (entry_id,)
+                )
+                store.bump_knowledge_revision(now=2.0)
+                self.assertEqual(store.mark_faq_stale_before_revision(1), 1)
+                with self.assertRaisesRegex(ValueError, "revision"):
+                    store.refresh_stale_faq(
+                        entry_id,
+                        old,
+                        answer="迟到答案",
+                        now=3.0,
+                    )
+                self.assertEqual(tuple(store.connection.execute(
+                    "SELECT answer,state,knowledge_revision,direct_hits FROM faq_entries WHERE id = ?",
+                    (entry_id,),
+                ).fetchone()), ("旧答案", "stale", 0, 7))
+                refreshed = store.refresh_stale_faq(
+                    entry_id,
+                    FaqObservation("intent", "global", "问题", "source-v2", 1),
+                    answer="新答案",
+                    now=4.0,
+                )
+                self.assertEqual(refreshed.answer, "新答案")
+                self.assertEqual(tuple(store.connection.execute(
+                    "SELECT answer,state,knowledge_revision,direct_hits FROM faq_entries WHERE id = ?",
+                    (entry_id,),
+                ).fetchone()), ("新答案", "enabled", 1, 7))
             finally:
                 store.close()
 
@@ -194,6 +286,7 @@ class StoreTests(unittest.TestCase):
                     )
                 entry_id = match.entry_id
                 store.connection.execute("UPDATE faq_entries SET direct_hits=4,state='stale' WHERE id=?", (entry_id,))
+                store.bump_knowledge_revision(now=2.0)
                 refreshed = store.refresh_stale_faq(
                     entry_id,
                     FaqObservation("intent", "global", "问题", "source-v2", 1),
