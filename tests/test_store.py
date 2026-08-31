@@ -127,6 +127,178 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_faq_legacy_alias_schema_is_rebuilt_and_cascades(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            seed = sqlite3.connect(db_path)
+            seed.executescript(
+                """
+                CREATE TABLE faq_entries (
+                    id TEXT PRIMARY KEY,
+                    intent_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    canonical_question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    source_signature TEXT NOT NULL,
+                    knowledge_revision INTEGER NOT NULL CHECK(knowledge_revision >= 0),
+                    state TEXT NOT NULL CHECK(state IN ('enabled', 'stale')),
+                    direct_hits INTEGER NOT NULL DEFAULT 0 CHECK(direct_hits >= 0),
+                    created_at REAL NOT NULL CHECK(created_at >= 0),
+                    updated_at REAL NOT NULL CHECK(updated_at >= 0),
+                    last_hit_at REAL CHECK(last_hit_at IS NULL OR last_hit_at >= 0),
+                    UNIQUE(scope_key, intent_key)
+                );
+                CREATE TABLE faq_aliases (
+                    faq_entry_id TEXT NOT NULL,
+                    normalized_question TEXT NOT NULL,
+                    alias_question TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                INSERT INTO faq_entries VALUES(
+                    'faq-legacy', 'intent', 'global', '问题', '答案', 'source',
+                    0, 'enabled', 0, 1.0, 1.0, NULL
+                );
+                INSERT INTO faq_aliases VALUES(
+                    'faq-legacy', '问题', '问题', 1.0
+                );
+                """
+            )
+            seed.commit()
+            seed.close()
+
+            store = IndexStore(db_path)
+            try:
+                columns = {
+                    row[1]
+                    for row in store.connection.execute("PRAGMA table_info(faq_aliases)").fetchall()
+                }
+                self.assertTrue(
+                    {
+                        "faq_id",
+                        "normalized_question",
+                        "search_text",
+                        "first_seen_at",
+                        "last_seen_at",
+                        "total_seen",
+                    }.issubset(columns)
+                )
+                self.assertEqual(len(store.find_faq_candidates("global", "问题")), 1)
+                foreign_key = next(
+                    row
+                    for row in store.connection.execute("PRAGMA foreign_key_list(faq_aliases)").fetchall()
+                    if row[3] == "faq_id"
+                )
+                self.assertEqual(tuple(foreign_key[2:6]), ("faq_entries", "faq_id", "id", "NO ACTION"))
+                self.assertEqual(foreign_key[6], "CASCADE")
+                store.connection.execute("DELETE FROM faq_entries WHERE id = 'faq-legacy'")
+                self.assertEqual(
+                    store.connection.execute("SELECT COUNT(*) FROM faq_aliases").fetchone()[0],
+                    0,
+                )
+            finally:
+                store.close()
+
+    def test_orphan_legacy_alias_aborts_alias_migration_and_rolls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            seed = sqlite3.connect(db_path)
+            seed.executescript(
+                """
+                CREATE TABLE faq_entries (
+                    id TEXT PRIMARY KEY,
+                    intent_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    canonical_question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    source_signature TEXT NOT NULL,
+                    knowledge_revision INTEGER NOT NULL CHECK(knowledge_revision >= 0),
+                    state TEXT NOT NULL CHECK(state IN ('enabled', 'stale')),
+                    direct_hits INTEGER NOT NULL DEFAULT 0 CHECK(direct_hits >= 0),
+                    created_at REAL NOT NULL CHECK(created_at >= 0),
+                    updated_at REAL NOT NULL CHECK(updated_at >= 0),
+                    last_hit_at REAL CHECK(last_hit_at IS NULL OR last_hit_at >= 0),
+                    UNIQUE(scope_key, intent_key)
+                );
+                CREATE TABLE faq_aliases (
+                    faq_entry_id TEXT NOT NULL,
+                    normalized_question TEXT NOT NULL,
+                    alias_question TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                INSERT INTO faq_entries VALUES(
+                    'faq-real', 'intent', 'global', '问题', '答案', 'source',
+                    0, 'enabled', 0, 1.0, 1.0, NULL
+                );
+                INSERT INTO faq_aliases VALUES(
+                    'missing', '问题', '问题', 1.0
+                );
+                """
+            )
+            seed.commit()
+            seed.close()
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                IndexStore(db_path)
+            check = sqlite3.connect(db_path)
+            try:
+                self.assertEqual(
+                    {row[1] for row in check.execute("PRAGMA table_info(faq_aliases)").fetchall()},
+                    {"faq_entry_id", "normalized_question", "alias_question", "created_at"},
+                )
+                self.assertEqual(
+                    tuple(check.execute("SELECT faq_entry_id, normalized_question FROM faq_aliases").fetchone()),
+                    ("missing", "问题"),
+                )
+            finally:
+                check.close()
+
+    def test_partial_scope_intent_unique_index_is_rebuilt_as_full_unique(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            seed = sqlite3.connect(db_path)
+            seed.executescript(
+                """
+                CREATE TABLE faq_entries (
+                    id TEXT PRIMARY KEY,
+                    intent_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    canonical_question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    source_signature TEXT NOT NULL,
+                    knowledge_revision INTEGER NOT NULL CHECK(knowledge_revision >= 0),
+                    state TEXT NOT NULL CHECK(state IN ('enabled', 'stale')),
+                    direct_hits INTEGER NOT NULL DEFAULT 0 CHECK(direct_hits >= 0),
+                    created_at REAL NOT NULL CHECK(created_at >= 0),
+                    updated_at REAL NOT NULL CHECK(updated_at >= 0),
+                    last_hit_at REAL CHECK(last_hit_at IS NULL OR last_hit_at >= 0)
+                );
+                CREATE UNIQUE INDEX faq_enabled_scope_intent
+                    ON faq_entries(scope_key, intent_key) WHERE state = 'enabled';
+                INSERT INTO faq_entries VALUES(
+                    'faq-one', 'intent', 'global', '问题', '答案', 'source',
+                    0, 'enabled', 0, 1.0, 1.0, NULL
+                );
+                """
+            )
+            seed.commit()
+            seed.close()
+
+            store = IndexStore(db_path)
+            try:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.connection.execute(
+                        "INSERT INTO faq_entries("
+                        "id,intent_key,scope_key,canonical_question,answer,source_signature,"
+                        "knowledge_revision,state,direct_hits,created_at,updated_at,last_hit_at"
+                        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            "faq-two", "intent", "global", "问题2", "答案2", "source2",
+                            0, "stale", 0, 1.0, 1.0, None,
+                        ),
+                    )
+            finally:
+                store.close()
+
     def test_faq_observation_promotes_on_third_recent_hit_and_returns_match(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")

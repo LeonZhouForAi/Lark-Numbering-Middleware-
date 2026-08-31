@@ -1132,6 +1132,7 @@ class IndexStore:
             all(check in table_sql for check in required_checks)
             and self._faq_scope_intent_unique_constraint_present()
         ):
+            self._migrate_faq_aliases_constraints()
             return
 
         columns = {
@@ -1274,7 +1275,7 @@ class IndexStore:
     def _faq_scope_intent_unique_constraint_present(self) -> bool:
         """Check the actual unique index columns, including legacy auto-indexes."""
         for index in self.connection.execute("PRAGMA index_list(faq_entries)").fetchall():
-            if not bool(index[2]):
+            if not bool(index[2]) or (len(index) > 4 and bool(index[4])):
                 continue
             index_name = str(index[1]).replace('"', '""')
             columns = [
@@ -1286,6 +1287,97 @@ class IndexStore:
             if columns == ["scope_key", "intent_key"]:
                 return True
         return False
+
+    def _migrate_faq_aliases_constraints(self) -> None:
+        """Validate and, when needed, rebuild the alias table in this transaction."""
+        table_row = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'faq_aliases'"
+        ).fetchone()
+        if table_row is None:
+            return
+
+        columns_info = self.connection.execute("PRAGMA table_info(faq_aliases)").fetchall()
+        columns = {row[1] for row in columns_info}
+        required_columns = {
+            "faq_id",
+            "normalized_question",
+            "search_text",
+            "first_seen_at",
+            "last_seen_at",
+            "total_seen",
+        }
+        has_current_columns = required_columns.issubset(columns)
+        primary_key_columns = [
+            row[1] for row in sorted(
+                (row for row in columns_info if row[5]), key=lambda row: row[5]
+            )
+        ]
+        unique_columns = primary_key_columns == ["faq_id", "normalized_question"]
+        if not unique_columns:
+            for index in self.connection.execute("PRAGMA index_list(faq_aliases)").fetchall():
+                if not bool(index[2]) or (len(index) > 4 and bool(index[4])):
+                    continue
+                index_name = str(index[1]).replace('"', '""')
+                index_columns = [
+                    row[2]
+                    for row in self.connection.execute(
+                        f'PRAGMA index_info("{index_name}")'
+                    ).fetchall()
+                ]
+                if index_columns == ["faq_id", "normalized_question"]:
+                    unique_columns = True
+                    break
+
+        has_cascade_fk = any(
+            row[2] == "faq_entries"
+            and row[3] == "faq_id"
+            and row[4] == "id"
+            and row[6] == "CASCADE"
+            for row in self.connection.execute("PRAGMA foreign_key_list(faq_aliases)").fetchall()
+        )
+        if has_current_columns and unique_columns and has_cascade_fk:
+            return
+
+        legacy_columns = {
+            "faq_entry_id",
+            "normalized_question",
+            "alias_question",
+            "created_at",
+        }
+        if not has_current_columns and not legacy_columns.issubset(columns):
+            raise RuntimeError(
+                "faq_aliases migration cannot preserve its existing columns"
+            )
+
+        def quoted(identifier: str) -> str:
+            return '"' + identifier.replace('"', '""') + '"'
+
+        legacy_name = f"faq_aliases_legacy_{uuid.uuid4().hex}"
+        self.connection.execute(
+            "DROP INDEX IF EXISTS idx_faq_aliases_normalized_question"
+        )
+        self.connection.execute(
+            f"ALTER TABLE faq_aliases RENAME TO {quoted(legacy_name)}"
+        )
+        self.connection.execute(_FAQ_ALIASES_SCHEMA)
+        if has_current_columns:
+            alias_select = (
+                "faq_id,normalized_question,search_text,first_seen_at,last_seen_at,total_seen"
+            )
+        else:
+            alias_select = (
+                "faq_entry_id,normalized_question,alias_question,created_at,created_at,1"
+            )
+        self.connection.execute(
+            "INSERT INTO faq_aliases("
+            "faq_id,normalized_question,search_text,first_seen_at,last_seen_at,total_seen"
+            f") SELECT {alias_select} FROM {quoted(legacy_name)}"
+        )
+        self.connection.execute(f"DROP TABLE {quoted(legacy_name)}")
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_faq_aliases_normalized_question "
+            "ON faq_aliases(normalized_question)"
+        )
 
     def claim_rate_limit(
         self,
