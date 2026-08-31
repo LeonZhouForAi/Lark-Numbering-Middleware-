@@ -68,6 +68,76 @@ class SettingsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, "RAG_MIN_RELEVANCE"):
                     Settings.from_env()
 
+    def test_faq_defaults(self):
+        with patch.dict(os.environ, self._base_env(), clear=True):
+            settings = Settings.from_env()
+        self.assertTrue(settings.rag_faq_enabled)
+        self.assertEqual(settings.rag_faq_promotion_count, 3)
+        self.assertEqual(settings.rag_faq_window_days, 15)
+        self.assertEqual(settings.rag_faq_min_text_similarity, 0.82)
+        self.assertEqual(settings.rag_faq_min_source_overlap, 0.80)
+
+    def test_faq_enabled_accepts_boolean_values(self):
+        for value, expected in (("true", True), ("false", False)):
+            env = self._base_env()
+            env["RAG_FAQ_ENABLED"] = value
+            with self.subTest(value=value), patch.dict(os.environ, env, clear=True):
+                self.assertEqual(Settings.from_env().rag_faq_enabled, expected)
+
+    def test_faq_rejects_invalid_environment_values(self):
+        cases = [
+            ("RAG_FAQ_ENABLED", "maybe"),
+            ("RAG_FAQ_PROMOTION_COUNT", "0"),
+            ("RAG_FAQ_PROMOTION_COUNT", "101"),
+            ("RAG_FAQ_PROMOTION_COUNT", "not-an-integer"),
+            ("RAG_FAQ_WINDOW_DAYS", "0"),
+            ("RAG_FAQ_WINDOW_DAYS", "366"),
+            ("RAG_FAQ_WINDOW_DAYS", "not-an-integer"),
+            ("RAG_FAQ_MIN_TEXT_SIMILARITY", "-0.01"),
+            ("RAG_FAQ_MIN_TEXT_SIMILARITY", "1.01"),
+            ("RAG_FAQ_MIN_TEXT_SIMILARITY", "nan"),
+            ("RAG_FAQ_MIN_TEXT_SIMILARITY", "inf"),
+            ("RAG_FAQ_MIN_TEXT_SIMILARITY", "not-a-number"),
+            ("RAG_FAQ_MIN_SOURCE_OVERLAP", "-0.01"),
+            ("RAG_FAQ_MIN_SOURCE_OVERLAP", "1.01"),
+            ("RAG_FAQ_MIN_SOURCE_OVERLAP", "nan"),
+            ("RAG_FAQ_MIN_SOURCE_OVERLAP", "inf"),
+            ("RAG_FAQ_MIN_SOURCE_OVERLAP", "not-a-number"),
+        ]
+        for name, value in cases:
+            env = self._base_env()
+            env[name] = value
+            with self.subTest(name=name, value=value), patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(ConfigError, name):
+                    Settings.from_env()
+
+    def test_faq_values_can_be_configured_and_repr_is_non_sensitive(self):
+        env = self._base_env()
+        env.update(
+            RAG_FAQ_ENABLED="off",
+            RAG_FAQ_PROMOTION_COUNT="7",
+            RAG_FAQ_WINDOW_DAYS="30",
+            RAG_FAQ_MIN_TEXT_SIMILARITY="0.9",
+            RAG_FAQ_MIN_SOURCE_OVERLAP="0.7",
+        )
+        with patch.dict(os.environ, env, clear=True):
+            settings = Settings.from_env()
+        self.assertFalse(settings.rag_faq_enabled)
+        self.assertEqual(settings.rag_faq_promotion_count, 7)
+        self.assertEqual(settings.rag_faq_window_days, 30)
+        self.assertEqual(settings.rag_faq_min_text_similarity, 0.9)
+        self.assertEqual(settings.rag_faq_min_source_overlap, 0.7)
+        rendered = repr(settings)
+        for name in (
+            "rag_faq_enabled",
+            "rag_faq_promotion_count",
+            "rag_faq_window_days",
+            "rag_faq_min_text_similarity",
+            "rag_faq_min_source_overlap",
+        ):
+            self.assertIn(name, rendered)
+        self.assertNotIn("deepseek-secret-value", rendered)
+
     def test_question_max_chars_defaults_to_500(self):
         with patch.dict(os.environ, self._base_env(), clear=True):
             self.assertEqual(Settings.from_env().rag_question_max_chars, 500)

@@ -57,6 +57,11 @@ class Settings:
     api_retry_max_attempts: int = 3
     api_retry_base_delay: float = 0.5
     log_level: str = "INFO"
+    rag_faq_enabled: bool = True
+    rag_faq_promotion_count: int = 3
+    rag_faq_window_days: int = 15
+    rag_faq_min_text_similarity: float = 0.82
+    rag_faq_min_source_overlap: float = 0.80
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "Settings":
@@ -130,6 +135,31 @@ class Settings:
             raise ConfigError("RAG_MIN_RELEVANCE 必须是 0 到 1 之间的数字") from exc
         if not math.isfinite(min_relevance) or not 0.0 <= min_relevance <= 1.0:
             raise ConfigError("RAG_MIN_RELEVANCE 必须在 0 到 1 之间")
+        faq_enabled = _as_bool(env.get("RAG_FAQ_ENABLED", "true"), "RAG_FAQ_ENABLED")
+        try:
+            faq_promotion_count = int(env.get("RAG_FAQ_PROMOTION_COUNT", "3"))
+        except ValueError as exc:
+            raise ConfigError("RAG_FAQ_PROMOTION_COUNT 必须是 1 到 100 的整数") from exc
+        if not 1 <= faq_promotion_count <= 100:
+            raise ConfigError("RAG_FAQ_PROMOTION_COUNT 必须在 1 到 100 之间")
+        try:
+            faq_window_days = int(env.get("RAG_FAQ_WINDOW_DAYS", "15"))
+        except ValueError as exc:
+            raise ConfigError("RAG_FAQ_WINDOW_DAYS 必须是 1 到 365 的整数") from exc
+        if not 1 <= faq_window_days <= 365:
+            raise ConfigError("RAG_FAQ_WINDOW_DAYS 必须在 1 到 365 之间")
+        faq_similarities: dict[str, float] = {}
+        for name, default in (
+            ("RAG_FAQ_MIN_TEXT_SIMILARITY", "0.82"),
+            ("RAG_FAQ_MIN_SOURCE_OVERLAP", "0.80"),
+        ):
+            try:
+                value = float(env.get(name, default))
+            except ValueError as exc:
+                raise ConfigError(f"{name} 必须是 0 到 1 之间的有限数字") from exc
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ConfigError(f"{name} 必须在 0 到 1 之间且为有限数字")
+            faq_similarities[name] = value
         strategy_version = env.get("RAG_CHUNK_STRATEGY_VERSION", "hybrid-v4").strip()
         if not strategy_version:
             raise ConfigError("RAG_CHUNK_STRATEGY_VERSION 不能为空")
@@ -161,6 +191,11 @@ class Settings:
             api_retry_max_attempts=retry_max_attempts,
             api_retry_base_delay=retry_base_delay,
             log_level=env.get("LOG_LEVEL", "INFO").upper(),
+            rag_faq_enabled=faq_enabled,
+            rag_faq_promotion_count=faq_promotion_count,
+            rag_faq_window_days=faq_window_days,
+            rag_faq_min_text_similarity=faq_similarities["RAG_FAQ_MIN_TEXT_SIMILARITY"],
+            rag_faq_min_source_overlap=faq_similarities["RAG_FAQ_MIN_SOURCE_OVERLAP"],
         )
 
     def __repr__(self) -> str:
@@ -183,5 +218,10 @@ class Settings:
             f"rag_chunk_strategy_version={self.rag_chunk_strategy_version!r}, "
             f"api_retry_max_attempts={self.api_retry_max_attempts!r}, "
             f"api_retry_base_delay={self.api_retry_base_delay!r}, "
+            f"rag_faq_enabled={self.rag_faq_enabled!r}, "
+            f"rag_faq_promotion_count={self.rag_faq_promotion_count!r}, "
+            f"rag_faq_window_days={self.rag_faq_window_days!r}, "
+            f"rag_faq_min_text_similarity={self.rag_faq_min_text_similarity!r}, "
+            f"rag_faq_min_source_overlap={self.rag_faq_min_source_overlap!r}, "
             f"log_level={self.log_level!r})"
         )

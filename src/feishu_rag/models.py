@@ -37,3 +37,22 @@ class Chunk:
 class SearchResult:
     chunk: Chunk
     score: float
+
+
+@dataclass(frozen=True)
+class FaqMatch:
+    """命中的高频问答条目。"""
+
+    entry_id: str
+    answer: str
+    intent_key: str
+
+
+@dataclass(frozen=True)
+class FaqObservation:
+    """用于统计高频问答的观测记录。"""
+
+    intent_key: str
+    scope_key: str
+    source_signature: str
+    knowledge_revision: int
