@@ -769,14 +769,21 @@ class IndexStore:
         answer: str,
         day: str,
         now: float,
+        promotion_count: int,
         window_days: int = _FAQ_WINDOW_DAYS,
     ) -> FaqMatch | None:
-        """Atomically record an observation and promote its FAQ on hit three."""
+        """Atomically record an observation and promote at the configured threshold."""
         self._validate_faq_observation(observation)
         safe_answer = self._faq_answer(answer)
         current_day = self._validate_faq_day(day)
         timestamp = self._validate_faq_now(now)
         question = self._faq_question(observation)
+        if (
+            isinstance(promotion_count, bool)
+            or not isinstance(promotion_count, int)
+            or not 1 <= promotion_count <= 100
+        ):
+            raise ValueError("promotion_count must be an integer from 1 to 100")
         if (
             isinstance(window_days, bool)
             or not isinstance(window_days, int)
@@ -887,7 +894,7 @@ class IndexStore:
                 self.connection.commit()
                 return None
 
-            if total < _FAQ_PROMOTION_COUNT:
+            if total < promotion_count:
                 self.connection.commit()
                 return None
 
@@ -1121,7 +1128,10 @@ class IndexStore:
             "check(updated_at>=0)",
             "check(last_hit_atisnullorlast_hit_at>=0)",
         )
-        if all(check in table_sql for check in required_checks):
+        if (
+            all(check in table_sql for check in required_checks)
+            and self._faq_scope_intent_unique_constraint_present()
+        ):
             return
 
         columns = {
@@ -1260,6 +1270,22 @@ class IndexStore:
             "CREATE INDEX IF NOT EXISTS idx_faq_aliases_normalized_question "
             "ON faq_aliases(normalized_question)"
         )
+
+    def _faq_scope_intent_unique_constraint_present(self) -> bool:
+        """Check the actual unique index columns, including legacy auto-indexes."""
+        for index in self.connection.execute("PRAGMA index_list(faq_entries)").fetchall():
+            if not bool(index[2]):
+                continue
+            index_name = str(index[1]).replace('"', '""')
+            columns = [
+                row[2]
+                for row in self.connection.execute(
+                    f'PRAGMA index_info("{index_name}")'
+                ).fetchall()
+            ]
+            if columns == ["scope_key", "intent_key"]:
+                return True
+        return False
 
     def claim_rate_limit(
         self,
