@@ -1161,29 +1161,6 @@ class IndexStore:
             "knowledge_revision",
             "day",
         ]
-        if not has_complete_unique_key:
-            for index in self.connection.execute(
-                "PRAGMA index_list(faq_observation_daily)"
-            ).fetchall():
-                if not bool(index[2]) or (len(index) > 4 and bool(index[4])):
-                    continue
-                index_name = str(index[1]).replace('"', '""')
-                index_columns = [
-                    row[2]
-                    for row in self.connection.execute(
-                        f'PRAGMA index_info("{index_name}")'
-                    ).fetchall()
-                ]
-                if index_columns == [
-                    "scope_key",
-                    "intent_key",
-                    "normalized_question",
-                    "source_signature",
-                    "knowledge_revision",
-                    "day",
-                ]:
-                    has_complete_unique_key = True
-                    break
         if has_complete_unique_key:
             return
 

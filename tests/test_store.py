@@ -196,6 +196,80 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_mixed_observation_schema_rebuilds_old_primary_key_despite_new_unique_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            seed = sqlite3.connect(db_path)
+            seed.executescript(
+                """
+                CREATE TABLE faq_observation_daily (
+                    intent_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    day TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    normalized_question TEXT NOT NULL,
+                    source_signature TEXT NOT NULL,
+                    knowledge_revision INTEGER NOT NULL,
+                    latest_safe_answer TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(scope_key, intent_key, source_signature, knowledge_revision, day)
+                );
+                CREATE UNIQUE INDEX mixed_new_observation_key
+                    ON faq_observation_daily(
+                        scope_key, intent_key, normalized_question,
+                        source_signature, knowledge_revision, day
+                    );
+                INSERT INTO faq_observation_daily VALUES(
+                    'intent', 'global', '2026-08-31', 2, '问题一', 'source-v1', 0, '答案'
+                );
+                """
+            )
+            seed.commit()
+            seed.close()
+            store = IndexStore(db_path)
+            try:
+                primary_key = [
+                    row[1]
+                    for row in sorted(
+                        (
+                            row
+                            for row in store.connection.execute(
+                                "PRAGMA table_info(faq_observation_daily)"
+                            ).fetchall()
+                            if row[5]
+                        ),
+                        key=lambda row: row[5],
+                    )
+                ]
+                self.assertEqual(
+                    primary_key,
+                    [
+                        "scope_key",
+                        "intent_key",
+                        "normalized_question",
+                        "source_signature",
+                        "knowledge_revision",
+                        "day",
+                    ],
+                )
+                self.assertIsNone(
+                    store.record_faq_observation(
+                        FaqObservation("intent", "global", "问题二", "source-v1", 0),
+                        answer="答案",
+                        day="2026-08-31",
+                        now=2.0,
+                        promotion_count=100,
+                    )
+                )
+                self.assertEqual(
+                    [tuple(row) for row in store.connection.execute(
+                        "SELECT normalized_question,count FROM faq_observation_daily "
+                        "ORDER BY normalized_question"
+                    ).fetchall()],
+                    [("问题一", 2), ("问题二", 1)],
+                )
+            finally:
+                store.close()
+
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
             try:
