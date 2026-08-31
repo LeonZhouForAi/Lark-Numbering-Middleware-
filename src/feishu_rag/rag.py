@@ -194,6 +194,9 @@ class RagService:
             return RagAnswer("请输入要查询的问题。", [])
         if len(question) > self.question_max_chars:
             return RagAnswer(f"问题过长，请精简到 {self.question_max_chars} 字以内。", [])
+        snapshot_revision = None
+        if self.faq_service is not None:
+            snapshot_revision = self.store.knowledge_revision()
         results = self.store.search(
             question,
             top_k=self.top_k,
@@ -205,7 +208,12 @@ class RagService:
 
         if self.faq_service is not None:
             try:
-                observation = self.faq_service.describe(question, results, scope)
+                observation = self.faq_service.describe(
+                    question,
+                    results,
+                    scope,
+                    knowledge_revision=snapshot_revision,
+                )
                 lookup_observation = getattr(
                     self.faq_service, "lookup_observation", None
                 )

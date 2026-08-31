@@ -68,6 +68,19 @@ class FaqModelsTests(unittest.TestCase):
 
 
 class FaqServiceTests(unittest.TestCase):
+    def test_describe_uses_explicit_knowledge_revision_without_reading_store(self):
+        class NoRevisionReadStore(_FakeStore):
+            def knowledge_revision(self):
+                raise AssertionError("describe must use the explicit revision")
+
+        service = self._service(NoRevisionReadStore())
+
+        observation = service.describe(
+            "供应商开发", _results("supplier"), None, knowledge_revision=7
+        )
+
+        self.assertEqual(observation.knowledge_revision, 7)
+
     def _service(self, store=None, **kwargs):
         return FaqService(
             store or _FakeStore(),

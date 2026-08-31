@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from feishu_rag.llm import DeepSeekClient
+from feishu_rag.faq import FaqService
 from feishu_rag.models import Chunk, FaqMatch, FaqObservation, RetrievalScope, SearchResult
 from feishu_rag.rag import RagResponseError, RagService
 from feishu_rag.store import IndexStore
@@ -44,6 +45,9 @@ class RecordingStore:
         )
         return self.results
 
+    def knowledge_revision(self):
+        return 1
+
 
 class StaleDirectHitStore(RecordingStore):
     def __init__(self, results=None):
@@ -66,13 +70,13 @@ class FakeFaqService:
         self.lookup_calls.append((question, results, scope))
         return self.match
 
-    def describe(self, question, results, scope):
+    def describe(self, question, results, scope, *, knowledge_revision=None):
         observation = FaqObservation(
             intent_key="intent",
             scope_key="global",
             normalized_question=question,
             source_signature="source",
-            knowledge_revision=1,
+            knowledge_revision=1 if knowledge_revision is None else knowledge_revision,
             source_ids=("source",),
         )
         self.describe_calls.append((question, results, scope))
@@ -96,13 +100,26 @@ class FixedObservationFaqService(FakeFaqService):
         )
         self.observation_lookups = []
 
-    def describe(self, question, results, scope):
+    def describe(self, question, results, scope, *, knowledge_revision=None):
         self.describe_calls.append((question, results, scope))
         return self.observation
 
     def lookup_observation(self, observation):
         self.observation_lookups.append(observation)
         return None
+
+
+class SearchBumpsRevisionStore:
+    def __init__(self, store):
+        self.store = store
+
+    def search(self, *args, **kwargs):
+        results = self.store.search(*args, **kwargs)
+        self.store.bump_knowledge_revision(now=2.0)
+        return results
+
+    def __getattr__(self, name):
+        return getattr(self.store, name)
 
 
 def _result(content="报销需要提交发票。"):
@@ -120,6 +137,35 @@ def _result(content="报销需要提交发票。"):
 
 
 class RagTests(unittest.TestCase):
+    def test_revision_snapshot_before_search_fences_faq_observation_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from feishu_rag.store import IndexStore
+
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.upsert_document(
+                    "supplier", "供应商准入", "policy", "checksum",
+                    [Chunk("chunk-1", "supplier", "供应商准入", "供应商开发流程需提交准入材料。")],
+                )
+                faq = FaqService(store, True, 3, 15, 0.82, 0.80)
+                rag = RagService(
+                    SearchBumpsRevisionStore(store), FakeLLM(),
+                    faq_service=faq, min_relevance=0.1,
+                )
+
+                answer = rag.answer("供应商开发流程是什么")
+
+                self.assertEqual(answer.text, "根据制度,员工需要先提交申请。")
+                self.assertEqual(store.knowledge_revision(), 1)
+                self.assertEqual(store.connection.execute(
+                    "SELECT COUNT(*) FROM faq_observation_daily"
+                ).fetchone()[0], 0)
+                self.assertEqual(store.connection.execute(
+                    "SELECT COUNT(*) FROM faq_entries"
+                ).fetchone()[0], 0)
+            finally:
+                store.close()
+
     def test_stale_direct_hit_falls_back_to_llm(self):
         store = StaleDirectHitStore([_result()])
         faq = FakeFaqService(FaqMatch("faq-1", "旧缓存答案", "intent", 1))

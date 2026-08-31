@@ -126,6 +126,8 @@ class FaqService:
         question: str,
         results: list[SearchResult],
         scope: RetrievalScope | None,
+        *,
+        knowledge_revision: int | None = None,
     ) -> FaqObservation:
         normalized_question, intent_key = self._question_features(question)
         source_ids = self._source_ids(results)
@@ -136,7 +138,11 @@ class FaqService:
             scope_key=scope_key,
             normalized_question=normalized_question,
             source_signature=source_signature,
-            knowledge_revision=int(self.store.knowledge_revision()),
+            knowledge_revision=(
+                int(self.store.knowledge_revision())
+                if knowledge_revision is None
+                else knowledge_revision
+            ),
             source_ids=source_ids,
         )
 
