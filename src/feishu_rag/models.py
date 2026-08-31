@@ -54,5 +54,6 @@ class FaqObservation:
 
     intent_key: str
     scope_key: str
+    normalized_question: str
     source_signature: str
     knowledge_revision: int

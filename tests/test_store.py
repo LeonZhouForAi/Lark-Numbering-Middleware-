@@ -17,22 +17,19 @@ class StoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
             try:
-                observation = FaqObservation("supplier-intake", "global", "source-v1", 0)
+                observation = FaqObservation("supplier-intake", "global", "供应商开发流程", "source-v1", 0)
                 self.assertIsNone(
                     store.record_faq_observation(
                         observation, answer="安全答案", day="2026-08-17", now=1.0,
-                        normalized_question="供应商开发流程",
                     )
                 )
                 self.assertIsNone(
                     store.record_faq_observation(
                         observation, answer="安全答案", day="2026-08-18", now=2.0,
-                        normalized_question="供应商开发流程",
                     )
                 )
                 match = store.record_faq_observation(
                     observation, answer="安全答案", day="2026-08-31", now=3.0,
-                    normalized_question="供应商开发流程",
                 )
                 self.assertIsNotNone(match)
                 self.assertEqual(match.answer, "安全答案")
@@ -47,12 +44,104 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_faq_observation_promotes_after_three_observations_on_one_day(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                observation = FaqObservation("intent", "global", "真实问题", "source-v1", 0)
+                matches = [
+                    store.record_faq_observation(
+                        observation, answer="答案", day="2026-08-31", now=float(index),
+                    )
+                    for index in (1, 2, 3)
+                ]
+                self.assertEqual(sum(match is not None for match in matches), 1)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT count FROM faq_observation_daily"
+                    ).fetchone()[0],
+                    3,
+                )
+            finally:
+                store.close()
+
+    def test_faq_observation_uses_real_question_for_alias_and_canonical_question(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                observation = FaqObservation(
+                    "intent-hash", "global", "供应商开发流程是什么", "source-v1", 0
+                )
+                for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
+                    match = store.record_faq_observation(observation, answer="答案", day=day, now=1.0)
+                self.assertIsNotNone(match)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT canonical_question FROM faq_entries"
+                    ).fetchone()[0],
+                    "供应商开发流程是什么",
+                )
+                self.assertEqual(
+                    len(store.find_faq_candidates("global", "供应商开发流程是什么")),
+                    1,
+                )
+                self.assertEqual(store.find_faq_candidates("global", "intent-hash"), [])
+            finally:
+                store.close()
+
+    def test_record_observation_refreshes_existing_entry_after_revision_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                old = FaqObservation("intent", "global", "问题", "source-v1", 0)
+                for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
+                    match = store.record_faq_observation(old, answer="旧答案", day=day, now=1.0)
+                entry_id = match.entry_id
+                store.connection.execute(
+                    "UPDATE faq_entries SET direct_hits = 7 WHERE id = ?", (entry_id,)
+                )
+                refreshed = store.record_faq_observation(
+                    FaqObservation("intent", "global", "问题", "source-v2", 1),
+                    answer="新答案",
+                    day="2026-09-01",
+                    now=2.0,
+                )
+                self.assertIsNotNone(refreshed)
+                self.assertEqual(refreshed.answer, "新答案")
+                self.assertEqual(
+                    tuple(store.connection.execute(
+                        "SELECT answer,source_signature,knowledge_revision,state,direct_hits "
+                        "FROM faq_entries WHERE id = ?", (entry_id,)
+                    ).fetchone()),
+                    ("新答案", "source-v2", 1, "enabled", 7),
+                )
+            finally:
+                store.close()
+
+    def test_faq_dates_require_iso_calendar_date_format(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                observation = FaqObservation("intent", "global", "问题", "source-v1", 0)
+                for invalid_day in ("20260831", "2026-W35-7"):
+                    with self.subTest(invalid_day=invalid_day):
+                        with self.assertRaises(ValueError):
+                            store.record_faq_observation(
+                                observation, answer="答案", day=invalid_day, now=1.0
+                            )
+                with self.assertRaises(ValueError):
+                    store.cleanup_faq(cutoff_day="20260831", stale_cutoff=0.0)
+                with self.assertRaises(ValueError):
+                    store.query_faq_metrics(since_day="2026-W35-7")
+            finally:
+                store.close()
+
     def test_faq_observation_does_not_mix_sources_or_expired_days(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
             try:
-                first = FaqObservation("intent", "global", "source-v1", 0)
-                second = FaqObservation("intent", "global", "source-v2", 0)
+                first = FaqObservation("intent", "global", "问题", "source-v1", 0)
+                second = FaqObservation("intent", "global", "问题", "source-v2", 0)
                 store.record_faq_observation(first, answer="a", day="2026-08-01", now=1.0)
                 store.record_faq_observation(first, answer="a", day="2026-08-17", now=2.0)
                 self.assertIsNone(
@@ -69,7 +158,7 @@ class StoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "rag.sqlite3"
             seed = IndexStore(db_path)
-            observation = FaqObservation("intent", "global", "source-v1", 0)
+            observation = FaqObservation("intent", "global", "问题", "source-v1", 0)
             seed.record_faq_observation(observation, answer="a", day="2026-08-29", now=1.0)
             seed.record_faq_observation(observation, answer="a", day="2026-08-30", now=2.0)
             seed.close()
@@ -98,17 +187,16 @@ class StoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
             try:
-                observation = FaqObservation("intent", "global", "source-v1", 0)
+                observation = FaqObservation("intent", "global", "问题", "source-v1", 0)
                 for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
                     match = store.record_faq_observation(
                         observation, answer="旧答案", day=day, now=1.0,
-                        normalized_question="问题",
                     )
                 entry_id = match.entry_id
                 store.connection.execute("UPDATE faq_entries SET direct_hits=4,state='stale' WHERE id=?", (entry_id,))
                 refreshed = store.refresh_stale_faq(
                     entry_id,
-                    FaqObservation("intent", "global", "source-v2", 1),
+                    FaqObservation("intent", "global", "问题", "source-v2", 1),
                     answer="新答案",
                     now=5.0,
                 )
@@ -130,9 +218,9 @@ class StoreTests(unittest.TestCase):
                     store.record_faq_metric("2026-08-31", "scope_key")
                 metrics = store.query_faq_metrics(since_day="2026-08-31")
                 self.assertEqual(metrics[0]["direct_hits"], 2)
-                observation = FaqObservation("intent", "global", "source-v1", 0)
+                observation = FaqObservation("intent", "global", "问题", "source-v1", 0)
                 for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
-                    store.record_faq_observation(observation, answer="a", day=day, now=1.0, normalized_question="q")
+                    store.record_faq_observation(observation, answer="a", day=day, now=1.0)
                 removed = store.cleanup_faq(cutoff_day="2026-08-30", stale_cutoff=0.0)
                 self.assertGreaterEqual(removed["observations"], 1)
                 self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM faq_entries").fetchone()[0], 1)

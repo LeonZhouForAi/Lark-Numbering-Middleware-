@@ -680,12 +680,15 @@ class IndexStore:
 
     @staticmethod
     def _validate_faq_day(day: str) -> date:
-        if not isinstance(day, str):
+        if not isinstance(day, str) or re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) is None:
             raise ValueError("day must be an ISO date")
         try:
-            return date.fromisoformat(day)
+            parsed = date.fromisoformat(day)
         except ValueError as exc:
             raise ValueError("day must be an ISO date") from exc
+        if parsed.isoformat() != day:
+            raise ValueError("day must be an ISO date")
+        return parsed
 
     @staticmethod
     def _validate_faq_now(now: float) -> float:
@@ -706,6 +709,11 @@ class IndexStore:
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{field} must not be empty")
         if (
+            not isinstance(observation.normalized_question, str)
+            or not observation.normalized_question.strip()
+        ):
+            raise ValueError("normalized_question must not be empty")
+        if (
             isinstance(observation.knowledge_revision, bool)
             or not isinstance(observation.knowledge_revision, int)
             or observation.knowledge_revision < 0
@@ -713,18 +721,8 @@ class IndexStore:
             raise ValueError("knowledge_revision must be a non-negative integer")
 
     @staticmethod
-    def _faq_question(observation: FaqObservation, normalized_question: str | None) -> str:
-        question = normalized_question
-        if question is None:
-            question = getattr(observation, "normalized_question", None)
-        if question is None:
-            # FaqObservation intentionally contains no employee/message data.  The
-            # stable intent is the only safe fallback when an older caller does not
-            # provide its normalized wording.
-            question = observation.intent_key
-        if not isinstance(question, str):
-            raise ValueError("normalized_question must be a string")
-        question = _normalize(question)
+    def _faq_question(observation: FaqObservation) -> str:
+        question = _normalize(observation.normalized_question)
         if not question:
             raise ValueError("normalized_question must not be empty")
         return question
@@ -771,7 +769,6 @@ class IndexStore:
         answer: str,
         day: str,
         now: float,
-        normalized_question: str | None = None,
         window_days: int = _FAQ_WINDOW_DAYS,
     ) -> FaqMatch | None:
         """Atomically record an observation and promote its FAQ on hit three."""
@@ -779,7 +776,7 @@ class IndexStore:
         safe_answer = self._faq_answer(answer)
         current_day = self._validate_faq_day(day)
         timestamp = self._validate_faq_now(now)
-        question = self._faq_question(observation, normalized_question)
+        question = self._faq_question(observation)
         if (
             isinstance(window_days, bool)
             or not isinstance(window_days, int)
@@ -796,7 +793,8 @@ class IndexStore:
                 "knowledge_revision,latest_safe_answer"
                 ") VALUES(?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(scope_key,intent_key,source_signature,knowledge_revision,day) "
-                "DO UPDATE SET latest_safe_answer = excluded.latest_safe_answer",
+                "DO UPDATE SET count = count + 1, "
+                "latest_safe_answer = excluded.latest_safe_answer",
                 (
                     observation.intent_key,
                     observation.scope_key,
@@ -833,6 +831,38 @@ class IndexStore:
                 (observation.scope_key, observation.intent_key),
             ).fetchone()
             if existing is not None:
+                if (
+                    existing["state"] == "stale"
+                    or existing["knowledge_revision"] != observation.knowledge_revision
+                ):
+                    self.connection.execute(
+                        "UPDATE faq_entries SET canonical_question = ?, answer = ?, "
+                        "source_signature = ?, knowledge_revision = ?, state = 'enabled', "
+                        "updated_at = ? WHERE id = ?",
+                        (
+                            question,
+                            safe_answer,
+                            observation.source_signature,
+                            observation.knowledge_revision,
+                            timestamp,
+                            existing["id"],
+                        ),
+                    )
+                    self.connection.execute(
+                        "INSERT INTO faq_aliases("
+                        "faq_id,normalized_question,search_text,first_seen_at,last_seen_at,total_seen"
+                        ") VALUES(?,?,?,?,?,1) ON CONFLICT(faq_id,normalized_question) DO UPDATE SET "
+                        "search_text = excluded.search_text, last_seen_at = excluded.last_seen_at, "
+                        "total_seen = total_seen + 1",
+                        (existing["id"], question, _pretokenize(question), timestamp, timestamp),
+                    )
+                    self.connection.execute(
+                        "INSERT INTO faq_metrics_daily(scope_key,day,refreshes) VALUES(?,?,1) "
+                        "ON CONFLICT(scope_key,day) DO UPDATE SET refreshes = refreshes + 1",
+                        (observation.scope_key, day),
+                    )
+                    self.connection.commit()
+                    return FaqMatch(existing["id"], safe_answer, observation.intent_key)
                 if (
                     existing["state"] == "enabled"
                     and existing["source_signature"] == observation.source_signature
@@ -918,7 +948,6 @@ class IndexStore:
         *,
         answer: str,
         now: float,
-        normalized_question: str | None = None,
     ) -> FaqMatch:
         """Refresh one stale/versioned FAQ in place while preserving hit history."""
         if not isinstance(entry_id, str) or not entry_id.strip():
@@ -926,7 +955,7 @@ class IndexStore:
         self._validate_faq_observation(observation)
         safe_answer = self._faq_answer(answer)
         timestamp = self._validate_faq_now(now)
-        question = self._faq_question(observation, normalized_question)
+        question = self._faq_question(observation)
         self._begin_faq_transaction()
         try:
             entry = self.connection.execute(
@@ -962,14 +991,13 @@ class IndexStore:
                     "ON CONFLICT(scope_key,day) DO UPDATE SET refreshes = refreshes + 1",
                     (observation.scope_key, datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()),
                 )
-            if normalized_question is not None:
-                self.connection.execute(
-                    "INSERT INTO faq_aliases("
-                    "faq_id,normalized_question,search_text,first_seen_at,last_seen_at,total_seen"
-                    ") VALUES(?,?,?,?,?,1) ON CONFLICT(faq_id,normalized_question) DO UPDATE SET "
-                    "last_seen_at = excluded.last_seen_at, total_seen = total_seen + 1",
-                    (entry_id, question, _pretokenize(question), timestamp, timestamp),
-                )
+            self.connection.execute(
+                "INSERT INTO faq_aliases("
+                "faq_id,normalized_question,search_text,first_seen_at,last_seen_at,total_seen"
+                ") VALUES(?,?,?,?,?,1) ON CONFLICT(faq_id,normalized_question) DO UPDATE SET "
+                "last_seen_at = excluded.last_seen_at, total_seen = total_seen + 1",
+                (entry_id, question, _pretokenize(question), timestamp, timestamp),
+            )
             self.connection.commit()
             return FaqMatch(entry_id, safe_answer if should_refresh else entry["answer"], observation.intent_key)
         except Exception:

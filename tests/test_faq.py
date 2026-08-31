@@ -17,8 +17,10 @@ class FaqModelsTests(unittest.TestCase):
             scope_key="space-a",
             source_signature="sig",
             knowledge_revision=4,
+            normalized_question="密码怎么重置",
         )
         self.assertEqual(observation.knowledge_revision, 4)
+        self.assertEqual(observation.normalized_question, "密码怎么重置")
         with self.assertRaises(FrozenInstanceError):
             observation.scope_key = "space-b"
 
