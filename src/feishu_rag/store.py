@@ -171,9 +171,80 @@ class IndexStore:
                     PRIMARY KEY(user_hash, window_seconds, bucket_start)
                 )
                 """,
+                """
+                CREATE TABLE IF NOT EXISTS knowledge_state (
+                    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+                    revision INTEGER NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS faq_entries (
+                    id TEXT PRIMARY KEY,
+                    intent_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    canonical_question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    source_signature TEXT NOT NULL,
+                    knowledge_revision INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    direct_hits INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    last_hit_at REAL,
+                    UNIQUE(scope_key, intent_key)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS faq_aliases (
+                    faq_id TEXT NOT NULL REFERENCES faq_entries(id) ON DELETE CASCADE,
+                    normalized_question TEXT NOT NULL,
+                    search_text TEXT NOT NULL,
+                    first_seen_at REAL NOT NULL,
+                    last_seen_at REAL NOT NULL,
+                    total_seen INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(faq_id, normalized_question)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS faq_observation_daily (
+                    intent_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    day TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    normalized_question TEXT NOT NULL,
+                    source_signature TEXT NOT NULL,
+                    knowledge_revision INTEGER NOT NULL,
+                    latest_safe_answer TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(
+                        scope_key, intent_key, source_signature, knowledge_revision, day
+                    )
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS faq_metrics_daily (
+                    scope_key TEXT NOT NULL,
+                    day TEXT NOT NULL,
+                    eligible_questions INTEGER NOT NULL DEFAULT 0,
+                    rag_answers INTEGER NOT NULL DEFAULT 0,
+                    direct_hits INTEGER NOT NULL DEFAULT 0,
+                    promotions INTEGER NOT NULL DEFAULT 0,
+                    refreshes INTEGER NOT NULL DEFAULT 0,
+                    rejected_answers INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(scope_key, day)
+                )
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_faq_entries_scope_state ON faq_entries(scope_key, state)",
+                "CREATE INDEX IF NOT EXISTS idx_faq_aliases_normalized_question ON faq_aliases(normalized_question)",
+                "CREATE INDEX IF NOT EXISTS idx_faq_observation_daily_day ON faq_observation_daily(day)",
+                "CREATE INDEX IF NOT EXISTS idx_faq_metrics_daily_day ON faq_metrics_daily(day)",
             )
             for statement in schema_statements:
                 self.connection.execute(statement)
+            self.connection.execute(
+                "INSERT OR IGNORE INTO knowledge_state(singleton_id,revision,updated_at) "
+                "VALUES(1,0,0)"
+            )
 
             document_columns = {
                 row[1]
@@ -480,6 +551,26 @@ class IndexStore:
 
     def count_documents(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+
+    def knowledge_revision(self) -> int:
+        return int(
+            self.connection.execute(
+                "SELECT revision FROM knowledge_state WHERE singleton_id = 1"
+            ).fetchone()[0]
+        )
+
+    def bump_knowledge_revision(self, now: float | None = None) -> int:
+        timestamp = time.time() if now is None else float(now)
+        row = self.connection.execute(
+            "UPDATE knowledge_state "
+            "SET revision = revision + 1, updated_at = ? "
+            "WHERE singleton_id = 1 RETURNING revision",
+            (timestamp,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("knowledge state is not initialized")
+        self.connection.commit()
+        return int(row[0])
 
     def claim_rate_limit(
         self,

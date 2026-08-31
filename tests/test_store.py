@@ -13,6 +13,224 @@ from feishu_rag.store import IndexStore, _pretokenize, _tokens
 
 
 class StoreTests(unittest.TestCase):
+    def test_empty_database_creates_faq_schema_and_initial_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                table_names = {
+                    row[0]
+                    for row in store.connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                self.assertTrue(
+                    {
+                        "knowledge_state",
+                        "faq_entries",
+                        "faq_aliases",
+                        "faq_observation_daily",
+                        "faq_metrics_daily",
+                    }.issubset(table_names)
+                )
+                self.assertEqual(store.knowledge_revision(), 0)
+                self.assertEqual(
+                    tuple(
+                        store.connection.execute(
+                            "SELECT singleton_id, revision, updated_at FROM knowledge_state"
+                        ).fetchone()
+                    ),
+                    (1, 0, 0.0),
+                )
+            finally:
+                store.close()
+
+    def test_legacy_v023_database_preserves_content_and_starts_at_revision_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            connection = sqlite3.connect(db_path)
+            connection.executescript(
+                """
+                CREATE TABLE documents (
+                    source_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE chunks (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES documents(source_id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    page INTEGER,
+                    section TEXT
+                );
+                CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                    chunk_id UNINDEXED, title, content
+                );
+                CREATE TABLE processed_messages (
+                    message_id TEXT PRIMARY KEY,
+                    processed_at REAL NOT NULL
+                );
+                INSERT INTO documents VALUES('legacy.txt', '旧文档', 'legacy.txt', 'v1', 0);
+                INSERT INTO chunks VALUES('legacy-chunk', 'legacy.txt', '旧文档', '报销内容', NULL, NULL);
+                INSERT INTO chunks_fts VALUES('legacy-chunk', '旧文档', '报销内容');
+                INSERT INTO processed_messages VALUES('om_legacy', 1);
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            store = IndexStore(db_path)
+            try:
+                self.assertEqual(store.knowledge_revision(), 0)
+                self.assertEqual(store.count_documents(), 1)
+                self.assertEqual(store.count_chunks(), 1)
+                self.assertEqual(store.search("报销内容")[0].chunk.id, "legacy-chunk")
+                self.assertEqual(store.claim_message_state("om_legacy", retention_seconds=10**12), "completed")
+            finally:
+                store.close()
+
+    def test_faq_migration_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            first = IndexStore(db_path)
+            try:
+                self.assertEqual(first.bump_knowledge_revision(now=10), 1)
+            finally:
+                first.close()
+
+            second = IndexStore(db_path)
+            try:
+                self.assertEqual(second.knowledge_revision(), 1)
+                self.assertEqual(
+                    second.connection.execute("SELECT COUNT(*) FROM knowledge_state").fetchone()[0],
+                    1,
+                )
+            finally:
+                second.close()
+
+    def test_knowledge_revision_is_monotonic_and_upsert_does_not_bump_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                self.assertEqual(store.knowledge_revision(), 0)
+                self.assertEqual(store.bump_knowledge_revision(now=12.5), 1)
+                self.assertEqual(store.bump_knowledge_revision(now=13.5), 2)
+                self.assertEqual(
+                    tuple(
+                        store.connection.execute(
+                            "SELECT revision, updated_at FROM knowledge_state"
+                        ).fetchone()
+                    ),
+                    (2, 13.5),
+                )
+                store.upsert_document(
+                    "policy.txt",
+                    "报销制度",
+                    "policy.txt",
+                    "v1",
+                    [Chunk("policy", "policy.txt", "报销制度", "报销内容")],
+                )
+                self.assertEqual(store.knowledge_revision(), 2)
+            finally:
+                store.close()
+
+    def test_faq_schema_enforces_entry_and_observation_uniqueness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                entry = (
+                    "faq-1", "intent", "scope", "问题", "答案", "source", 0,
+                    "active", 0, 1.0, 1.0, None,
+                )
+                store.connection.execute(
+                    "INSERT INTO faq_entries("
+                    "id,intent_key,scope_key,canonical_question,answer,source_signature,"
+                    "knowledge_revision,state,direct_hits,created_at,updated_at,last_hit_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    entry,
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.connection.execute(
+                        "INSERT INTO faq_entries("
+                        "id,intent_key,scope_key,canonical_question,answer,source_signature,"
+                        "knowledge_revision,state,direct_hits,created_at,updated_at,last_hit_at"
+                        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        ("faq-2",) + entry[1:],
+                    )
+                observation = (
+                    "intent",
+                    "scope",
+                    "2026-08-31",
+                    1,
+                    "问题",
+                    "source",
+                    0,
+                    "答案",
+                )
+                store.connection.execute(
+                    "INSERT INTO faq_observation_daily("
+                    "intent_key,scope_key,day,count,normalized_question,source_signature,"
+                    "knowledge_revision,latest_safe_answer"
+                    ") VALUES(?,?,?,?,?,?,?,?)",
+                    observation,
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.connection.execute(
+                        "INSERT INTO faq_observation_daily("
+                        "intent_key,scope_key,day,count,normalized_question,source_signature,"
+                        "knowledge_revision,latest_safe_answer"
+                        ") VALUES(?,?,?,?,?,?,?,?)",
+                        observation,
+                    )
+            finally:
+                store.close()
+
+    def test_faq_schema_contains_alias_observation_and_metrics_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                expected_columns = {
+                    "faq_aliases": {
+                        "faq_id",
+                        "normalized_question",
+                        "search_text",
+                        "first_seen_at",
+                        "last_seen_at",
+                        "total_seen",
+                    },
+                    "faq_observation_daily": {
+                        "intent_key",
+                        "scope_key",
+                        "day",
+                        "count",
+                        "normalized_question",
+                        "source_signature",
+                        "knowledge_revision",
+                        "latest_safe_answer",
+                    },
+                    "faq_metrics_daily": {
+                        "day",
+                        "eligible_questions",
+                        "rag_answers",
+                        "direct_hits",
+                        "promotions",
+                        "refreshes",
+                        "rejected_answers",
+                    },
+                }
+                for table, columns in expected_columns.items():
+                    actual = {
+                        row[1]
+                        for row in store.connection.execute(
+                            f"PRAGMA table_info({table})"
+                        ).fetchall()
+                    }
+                    self.assertTrue(columns.issubset(actual), table)
+            finally:
+                store.close()
+
     def test_set_document_space_updates_only_an_existing_document(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
