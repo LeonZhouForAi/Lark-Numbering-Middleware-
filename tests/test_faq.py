@@ -120,17 +120,42 @@ class FaqServiceTests(unittest.TestCase):
         self.assertEqual(store.recorded, [])
 
     def test_lookup_requires_current_revision_and_marks_old_entry_stale(self):
-        store = _FakeStore(
-            [{
-                "id": "faq-1", "intent_key": "wrong", "answer": "旧答案",
-                "normalized_question": "供应商开发", "search_text": "供应商 开发",
-                "source_signature": "old", "knowledge_revision": 3, "state": "enabled",
-            }],
-            revision=4,
-        )
+        store = _FakeStore(revision=4)
         service = self._service(store)
+        observation = service.describe("供应商开发", _results("supplier"), None)
+        store.candidates = [{
+            "id": "faq-1", "intent_key": observation.intent_key, "answer": "旧答案",
+            "normalized_question": observation.normalized_question,
+            "source_signature": observation.source_signature,
+            "source_ids_json": json.dumps(list(observation.source_ids)),
+            "knowledge_revision": 3, "state": "enabled",
+        }]
         self.assertIsNone(service.lookup("供应商开发", _results("supplier"), None))
         self.assertEqual(store.marked, [4])
+
+    def test_unrelated_old_candidate_does_not_block_current_matching_candidate(self):
+        store = _FakeStore(revision=4)
+        service = self._service(store)
+        observation = service.describe("供应商开发", _results("supplier"), None)
+        store.candidates = [
+            {
+                "id": "old-faq", "answer": "旧答案", "normalized_question": "财务报销",
+                "source_signature": "finance", "source_ids_json": json.dumps(["finance"]),
+                "knowledge_revision": 3, "state": "enabled",
+            },
+            {
+                "id": "current-faq", "answer": "新答案",
+                "normalized_question": observation.normalized_question,
+                "source_signature": observation.source_signature,
+                "source_ids_json": json.dumps(list(observation.source_ids)),
+                "knowledge_revision": 4, "state": "enabled",
+            },
+        ]
+        self.assertEqual(
+            service.lookup("供应商开发", _results("supplier"), None),
+            FaqMatch("current-faq", "新答案", observation.intent_key),
+        )
+        self.assertEqual(store.marked, [])
 
     def test_lookup_rejects_different_source_signature(self):
         store = _FakeStore()

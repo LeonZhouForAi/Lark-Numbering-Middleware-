@@ -99,7 +99,7 @@ class FaqService:
 
     @staticmethod
     def _token_set(text: str) -> set[str]:
-        return set(_tokens(text)) if text else set()
+        return set(_tokens(text)) if isinstance(text, str) and text else set()
 
     @staticmethod
     def _source_overlap(candidate: Any, current_source_ids: tuple[str, ...]) -> float:
@@ -159,16 +159,14 @@ class FaqService:
 
         candidates = self.store.find_faq_candidates(observation.scope_key)
         current_revision = observation.knowledge_revision
+        text_terms = self._token_set(observation.normalized_question)
+        stale_marked = False
         for candidate in candidates:
             if _row_value(candidate, "state", "enabled") != "enabled":
                 continue
-            if _row_value(candidate, "knowledge_revision") != current_revision:
-                self.store.mark_faq_stale_before_revision(current_revision)
-                return None
             candidate_question = _row_value(
                 candidate, "normalized_question", observation.normalized_question
             )
-            text_terms = self._token_set(observation.normalized_question)
             candidate_terms = self._token_set(candidate_question)
             union = text_terms | candidate_terms
             text_similarity = (
@@ -180,6 +178,11 @@ class FaqService:
                 self._source_overlap(candidate, observation.source_ids)
                 < self.min_source_overlap
             ):
+                continue
+            if _row_value(candidate, "knowledge_revision") != current_revision:
+                if not stale_marked:
+                    self.store.mark_faq_stale_before_revision(current_revision)
+                    stale_marked = True
                 continue
             return FaqMatch(
                 str(_row_value(candidate, "id")),
