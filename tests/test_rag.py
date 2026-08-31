@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from feishu_rag.llm import DeepSeekClient
-from feishu_rag.models import Chunk, RetrievalScope, SearchResult
+from feishu_rag.models import Chunk, FaqMatch, FaqObservation, RetrievalScope, SearchResult
 from feishu_rag.rag import RagResponseError, RagService
 from feishu_rag.store import IndexStore
 
@@ -45,6 +45,34 @@ class RecordingStore:
         return self.results
 
 
+class FakeFaqService:
+    def __init__(self, match=None):
+        self.match = match
+        self.lookup_calls = []
+        self.describe_calls = []
+        self.recorded = []
+
+    def lookup(self, question, results, scope):
+        self.lookup_calls.append((question, results, scope))
+        return self.match
+
+    def describe(self, question, results, scope):
+        observation = FaqObservation(
+            intent_key="intent",
+            scope_key="global",
+            normalized_question=question,
+            source_signature="source",
+            knowledge_revision=1,
+            source_ids=("source",),
+        )
+        self.describe_calls.append((question, results, scope))
+        return observation
+
+    def record_safe_answer(self, observation, answer):
+        self.recorded.append((observation, answer))
+        return None
+
+
 def _result(content="报销需要提交发票。"):
     return SearchResult(
         Chunk(
@@ -60,6 +88,49 @@ def _result(content="报销需要提交发票。"):
 
 
 class RagTests(unittest.TestCase):
+    def test_faq_hit_reuses_search_results_and_skips_llm(self):
+        store = RecordingStore([_result()])
+        llm = FakeLLM()
+        faq = FakeFaqService(FaqMatch("faq-1", "标准答案\n来源：内部资料", "intent"))
+
+        answer = RagService(store, llm, faq_service=faq).answer("同义问题")
+
+        self.assertEqual(answer.text, "标准答案")
+        self.assertEqual(answer.citations, [])
+        self.assertEqual(len(store.calls), 1)
+        self.assertEqual(llm.calls, [])
+        self.assertEqual(faq.lookup_calls[0][1], store.results)
+
+    def test_safe_llm_answer_is_recorded_for_faq_promotion(self):
+        store = RecordingStore([_result()])
+        faq = FakeFaqService()
+
+        answer = RagService(store, FakeLLM(), faq_service=faq).answer("报销流程")
+
+        self.assertEqual(len(faq.describe_calls), 1)
+        self.assertEqual(faq.recorded[0][1], answer.text)
+        self.assertNotIn(answer.text, {INSUFFICIENT_ANSWER, UNSAFE_ANSWER})
+
+    def test_insufficient_llm_answer_is_not_recorded(self):
+        self._assert_llm_answer_is_not_recorded(
+            {"answer": "模型试图回答", "evidence_sufficient": False},
+            INSUFFICIENT_ANSWER,
+        )
+
+    def test_unsafe_llm_answer_is_not_recorded(self):
+        self._assert_llm_answer_is_not_recorded(
+            {"answer": "请访问 https://example.com", "evidence_sufficient": True},
+            UNSAFE_ANSWER,
+        )
+
+    def _assert_llm_answer_is_not_recorded(self, response, expected):
+        faq = FakeFaqService()
+        answer = RagService(
+            RecordingStore([_result()]), FakeLLM(response), faq_service=faq
+        ).answer("报销流程")
+        self.assertEqual(answer.text, expected)
+        self.assertEqual(faq.recorded, [])
+
     def test_answer_passes_custom_min_relevance_to_store(self):
         store = RecordingStore()
 

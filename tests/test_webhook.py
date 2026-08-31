@@ -7,6 +7,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -65,6 +66,31 @@ class NotSentOnceFeishu(FakeFeishu):
 
 
 class WebhookTests(unittest.TestCase):
+    def test_create_app_builds_faq_service_from_settings(self):
+        settings = Settings(
+            deepseek_api_key="key",
+            feishu_app_id="app",
+            feishu_app_secret="secret",
+            feishu_verification_token="verify",
+            rag_faq_enabled=False,
+            rag_faq_promotion_count=7,
+            rag_faq_window_days=30,
+            rag_faq_min_text_similarity=0.9,
+            rag_faq_min_source_overlap=0.7,
+        )
+        with (
+            patch("feishu_rag.web.FaqService") as faq_type,
+            patch("feishu_rag.web.RagService") as rag_type,
+            patch("feishu_rag.web.DeepSeekClient"),
+            patch("feishu_rag.web.FeishuClient"),
+        ):
+            create_app(settings)
+
+        faq_type.assert_called_once_with(
+            rag_type.call_args.args[0], False, 7, 30, 0.9, 0.7
+        )
+        self.assertIs(rag_type.call_args.kwargs["faq_service"], faq_type.return_value)
+
     @staticmethod
     def _payload(message_id, sender_id=None):
         event = {

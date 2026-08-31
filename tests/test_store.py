@@ -861,6 +861,28 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM faq_entries").fetchone()[0], 1)
             finally:
                 store.close()
+
+    def test_record_faq_direct_hit_updates_entry_and_daily_metric(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                observation = FaqObservation("intent", "global", "问题", "source-v1", 0)
+                for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
+                    match = store.record_faq_observation(
+                        observation, answer="答案", day=day, now=1.0, promotion_count=3
+                    )
+                store.record_faq_direct_hit(match.entry_id, now=1725148800.0)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT direct_hits FROM faq_entries WHERE id = ?", (match.entry_id,)
+                    ).fetchone()[0],
+                    1,
+                )
+                metrics = store.query_faq_metrics(since_day="2024-01-01")
+                self.assertEqual(sum(int(row["direct_hits"]) for row in metrics), 1)
+            finally:
+                store.close()
+
     def test_empty_database_creates_faq_schema_and_initial_revision(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")

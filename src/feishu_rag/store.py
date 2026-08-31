@@ -1103,6 +1103,31 @@ class IndexStore:
             self.connection.rollback()
             raise
 
+    def record_faq_direct_hit(self, entry_id: str, now: float | None = None) -> None:
+        """Atomically count a direct FAQ hit on its entry and daily metrics."""
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            raise ValueError("entry_id must not be empty")
+        timestamp = time.time() if now is None else self._validate_faq_now(now)
+        day = datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+        self._begin_faq_transaction()
+        try:
+            cursor = self.connection.execute(
+                "UPDATE faq_entries SET direct_hits = direct_hits + 1, last_hit_at = ? "
+                "WHERE id = ? AND state = 'enabled'",
+                (timestamp, entry_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("FAQ entry does not exist or is not enabled")
+            self.connection.execute(
+                "INSERT INTO faq_metrics_daily(scope_key,day,direct_hits) VALUES('',?,1) "
+                "ON CONFLICT(scope_key,day) DO UPDATE SET direct_hits = direct_hits + 1",
+                (day,),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def query_faq_metrics(self, *, since_day: str | None = None) -> list[dict[str, object]]:
         if since_day is not None:
             self._validate_faq_day(since_day)

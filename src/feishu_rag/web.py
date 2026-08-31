@@ -8,6 +8,7 @@ import json
 from typing import Any
 
 from .config import ConfigError, Settings
+from .faq import FaqService
 from .feishu_client import FeishuClient, FeishuReplyNotSentError
 from .llm import DeepSeekClient
 from .rag import RagService
@@ -203,6 +204,14 @@ def create_app(
                 retry_policy=retry_policy,
                 usage_sink=store,
             )
+            faq_service = FaqService(
+                store,
+                settings.rag_faq_enabled,
+                settings.rag_faq_promotion_count,
+                settings.rag_faq_window_days,
+                settings.rag_faq_min_text_similarity,
+                settings.rag_faq_min_source_overlap,
+            )
             rag = rag or RagService(
                 store,
                 llm,
@@ -211,6 +220,7 @@ def create_app(
                 question_max_chars=settings.rag_question_max_chars,
                 rate_limit_per_minute=settings.rag_rate_limit_per_minute,
                 rate_limit_per_day=settings.rag_rate_limit_per_day,
+                faq_service=faq_service,
             )
             feishu = feishu or FeishuClient(
                 settings.feishu_app_id,

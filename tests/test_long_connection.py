@@ -484,3 +484,29 @@ def test_run_configures_and_shuts_down_ack_adapter() -> None:
     )
     client.start.assert_called_once_with()
     client.shutdown.assert_called_once_with()
+
+
+def test_long_connection_resource_factory_injects_configured_faq_service() -> None:
+    settings = Settings(
+        deepseek_api_key="key",
+        feishu_app_id="app",
+        feishu_app_secret="secret",
+        feishu_verification_token="",
+        rag_faq_enabled=False,
+        rag_faq_promotion_count=7,
+        rag_faq_window_days=30,
+        rag_faq_min_text_similarity=0.9,
+        rag_faq_min_source_overlap=0.7,
+    )
+    store = MagicMock()
+    with (
+        patch.object(long_connection, "IndexStore", return_value=store),
+        patch.object(long_connection, "DeepSeekClient"),
+        patch.object(long_connection, "FaqService") as faq_type,
+        patch.object(long_connection, "RagService") as rag_type,
+    ):
+        result_store, _ = long_connection._create_message_resources(settings)
+
+    assert result_store is store
+    faq_type.assert_called_once_with(store, False, 7, 30, 0.9, 0.7)
+    assert rag_type.call_args.kwargs["faq_service"] is faq_type.return_value

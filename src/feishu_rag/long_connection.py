@@ -29,6 +29,7 @@ from lark_oapi.ws.model import Response
 from lark_oapi.ws.pb.pbbp2_pb2 import Frame
 
 from .config import Settings
+from .faq import FaqService
 from .feishu_client import FeishuClient
 from .llm import DeepSeekClient
 from .logging_utils import configure_logging
@@ -160,6 +161,14 @@ def _create_message_resources(
             question_max_chars=settings.rag_question_max_chars,
             rate_limit_per_minute=settings.rag_rate_limit_per_minute,
             rate_limit_per_day=settings.rag_rate_limit_per_day,
+            faq_service=FaqService(
+                store,
+                settings.rag_faq_enabled,
+                settings.rag_faq_promotion_count,
+                settings.rag_faq_window_days,
+                settings.rag_faq_min_text_similarity,
+                settings.rag_faq_min_source_overlap,
+            ),
         )
         return store, rag
     except Exception:

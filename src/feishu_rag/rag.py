@@ -6,7 +6,9 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
+from .faq import FaqService
 from .models import RetrievalScope, SearchResult
 from .store import IndexStore
 
@@ -95,6 +97,7 @@ class RagService:
         question_max_chars: int = 500,
         rate_limit_per_minute: int = 10,
         rate_limit_per_day: int = 200,
+        faq_service: FaqService | None = None,
     ):
         if question_max_chars < 1:
             raise ValueError("question_max_chars 必须大于 0")
@@ -110,6 +113,7 @@ class RagService:
         self.question_max_chars = question_max_chars
         self.rate_limit_per_minute = rate_limit_per_minute
         self.rate_limit_per_day = rate_limit_per_day
+        self.faq_service = faq_service
 
     @staticmethod
     def _context(results: list[SearchResult]) -> tuple[str, list[Citation]]:
@@ -199,6 +203,16 @@ class RagService:
         if not results:
             return RagAnswer("知识库中暂无依据，请换一种问法或联系文控管理员。", [])
 
+        if self.faq_service is not None:
+            try:
+                match = self.faq_service.lookup(question, results, scope)
+            except Exception:
+                match = None
+            if match is not None:
+                cleaned = self._clean_answer(match.answer)
+                self._record_direct_hit(match)
+                return RagAnswer(cleaned, [])
+
         context, citations = self._context(results)
         system_prompt = (
             "你是公司内部知识库助手。仅依据资料回答，不得补造制度、金额、日期或审批人。"
@@ -214,4 +228,26 @@ class RagService:
         )
         if not evidence_sufficient:
             return RagAnswer(INSUFFICIENT_ANSWER, citations)
-        return RagAnswer(self._clean_answer(generated), citations)
+        cleaned = self._clean_answer(generated)
+        if (
+            self.faq_service is not None
+            and cleaned not in {INSUFFICIENT_ANSWER, UNSAFE_ANSWER}
+        ):
+            try:
+                observation = self.faq_service.describe(question, results, scope)
+                self.faq_service.record_safe_answer(observation, cleaned)
+            except Exception:
+                pass
+        return RagAnswer(cleaned, citations)
+
+    def _record_direct_hit(self, match) -> None:
+        entry_id = getattr(match, "entry_id", None)
+        record_hit = getattr(self.store, "record_faq_direct_hit", None)
+        if callable(record_hit) and isinstance(entry_id, str) and entry_id:
+            record_hit(entry_id)
+            return
+        record_metric = getattr(self.store, "record_faq_metric", None)
+        if callable(record_metric):
+            record_metric(
+                datetime.now(timezone.utc).date().isoformat(), "direct_hits"
+            )
