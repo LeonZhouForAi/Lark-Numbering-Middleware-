@@ -359,7 +359,7 @@ class IngestTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_index_directory_does_not_bump_when_indexing_raises(self):
+    def test_index_directory_does_not_write_or_bump_when_indexing_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "one.txt").write_text("第一份制度。", encoding="utf-8")
@@ -367,11 +367,15 @@ class IngestTests(unittest.TestCase):
             store = IndexStore(root / "index.sqlite3")
             try:
                 with patch(
-                    "feishu_rag.ingest.index_file",
-                    side_effect=[True, RuntimeError("index failed")],
+                    "feishu_rag.ingest.extract_sections",
+                    side_effect=[
+                        [Section(text="第一份制度。")],
+                        RuntimeError("index failed"),
+                    ],
                 ):
                     with self.assertRaisesRegex(RuntimeError, "index failed"):
                         index_directory(root, store)
+                self.assertEqual(store.count_documents(), 0)
                 self.assertEqual(store.knowledge_revision(), 0)
             finally:
                 store.close()

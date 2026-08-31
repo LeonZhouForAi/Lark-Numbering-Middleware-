@@ -21,7 +21,7 @@ from .logging_utils import configure_logging
 from .models import Chunk
 from .retry import RetryPolicy
 from .semantic_chunker import AtomicUnit, DeepSeekPlanner, SemanticPlanner, semantic_chunks
-from .store import IndexStore
+from .store import IndexStore, PreparedDocument
 
 
 logger = logging.getLogger(__name__)
@@ -150,7 +150,8 @@ def sync_wiki_space(
     chunk_model: str = "",
     enable_ocr: bool = True,
 ) -> SyncResult:
-    nodes_seen = indexed = skipped = 0
+    nodes_seen = skipped = 0
+    prepared_updates: list[PreparedDocument] = []
     pending_parents: list[str | None] = [None]
     seen_nodes: dict[str, tuple[str, str, bool, str]] = {}
     retained_source_ids: set[str] = set()
@@ -206,7 +207,16 @@ def sync_wiki_space(
                         f"{content_checksum}:{chunk_strategy_version}:{chunk_model}:ocr={ocr_cache_mode}".encode("utf-8")
                     ).hexdigest()
                     if store.document_checksum(source_id) == checksum:
-                        store.set_document_space(source_id, space_id)
+                        prepared_updates.append(
+                            PreparedDocument(
+                                source_id,
+                                title,
+                                f"wiki/{space_id}/{node_token}",
+                                checksum,
+                                None,
+                                space_id,
+                            )
+                        )
                         retained_source_ids.add(source_id)
                         skipped += 1
                         continue
@@ -226,16 +236,17 @@ def sync_wiki_space(
                     if not chunks:
                         skipped += 1
                         continue
-                    store.upsert_document(
-                        source_id,
-                        title,
-                        f"wiki/{space_id}/{node_token}",
-                        checksum,
-                        chunks,
-                        space_id=space_id,
+                    prepared_updates.append(
+                        PreparedDocument(
+                            source_id,
+                            title,
+                            f"wiki/{space_id}/{node_token}",
+                            checksum,
+                            tuple(chunks),
+                            space_id,
+                        )
                     )
                     retained_source_ids.add(source_id)
-                    indexed += 1
                     continue
                 if object_type not in {"docx", "doc"}:
                     skipped += 1
@@ -250,7 +261,16 @@ def sync_wiki_space(
                     f"{content_checksum}:{chunk_strategy_version}:{chunk_model}".encode("utf-8")
                 ).hexdigest()
                 if store.document_checksum(source_id) == checksum:
-                    store.set_document_space(source_id, space_id)
+                    prepared_updates.append(
+                        PreparedDocument(
+                            source_id,
+                            title,
+                            f"wiki/{space_id}/{node_token}",
+                            checksum,
+                            None,
+                            space_id,
+                        )
+                    )
                     retained_source_ids.add(source_id)
                     skipped += 1
                     continue
@@ -267,16 +287,17 @@ def sync_wiki_space(
                 if not chunks:
                     skipped += 1
                     continue
-                store.upsert_document(
-                    source_id,
-                    title,
-                    f"wiki/{space_id}/{node_token}",
-                    checksum,
-                    chunks,
-                    space_id=space_id,
+                prepared_updates.append(
+                    PreparedDocument(
+                        source_id,
+                        title,
+                        f"wiki/{space_id}/{node_token}",
+                        checksum,
+                        tuple(chunks),
+                        space_id,
+                    )
                 )
                 retained_source_ids.add(source_id)
-                indexed += 1
             has_more = bool(data.get("has_more"))
             if not has_more:
                 break
@@ -287,9 +308,11 @@ def sync_wiki_space(
                 raise FeishuSyncError("has_more=true 时 page_token 重复")
             seen_page_tokens.add(next_token)
             page_token = next_token
-    deleted = store.prune_documents(f"feishu:{space_id}:", retained_source_ids)
-    if indexed or deleted:
-        store.bump_knowledge_revision()
+    indexed, deleted = store.apply_document_snapshot(
+        prepared_updates,
+        prune_prefix=f"feishu:{space_id}:",
+        retained=retained_source_ids,
+    )
     return SyncResult(nodes_seen, indexed, skipped, deleted)
 
 

@@ -10,6 +10,7 @@ import unicodedata
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Collection, Iterable
@@ -63,6 +64,16 @@ CREATE TABLE IF NOT EXISTS faq_aliases (
     PRIMARY KEY(faq_id, normalized_question)
 )
 """
+
+
+@dataclass(frozen=True)
+class PreparedDocument:
+    source_id: str
+    title: str
+    path: str
+    checksum: str
+    chunks: tuple[Chunk, ...] | None
+    space_id: str = ""
 
 
 def _normalize(text: str) -> str:
@@ -379,38 +390,113 @@ class IndexStore:
     ) -> None:
         chunk_list = list(chunks)
         with self.connection:
-            old_ids = [
-                row[0]
-                for row in self.connection.execute(
-                    "SELECT id FROM chunks WHERE source_id = ?", (source_id,)
-                ).fetchall()
-            ]
-            if self._fts_available and old_ids:
-                self.connection.executemany("DELETE FROM chunks_fts WHERE chunk_id = ?", ((cid,) for cid in old_ids))
-            self.connection.execute("DELETE FROM documents WHERE source_id = ?", (source_id,))
-            self.connection.execute(
-                "INSERT INTO documents(source_id,title,path,checksum,updated_at,space_id) "
-                "VALUES(?,?,?,?,?,?)",
-                (source_id, title, path, checksum, time.time(), space_id),
+            self._upsert_document_in_transaction(
+                source_id, title, path, checksum, chunk_list, space_id=space_id
             )
+
+    def _upsert_document_in_transaction(
+        self,
+        source_id: str,
+        title: str,
+        path: str,
+        checksum: str,
+        chunks: Iterable[Chunk],
+        *,
+        space_id: str = "",
+    ) -> None:
+        chunk_list = list(chunks)
+        old_ids = [
+            row[0]
+            for row in self.connection.execute(
+                "SELECT id FROM chunks WHERE source_id = ?", (source_id,)
+            ).fetchall()
+        ]
+        if self._fts_available and old_ids:
             self.connection.executemany(
-                "INSERT INTO chunks(id,source_id,title,content,page,section,search_text) VALUES(?,?,?,?,?,?,?)",
-                ((c.id, c.source_id, c.title, c.content, c.page, c.section, c.search_text) for c in chunk_list),
+                "DELETE FROM chunks_fts WHERE chunk_id = ?", ((cid,) for cid in old_ids)
             )
-            if self._fts_available:
-                self.connection.executemany(
-                    "INSERT INTO chunks_fts(chunk_id,title_terms,content_terms,search_terms) "
-                    "VALUES(?,?,?,?)",
+        self.connection.execute("DELETE FROM documents WHERE source_id = ?", (source_id,))
+        self.connection.execute(
+            "INSERT INTO documents(source_id,title,path,checksum,updated_at,space_id) "
+            "VALUES(?,?,?,?,?,?)",
+            (source_id, title, path, checksum, time.time(), space_id),
+        )
+        self.connection.executemany(
+            "INSERT INTO chunks(id,source_id,title,content,page,section,search_text) VALUES(?,?,?,?,?,?,?)",
+            ((c.id, c.source_id, c.title, c.content, c.page, c.section, c.search_text) for c in chunk_list),
+        )
+        if self._fts_available:
+            self.connection.executemany(
+                "INSERT INTO chunks_fts(chunk_id,title_terms,content_terms,search_terms) "
+                "VALUES(?,?,?,?)",
+                (
                     (
-                        (
-                            c.id,
-                            _pretokenize(c.title),
-                            _pretokenize(c.content),
-                            _pretokenize(c.search_text),
+                        c.id,
+                        _pretokenize(c.title),
+                        _pretokenize(c.content),
+                        _pretokenize(c.search_text),
+                    )
+                    for c in chunk_list
+                ),
+            )
+
+    def apply_document_snapshot(
+        self,
+        prepared_updates: Iterable[PreparedDocument],
+        *,
+        prune_prefix: str | None = None,
+        retained: Collection[str] | None = None,
+    ) -> tuple[int, int]:
+        updates = tuple(prepared_updates)
+        if prune_prefix is not None:
+            if re.fullmatch(r"feishu:[^:]+:", prune_prefix) is None:
+                raise ValueError("prefix must identify one Feishu space")
+            if retained is None:
+                raise ValueError("retained is required when prune_prefix is provided")
+            if any(not source_id.startswith(prune_prefix) for source_id in retained):
+                raise ValueError("all retained source_ids must start with prefix")
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            updated = 0
+            for prepared in updates:
+                row = self.connection.execute(
+                    "SELECT checksum,space_id FROM documents WHERE source_id = ?",
+                    (prepared.source_id,),
+                ).fetchone()
+                if row is not None and row[0] == prepared.checksum:
+                    if prepared.space_id and row[1] != prepared.space_id:
+                        self.connection.execute(
+                            "UPDATE documents SET space_id = ? WHERE source_id = ?",
+                            (prepared.space_id, prepared.source_id),
                         )
-                        for c in chunk_list
-                    ),
+                    continue
+                if prepared.chunks is None:
+                    raise ValueError("new or changed documents require chunks")
+                self._upsert_document_in_transaction(
+                    prepared.source_id,
+                    prepared.title,
+                    prepared.path,
+                    prepared.checksum,
+                    prepared.chunks,
+                    space_id=prepared.space_id,
                 )
+                updated += 1
+
+            deleted = 0
+            if prune_prefix is not None:
+                deleted = self._prune_documents_in_transaction(prune_prefix, retained or ())
+            if updated or deleted:
+                self.connection.execute(
+                    "UPDATE knowledge_state SET revision = revision + 1, updated_at = ? "
+                    "WHERE singleton_id = 1",
+                    (time.time(),),
+                )
+            self.connection.commit()
+            return updated, deleted
+        except Exception:
+            self.connection.rollback()
+            raise
 
     @staticmethod
     def _terms(query: str) -> list[str]:
@@ -865,24 +951,26 @@ class IndexStore:
             raise ValueError("all retained source_ids must start with prefix")
 
         with self.connection:
-            source_rows = self.connection.execute(
-                "SELECT source_id FROM documents WHERE substr(source_id, 1, ?) = ?",
-                (len(prefix), prefix),
-            ).fetchall()
-            stale_ids = [row[0] for row in source_rows if row[0] not in retained]
-            if not stale_ids:
-                return 0
+            return self._prune_documents_in_transaction(prefix, retained)
 
-            for source_id in stale_ids:
-                if self._fts_available:
-                    chunk_rows = self.connection.execute(
-                        "SELECT id FROM chunks WHERE source_id = ?", (source_id,)
-                    ).fetchall()
-                    self.connection.executemany(
-                        "DELETE FROM chunks_fts WHERE chunk_id = ?",
-                        ((row[0],) for row in chunk_rows),
-                    )
-                self.connection.execute("DELETE FROM documents WHERE source_id = ?", (source_id,))
+    def _prune_documents_in_transaction(
+        self, prefix: str, retained: Collection[str]
+    ) -> int:
+        source_rows = self.connection.execute(
+            "SELECT source_id FROM documents WHERE substr(source_id, 1, ?) = ?",
+            (len(prefix), prefix),
+        ).fetchall()
+        stale_ids = [row[0] for row in source_rows if row[0] not in retained]
+        for source_id in stale_ids:
+            if self._fts_available:
+                chunk_rows = self.connection.execute(
+                    "SELECT id FROM chunks WHERE source_id = ?", (source_id,)
+                ).fetchall()
+                self.connection.executemany(
+                    "DELETE FROM chunks_fts WHERE chunk_id = ?",
+                    ((row[0],) for row in chunk_rows),
+                )
+            self.connection.execute("DELETE FROM documents WHERE source_id = ?", (source_id,))
         return len(stale_ids)
 
     def document_checksum(self, source_id: str) -> str | None:

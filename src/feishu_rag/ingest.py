@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .chunker import chunk_text
 from .logging_utils import configure_logging
-from .store import IndexStore
+from .store import IndexStore, PreparedDocument
 from .semantic_chunker import AtomicUnit, SemanticPlanner, semantic_chunks
 
 
@@ -138,25 +138,31 @@ def extract_sections(path: str | Path, enable_ocr: bool = True) -> list[Section]
     raise UnsupportedFileError(f"不支持的文件格式: {file_path.suffix or '(无扩展名)'}")
 
 
-def index_file(
+def _file_checksum(
+    path: Path,
+    enable_ocr: bool,
+    chunk_strategy_version: str,
+    chunk_model: str,
+) -> str:
+    content_checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+    ocr_cache_mode = str(enable_ocr).lower() if path.suffix.lower() == ".pdf" else "na"
+    return hashlib.sha256(
+        f"{content_checksum}:{chunk_strategy_version}:{chunk_model}:ocr={ocr_cache_mode}".encode("utf-8")
+    ).hexdigest()
+
+
+def _prepare_file(
     path: Path,
     root: Path,
-    store: IndexStore,
     max_chars: int = 900,
     enable_ocr: bool = True,
     semantic_planner: SemanticPlanner | None = None,
     chunk_strategy_version: str = "local-v1",
     chunk_model: str = "",
-) -> bool:
+) -> PreparedDocument | None:
     source_id = path.relative_to(root).as_posix()
     title = path.stem
-    content_checksum = hashlib.sha256(path.read_bytes()).hexdigest()
-    ocr_cache_mode = str(enable_ocr).lower() if path.suffix.lower() == ".pdf" else "na"
-    checksum = hashlib.sha256(
-        f"{content_checksum}:{chunk_strategy_version}:{chunk_model}:ocr={ocr_cache_mode}".encode("utf-8")
-    ).hexdigest()
-    if store.document_checksum(source_id) == checksum:
-        return False
+    checksum = _file_checksum(path, enable_ocr, chunk_strategy_version, chunk_model)
     sections = extract_sections(path, enable_ocr=enable_ocr)
     overlap = max(0, min(120, max_chars // 5))
 
@@ -194,9 +200,37 @@ def index_file(
             )
             chunks = local_chunks()
     if not chunks:
+        return None
+    return PreparedDocument(source_id, title, source_id, checksum, tuple(chunks))
+
+
+def index_file(
+    path: Path,
+    root: Path,
+    store: IndexStore,
+    max_chars: int = 900,
+    enable_ocr: bool = True,
+    semantic_planner: SemanticPlanner | None = None,
+    chunk_strategy_version: str = "local-v1",
+    chunk_model: str = "",
+) -> bool:
+    source_id = path.relative_to(root).as_posix()
+    checksum = _file_checksum(path, enable_ocr, chunk_strategy_version, chunk_model)
+    if store.document_checksum(source_id) == checksum:
         return False
-    store.upsert_document(source_id, title, source_id, checksum, chunks)
-    return True
+    prepared = _prepare_file(
+        path,
+        root,
+        max_chars=max_chars,
+        enable_ocr=enable_ocr,
+        semantic_planner=semantic_planner,
+        chunk_strategy_version=chunk_strategy_version,
+        chunk_model=chunk_model,
+    )
+    if prepared is None:
+        return False
+    updated, _ = store.apply_document_snapshot((prepared,))
+    return bool(updated)
 
 
 def index_directory(
@@ -211,23 +245,28 @@ def index_directory(
     """递归索引目录，返回成功索引的文件数量。"""
 
     root_path = Path(root).resolve()
-    indexed = 0
+    prepared_updates: list[PreparedDocument] = []
     for path in sorted(root_path.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
             continue
-        if index_file(
+        source_id = path.relative_to(root_path).as_posix()
+        checksum = _file_checksum(path, enable_ocr, chunk_strategy_version, chunk_model)
+        if store.document_checksum(source_id) == checksum:
+            continue
+        prepared = _prepare_file(
             path,
             root_path,
-            store,
             max_chars=max_chars,
             enable_ocr=enable_ocr,
             semantic_planner=semantic_planner,
             chunk_strategy_version=chunk_strategy_version,
             chunk_model=chunk_model,
-        ):
-            indexed += 1
-    if indexed:
-        store.bump_knowledge_revision()
+        )
+        if prepared is not None:
+            prepared_updates.append(prepared)
+    if not prepared_updates:
+        return 0
+    indexed, _ = store.apply_document_snapshot(prepared_updates)
     return indexed
 
 

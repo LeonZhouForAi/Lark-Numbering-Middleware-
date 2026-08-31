@@ -529,7 +529,7 @@ class FeishuSyncTests(unittest.TestCase):
             try:
                 with self.assertRaises(RuntimeError):
                     sync_wiki_space("space-1", client, store)
-                self.assertEqual(store.count_documents(), 1)
+                self.assertEqual(store.count_documents(), 0)
                 self.assertEqual(store.knowledge_revision(), 0)
             finally:
                 store.close()
@@ -570,7 +570,7 @@ class FeishuSyncTests(unittest.TestCase):
                 ):
                     with self.assertRaisesRegex(RuntimeError, "download failed"):
                         sync_wiki_space("space-1", client, store)
-                self.assertEqual(store.count_documents(), 1)
+                self.assertEqual(store.count_documents(), 0)
                 self.assertEqual(store.knowledge_revision(), 0)
             finally:
                 store.close()
@@ -614,7 +614,7 @@ class FeishuSyncTests(unittest.TestCase):
                 ):
                     with self.assertRaisesRegex(RuntimeError, "parse failed"):
                         sync_wiki_space("space-1", client, store)
-                self.assertEqual(store.count_documents(), 1)
+                self.assertEqual(store.count_documents(), 0)
                 self.assertEqual(store.knowledge_revision(), 0)
             finally:
                 store.close()

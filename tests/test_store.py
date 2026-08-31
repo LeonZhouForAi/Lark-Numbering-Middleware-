@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from feishu_rag.models import Chunk, RetrievalScope
-from feishu_rag.store import IndexStore, _pretokenize, _tokens
+from feishu_rag.store import IndexStore, PreparedDocument, _pretokenize, _tokens
 
 
 class StoreTests(unittest.TestCase):
@@ -133,6 +133,61 @@ class StoreTests(unittest.TestCase):
                     [Chunk("policy", "policy.txt", "报销制度", "报销内容")],
                 )
                 self.assertEqual(store.knowledge_revision(), 2)
+            finally:
+                store.close()
+
+    def test_apply_document_snapshot_commits_updates_and_revision_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                updates = [
+                    PreparedDocument(
+                        "one.txt",
+                        "第一份",
+                        "one.txt",
+                        "checksum-one",
+                        (Chunk("one", "one.txt", "第一份", "内容一"),),
+                    ),
+                    PreparedDocument(
+                        "two.txt",
+                        "第二份",
+                        "two.txt",
+                        "checksum-two",
+                        (Chunk("two", "two.txt", "第二份", "内容二"),),
+                    ),
+                ]
+
+                self.assertEqual(store.apply_document_snapshot(updates), (2, 0))
+                self.assertEqual(store.count_documents(), 2)
+                self.assertEqual(store.knowledge_revision(), 1)
+            finally:
+                store.close()
+
+    def test_apply_document_snapshot_rolls_back_all_updates_on_commit_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                updates = [
+                    PreparedDocument(
+                        "one.txt",
+                        "第一份",
+                        "one.txt",
+                        "checksum-one",
+                        (Chunk("duplicate", "one.txt", "第一份", "内容一"),),
+                    ),
+                    PreparedDocument(
+                        "two.txt",
+                        "第二份",
+                        "two.txt",
+                        "checksum-two",
+                        (Chunk("duplicate", "two.txt", "第二份", "内容二"),),
+                    ),
+                ]
+
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.apply_document_snapshot(updates)
+                self.assertEqual(store.count_documents(), 0)
+                self.assertEqual(store.knowledge_revision(), 0)
             finally:
                 store.close()
 
