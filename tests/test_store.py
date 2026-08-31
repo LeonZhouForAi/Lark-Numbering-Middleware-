@@ -47,6 +47,155 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_refresh_current_enabled_entry_rejects_without_writing_alias_or_metric(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                observation = FaqObservation("intent", "global", "问题", "source-v1", 0)
+                for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
+                    match = store.record_faq_observation(
+                        observation, answer="答案", day=day, now=1.0, promotion_count=3
+                    )
+                entry_id = match.entry_id
+                before_aliases = [
+                    tuple(row)
+                    for row in store.connection.execute(
+                        "SELECT faq_id,normalized_question,total_seen FROM faq_aliases ORDER BY normalized_question"
+                    ).fetchall()
+                ]
+                before_metrics = [
+                    tuple(row)
+                    for row in store.connection.execute(
+                        "SELECT scope_key,day,refreshes FROM faq_metrics_daily ORDER BY day"
+                    ).fetchall()
+                ]
+                with self.assertRaisesRegex(ValueError, "already current"):
+                    store.refresh_stale_faq(
+                        entry_id, observation, answer="新答案", now=2.0
+                    )
+                self.assertEqual(
+                    tuple(store.connection.execute(
+                        "SELECT answer,state,knowledge_revision FROM faq_entries WHERE id = ?",
+                        (entry_id,),
+                    ).fetchone()),
+                    ("答案", "enabled", 0),
+                )
+                self.assertEqual(
+                    [
+                        tuple(row)
+                        for row in store.connection.execute(
+                            "SELECT faq_id,normalized_question,total_seen FROM faq_aliases ORDER BY normalized_question"
+                        ).fetchall()
+                    ],
+                    before_aliases,
+                )
+                self.assertEqual(
+                    [
+                        tuple(row)
+                        for row in store.connection.execute(
+                            "SELECT scope_key,day,refreshes FROM faq_metrics_daily ORDER BY day"
+                        ).fetchall()
+                    ],
+                    before_metrics,
+                )
+            finally:
+                store.close()
+
+    def test_same_day_distinct_questions_promote_and_keep_each_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                observations = [
+                    FaqObservation("intent", "global", question, "source-v1", 0)
+                    for question in ("问题一", "问题二", "问题三")
+                ]
+                matches = [
+                    store.record_faq_observation(
+                        observation,
+                        answer="答案",
+                        day="2026-08-31",
+                        now=float(index),
+                        promotion_count=3,
+                    )
+                    for index, observation in enumerate(observations, 1)
+                ]
+                self.assertIsNotNone(matches[-1])
+                self.assertEqual(
+                    [
+                        tuple(row)
+                        for row in store.connection.execute(
+                            "SELECT count FROM faq_observation_daily ORDER BY normalized_question"
+                        ).fetchall()
+                    ],
+                    [(1,), (1,), (1,)],
+                )
+                for observation in observations:
+                    self.assertEqual(
+                        len(store.find_faq_candidates("global", observation.normalized_question)),
+                        1,
+                    )
+            finally:
+                store.close()
+
+    def test_legacy_observation_key_without_question_is_rebuilt_without_loss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rag.sqlite3"
+            seed = sqlite3.connect(db_path)
+            seed.executescript(
+                """
+                CREATE TABLE faq_observation_daily (
+                    intent_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    day TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    normalized_question TEXT NOT NULL,
+                    source_signature TEXT NOT NULL,
+                    knowledge_revision INTEGER NOT NULL,
+                    latest_safe_answer TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(scope_key, intent_key, source_signature, knowledge_revision, day)
+                );
+                INSERT INTO faq_observation_daily VALUES(
+                    'intent', 'global', '2026-08-31', 2, '问题', 'source-v1', 0, '答案'
+                );
+                """
+            )
+            seed.commit()
+            seed.close()
+            store = IndexStore(db_path)
+            try:
+                primary_key = [
+                    row[1]
+                    for row in sorted(
+                        (
+                            row
+                            for row in store.connection.execute(
+                                "PRAGMA table_info(faq_observation_daily)"
+                            ).fetchall()
+                            if row[5]
+                        ),
+                        key=lambda row: row[5],
+                    )
+                ]
+                self.assertEqual(
+                    primary_key,
+                    [
+                        "scope_key",
+                        "intent_key",
+                        "normalized_question",
+                        "source_signature",
+                        "knowledge_revision",
+                        "day",
+                    ],
+                )
+                self.assertEqual(
+                    tuple(store.connection.execute(
+                        "SELECT count,normalized_question FROM faq_observation_daily"
+                    ).fetchone()),
+                    (2, "问题"),
+                )
+            finally:
+                store.close()
+
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
             try:

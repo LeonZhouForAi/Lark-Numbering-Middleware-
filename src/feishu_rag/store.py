@@ -76,6 +76,26 @@ CREATE TABLE IF NOT EXISTS faq_aliases (
     PRIMARY KEY(faq_id, normalized_question)
 )
 """
+_FAQ_OBSERVATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS faq_observation_daily (
+    intent_key TEXT NOT NULL,
+    scope_key TEXT NOT NULL,
+    day TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    normalized_question TEXT NOT NULL,
+    source_signature TEXT NOT NULL,
+    knowledge_revision INTEGER NOT NULL,
+    latest_safe_answer TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(
+        scope_key,
+        intent_key,
+        normalized_question,
+        source_signature,
+        knowledge_revision,
+        day
+    )
+)
+"""
 
 
 @dataclass(frozen=True)
@@ -232,21 +252,7 @@ class IndexStore:
                 """,
                 _FAQ_ENTRIES_SCHEMA,
                 _FAQ_ALIASES_SCHEMA,
-                """
-                CREATE TABLE IF NOT EXISTS faq_observation_daily (
-                    intent_key TEXT NOT NULL,
-                    scope_key TEXT NOT NULL,
-                    day TEXT NOT NULL,
-                    count INTEGER NOT NULL DEFAULT 0,
-                    normalized_question TEXT NOT NULL,
-                    source_signature TEXT NOT NULL,
-                    knowledge_revision INTEGER NOT NULL,
-                    latest_safe_answer TEXT NOT NULL DEFAULT '',
-                    PRIMARY KEY(
-                        scope_key, intent_key, source_signature, knowledge_revision, day
-                    )
-                )
-                """,
+                _FAQ_OBSERVATION_SCHEMA,
                 """
                 CREATE TABLE IF NOT EXISTS faq_metrics_daily (
                     scope_key TEXT NOT NULL,
@@ -272,6 +278,7 @@ class IndexStore:
                 "VALUES(1,0,0)"
             )
             self._migrate_faq_entries_constraints()
+            self._migrate_faq_observation_constraints()
 
             document_columns = {
                 row[1]
@@ -807,7 +814,7 @@ class IndexStore:
                 "intent_key,scope_key,day,count,normalized_question,source_signature,"
                 "knowledge_revision,latest_safe_answer"
                 ") VALUES(?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(scope_key,intent_key,source_signature,knowledge_revision,day) "
+                "ON CONFLICT(scope_key,intent_key,normalized_question,source_signature,knowledge_revision,day) "
                 "DO UPDATE SET count = count + 1, "
                 "latest_safe_answer = excluded.latest_safe_answer",
                 (
@@ -994,6 +1001,8 @@ class IndexStore:
                 entry["state"] == "stale"
                 or entry["knowledge_revision"] != observation.knowledge_revision
             )
+            if not should_refresh:
+                raise ValueError("FAQ entry is already current")
             if should_refresh:
                 self.connection.execute(
                     "UPDATE faq_entries SET canonical_question = ?, answer = ?, "
@@ -1111,6 +1120,96 @@ class IndexStore:
         except Exception:
             self.connection.rollback()
             raise
+
+    def _migrate_faq_observation_constraints(self) -> None:
+        table_row = self.connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'faq_observation_daily'"
+        ).fetchone()
+        if table_row is None:
+            return
+
+        columns_info = self.connection.execute(
+            "PRAGMA table_info(faq_observation_daily)"
+        ).fetchall()
+        required_columns = {
+            "intent_key",
+            "scope_key",
+            "day",
+            "count",
+            "normalized_question",
+            "source_signature",
+            "knowledge_revision",
+            "latest_safe_answer",
+        }
+        columns = {row[1] for row in columns_info}
+        if not required_columns.issubset(columns):
+            raise RuntimeError(
+                "faq_observation_daily migration cannot preserve its existing columns"
+            )
+
+        primary_key_columns = [
+            row[1] for row in sorted(
+                (row for row in columns_info if row[5]), key=lambda row: row[5]
+            )
+        ]
+        has_complete_unique_key = primary_key_columns == [
+            "scope_key",
+            "intent_key",
+            "normalized_question",
+            "source_signature",
+            "knowledge_revision",
+            "day",
+        ]
+        if not has_complete_unique_key:
+            for index in self.connection.execute(
+                "PRAGMA index_list(faq_observation_daily)"
+            ).fetchall():
+                if not bool(index[2]) or (len(index) > 4 and bool(index[4])):
+                    continue
+                index_name = str(index[1]).replace('"', '""')
+                index_columns = [
+                    row[2]
+                    for row in self.connection.execute(
+                        f'PRAGMA index_info("{index_name}")'
+                    ).fetchall()
+                ]
+                if index_columns == [
+                    "scope_key",
+                    "intent_key",
+                    "normalized_question",
+                    "source_signature",
+                    "knowledge_revision",
+                    "day",
+                ]:
+                    has_complete_unique_key = True
+                    break
+        if has_complete_unique_key:
+            return
+
+        def quoted(identifier: str) -> str:
+            return '"' + identifier.replace('"', '""') + '"'
+
+        legacy_name = f"faq_observation_daily_legacy_{uuid.uuid4().hex}"
+        self.connection.execute(
+            "DROP INDEX IF EXISTS idx_faq_observation_daily_day"
+        )
+        self.connection.execute(
+            f"ALTER TABLE faq_observation_daily RENAME TO {quoted(legacy_name)}"
+        )
+        self.connection.execute(_FAQ_OBSERVATION_SCHEMA)
+        self.connection.execute(
+            "INSERT INTO faq_observation_daily("
+            "intent_key,scope_key,day,count,normalized_question,source_signature,"
+            "knowledge_revision,latest_safe_answer"
+            f") SELECT intent_key,scope_key,day,count,normalized_question,source_signature,"
+            f"knowledge_revision,latest_safe_answer FROM {quoted(legacy_name)}"
+        )
+        self.connection.execute(f"DROP TABLE {quoted(legacy_name)}")
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_faq_observation_daily_day "
+            "ON faq_observation_daily(day)"
+        )
 
     def _migrate_faq_entries_constraints(self) -> None:
         table_row = self.connection.execute(
