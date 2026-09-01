@@ -251,6 +251,8 @@ def index_directory(
     """递归索引目录，返回成功索引的文件数量。"""
 
     root_path = Path(root).resolve()
+    if not root_path.is_dir():
+        raise FileNotFoundError(f"local root is not a directory: {root_path}")
     prepared_updates: list[PreparedDocument] = []
     retained_source_ids: set[str] = set()
     for path in sorted(root_path.rglob("*")):

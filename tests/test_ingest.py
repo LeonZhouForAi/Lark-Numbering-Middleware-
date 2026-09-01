@@ -491,6 +491,34 @@ class IngestTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_index_directory_rejects_missing_root_without_applying_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "missing"
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.upsert_document(
+                    "legacy.txt", "遗留", "legacy.txt", "v1",
+                    [Chunk("legacy-chunk", "legacy.txt", "遗留", "遗留内容")],
+                )
+                with store.connection:
+                    store.connection.execute(
+                        "INSERT INTO faq_entries(id,intent_key,scope_key,canonical_question,answer,"
+                        "source_signature,source_ids_json,knowledge_revision,state,created_at,updated_at) "
+                        "VALUES ('faq','intent','scope','问题','答案','sig','[]',0,'enabled',1,1)"
+                    )
+                with patch.object(store, "apply_document_snapshot") as apply:
+                    with self.assertRaises(FileNotFoundError):
+                        index_directory(root, store)
+                apply.assert_not_called()
+                self.assertIsNotNone(store.document_checksum("legacy.txt"))
+                self.assertEqual(store.knowledge_revision(), 0)
+                self.assertEqual(
+                    store.connection.execute("SELECT state FROM faq_entries WHERE id='faq'").fetchone()[0],
+                    "enabled",
+                )
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
