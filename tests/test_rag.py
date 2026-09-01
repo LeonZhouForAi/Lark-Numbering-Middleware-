@@ -89,12 +89,27 @@ class BumpingLLM(FakeLLM):
         return result
 
 
+class RevisionCheckUnavailableStore(MutableRevisionStore):
+    def __init__(self, results=None):
+        super().__init__(results)
+        self.revision_reads = 0
+
+    def knowledge_revision(self):
+        self.revision_reads += 1
+        if self.revision_reads in {2, 4}:
+            raise RuntimeError("revision check unavailable")
+        return self.revision
+
+
 class FakeFaqService:
     def __init__(self, match=None):
         self.match = match
         self.lookup_calls = []
         self.describe_calls = []
         self.recorded = []
+        self.rejected_scopes = []
+        self.eligible = []
+        self.rag_answers = []
 
     def lookup(self, question, results, scope):
         self.lookup_calls.append((question, results, scope))
@@ -115,6 +130,18 @@ class FakeFaqService:
     def record_safe_answer(self, observation, answer):
         self.recorded.append((observation, answer))
         return None
+
+    def record_rejected_answer(self, observation):
+        self.rejected_scopes.append(observation.scope_key)
+
+    def record_rejected_scope(self, scope):
+        self.rejected_scopes.append(scope)
+
+    def record_eligible(self, observation):
+        self.eligible.append(observation)
+
+    def record_rag_answer(self, observation):
+        self.rag_answers.append(observation)
 
 
 class FixedObservationFaqService(FakeFaqService):
@@ -167,6 +194,34 @@ def _result(content="报销需要提交发票。"):
 
 
 class RagTests(unittest.TestCase):
+    def test_strict_personal_identifiers_skip_faq_and_do_not_store_question(self):
+        for question in (
+            "张三报销流程",
+            "审批人是张三",
+            "ou_1234567890abcdef",
+            "AB123456",
+        ):
+            with self.subTest(question=question):
+                faq = FakeFaqService()
+                RagService(RecordingStore([_result()]), FakeLLM(), faq_service=faq).answer(question)
+                self.assertEqual(faq.lookup_calls, [])
+                self.assertEqual(faq.describe_calls, [])
+                self.assertEqual(faq.recorded, [])
+                self.assertEqual(faq.rejected_scopes, [None])
+
+    def test_revision_check_failure_retries_once_then_returns_update_message(self):
+        store = RevisionCheckUnavailableStore([_result()])
+        faq = FakeFaqService()
+        llm = FakeLLM()
+
+        answer = RagService(store, llm, faq_service=faq).answer("报销流程")
+
+        self.assertEqual(answer.text, "资料正在更新，请稍后重试。")
+        self.assertEqual(len(store.calls), 2)
+        self.assertEqual(len(llm.calls), 2)
+        self.assertEqual(len(faq.eligible), 1)
+        self.assertEqual(len(faq.rag_answers), 2)
+
     def test_personal_identifier_question_skips_all_faq_operations(self):
         store = RecordingStore([_result()])
         faq = FakeFaqService()

@@ -35,6 +35,8 @@ _PERSONAL_IDENTIFIER_RE = re.compile(
     r"|(?<![A-Za-z0-9])[A-Za-z]\d{5,8}(?![A-Za-z0-9])"
     r"|(?<!\d)1[3-9]\d{9}(?!\d)"
     r"|(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9.-])"
+    r"|(?<![A-Za-z0-9])ou_[0-9a-f]{16}(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])[A-Za-z]{2}\d{6,8}(?![A-Za-z0-9])"
 )
 _COMMON_SURNAMES = (
     "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华"
@@ -43,7 +45,10 @@ _COMMON_SURNAMES = (
     "皮卞齐康伍余元卜顾孟平黄和穆萧尹姚邵湛汪祁毛禹狄米贝明"
 )
 _PERSONAL_NAME_RE = re.compile(
-    rf"(?<![\u4e00-\u9fff])[{_COMMON_SURNAMES}][\u4e00-\u9fff]{{1,3}}\s*的"
+    rf"(?<![\u4e00-\u9fff])[{_COMMON_SURNAMES}][\u4e00-\u9fff]{{1,2}}"
+    r"(?=\s*(?:报销|审批|流程|工号|是|的))"
+    rf"|(?:审批人|负责人|联系人|经办人)\s*(?:是|为|[:：])\s*"
+    rf"[{_COMMON_SURNAMES}][\u4e00-\u9fff]{{1,2}}"
 )
 
 
@@ -291,3 +296,14 @@ class FaqService:
 
     def record_rejected_answer(self, observation: FaqObservation) -> None:
         self._record_metric(observation, "rejected_answers")
+
+    def record_rejected_scope(self, scope: RetrievalScope | None) -> None:
+        if not self.enabled:
+            return
+        scope_key = self._scope_key(scope)
+        if not scope_key:
+            return
+        now = datetime.now(timezone.utc)
+        self.store.record_faq_metric(
+            now.date().isoformat(), "rejected_answers", scope_key=scope_key
+        )

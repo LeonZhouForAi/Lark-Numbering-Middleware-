@@ -200,8 +200,15 @@ class RagService:
             return RagAnswer(f"问题过长，请精简到 {self.question_max_chars} 字以内。", [])
         faq_configured = self.faq_service is not None and bool(
             getattr(self.faq_service, "enabled", True)
-            and not FaqService.contains_personal_identifier(question)
         )
+        personal_question = FaqService.contains_personal_identifier(question)
+        if faq_configured and personal_question:
+            try:
+                self.faq_service.record_rejected_scope(scope)
+            except Exception:
+                pass
+            faq_configured = False
+        eligible_recorded = False
         for attempt in range(2):
             faq_active = faq_configured
             snapshot_revision = None
@@ -233,10 +240,12 @@ class RagService:
                         knowledge_revision=snapshot_revision,
                     )
                     if observation is not None:
-                        try:
-                            self.faq_service.record_eligible(observation)
-                        except Exception:
-                            pass
+                        if not eligible_recorded:
+                            eligible_recorded = True
+                            try:
+                                self.faq_service.record_eligible(observation)
+                            except Exception:
+                                pass
                         lookup_observation = getattr(
                             self.faq_service, "lookup_observation", None
                         )
@@ -277,14 +286,15 @@ class RagService:
                 self.llm.complete_json(system_prompt, user_prompt, purpose="answer")
             )
             if faq_active and observation is not None:
+                revision_confirmed = True
                 try:
                     current_revision = self.store.knowledge_revision()
                 except Exception as exc:
                     logger.warning(
                         "faq_revision_check_failed error_type=%s", type(exc).__name__
                     )
-                    current_revision = snapshot_revision
-                if current_revision != snapshot_revision:
+                    revision_confirmed = False
+                if not revision_confirmed or current_revision != snapshot_revision:
                     if attempt == 0:
                         continue
                     return RagAnswer(UPDATING_ANSWER, [])
@@ -296,16 +306,20 @@ class RagService:
                         pass
                 return RagAnswer(INSUFFICIENT_ANSWER, citations)
             cleaned = self._clean_answer(generated)
-            if cleaned == UNSAFE_ANSWER:
+            if cleaned in {INSUFFICIENT_ANSWER, UNSAFE_ANSWER}:
                 if faq_active and observation is not None:
                     try:
                         self.faq_service.record_rejected_answer(observation)
                     except Exception:
                         pass
+            elif faq_active and observation is not None and FaqService.contains_personal_identifier(cleaned):
+                try:
+                    self.faq_service.record_rejected_answer(observation)
+                except Exception:
+                    pass
             elif (
                 faq_active
                 and observation is not None
-                and not FaqService.contains_personal_identifier(cleaned)
             ):
                 try:
                     self.faq_service.record_safe_answer(observation, cleaned)
