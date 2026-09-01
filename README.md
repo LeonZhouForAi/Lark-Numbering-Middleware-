@@ -1,6 +1,6 @@
 # 飞书 + DeepSeek RAG 机器人
 
-这是一个面向公司 Ubuntu 服务器部署的轻量 RAG 服务：文档先在本地解析，再由 DeepSeek 可选地优化语义切片，飞书自建应用负责接收员工问题并回复。当前 v0.4.0 已完成代码与测试，尚未部署生产环境。
+这是一个面向公司 Ubuntu 服务器部署的轻量 RAG 服务：文档先在本地解析，再由 DeepSeek 可选地优化语义切片，飞书自建应用负责接收员工问题并回复。当前 v0.5.0 为开发候选版本，代码与测试已完成，尚未部署生产环境。
 
 ## 目录
 
@@ -168,7 +168,7 @@ python -m feishu_rag.sync --db data/rag.sqlite3
 python scripts/report_usage.py data/rag.sqlite3 --input-price 1 --output-price 2
 ```
 
-FAQ 运维指标仅输出按日期和匿名范围聚合的数量（不包含问题、答案、来源或员工身份）：
+FAQ 运维指标仅输出按日期和匿名范围聚合的数量（不包含问题、答案、来源或员工身份）；日报中的 `rag_answers` 是模型请求尝试数，`rejected_answers` 是因安全/证据校验拒绝的回答数：
 
 ```bash
 python scripts/report_faq.py data/rag.sqlite3
@@ -211,7 +211,7 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 
 - `.env`、SQLite 数据库和 `documents/` 均不提交 Git。
 - API Key 和 App Secret 只从环境变量读取，日志和对象 repr 不包含密钥。
-- 员工可见回答会拦截密码、口令、密钥、API 密钥、访问令牌等中英文凭据标签和值，并返回固定安全提示。
+- FAQ 为加速会存储经过 PII 过滤的归一化意图、答案和资料特征；报表和日志不输出问题、答案、来源或员工身份。员工可见回答会拦截密码、口令、密钥、API 密钥、访问令牌等中英文凭据标签和值，并返回固定安全提示。
 - Webhook 开启 Encrypt Key 后强制校验签名。
 - 语义切片开启时，完整文档会在索引阶段按批次发送给 DeepSeek；回答阶段只发送命中的原始片段。
 - 切片策略版本固定为 `hybrid-v4`；修改策略版本后应重新索引现有文档。
@@ -227,6 +227,6 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 - 缺少 API Key 时服务健康检查报配置不完整，且不会发起外部请求。
 - 回滚预检不修改数据库；带 `--execute` 才会创建独占备份并移除 v2 FTS。
 
-v0.4.0 发布状态：代码与测试已完成，尚未部署生产；仍使用 SQLite（含 FTS5/BM25）和 `hybrid-v4`，没有引入向量数据库。
+v0.5.0 开发候选发布状态：代码与测试已完成，尚未部署生产；仍使用 SQLite（含 FTS5/BM25）和 `hybrid-v4`，没有引入向量数据库。
 
 长连接适配器依赖 `lark-oapi==1.7.3` 的私有 ACK 契约。升级 SDK 必须显式修改锁定版本，并通过 `tests/test_lark_sdk_contract.py` 的真实 SDK 合约测试后才能发布。

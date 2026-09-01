@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import time
 
 import pytest
 
@@ -71,6 +73,26 @@ def test_report_faq_promotion_count_option_changes_summary(tmp_path, capsys, mon
     output = capsys.readouterr().out
     summary = json.loads(next(line.split("\t", 1)[1] for line in output.splitlines() if line.startswith("summary\t")))
     assert summary["hot_intents"] == 2
+
+
+def test_report_faq_is_read_only_and_does_not_migrate(tmp_path, capsys):
+    db = tmp_path / "rag.sqlite3"
+    _seed(db)
+    before = (db.stat().st_mtime_ns, sqlite3.connect(db).execute(
+        "SELECT sql FROM sqlite_master WHERE name='faq_entries'"
+    ).fetchone()[0])
+    time.sleep(0.01)
+    assert report_main([str(db)]) == 0
+    capsys.readouterr()
+    after = (db.stat().st_mtime_ns, sqlite3.connect(db).execute(
+        "SELECT sql FROM sqlite_master WHERE name='faq_entries'"
+    ).fetchone()[0])
+    assert after == before
+    ro = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    ro.execute("PRAGMA query_only=ON")
+    with pytest.raises(sqlite3.OperationalError):
+        ro.execute("CREATE TABLE should_not_exist(value TEXT)")
+    ro.close()
 
 
 def test_summary_does_not_combine_observations_across_source_versions(tmp_path):
