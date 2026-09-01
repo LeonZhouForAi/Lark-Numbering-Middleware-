@@ -198,6 +198,8 @@ class RagService:
             return RagAnswer("请输入要查询的问题。", [])
         if len(question) > self.question_max_chars:
             return RagAnswer(f"问题过长，请精简到 {self.question_max_chars} 字以内。", [])
+        revision_reader = getattr(self.store, "knowledge_revision", None)
+        revision_supported = callable(revision_reader)
         faq_configured = self.faq_service is not None and bool(
             getattr(self.faq_service, "enabled", True)
         )
@@ -212,14 +214,17 @@ class RagService:
         for attempt in range(2):
             faq_active = faq_configured
             snapshot_revision = None
-            if faq_active:
+            snapshot_confirmed = True
+            if revision_supported:
                 try:
                     snapshot_revision = self.store.knowledge_revision()
                 except Exception as exc:
                     logger.warning(
                         "faq_snapshot_failed error_type=%s", type(exc).__name__
                     )
-                    faq_active = False
+                    snapshot_confirmed = False
+            if faq_active and not snapshot_confirmed:
+                faq_active = False
             results = self.store.search(
                 question,
                 top_k=self.top_k,
@@ -285,7 +290,7 @@ class RagService:
             generated, evidence_sufficient = self._validated_answer(
                 self.llm.complete_json(system_prompt, user_prompt, purpose="answer")
             )
-            if faq_active and observation is not None:
+            if revision_supported:
                 revision_confirmed = True
                 try:
                     current_revision = self.store.knowledge_revision()
@@ -294,7 +299,11 @@ class RagService:
                         "faq_revision_check_failed error_type=%s", type(exc).__name__
                     )
                     revision_confirmed = False
-                if not revision_confirmed or current_revision != snapshot_revision:
+                if (
+                    not revision_confirmed
+                    or not snapshot_confirmed
+                    or current_revision != snapshot_revision
+                ):
                     if attempt == 0:
                         continue
                     return RagAnswer(UPDATING_ANSWER, [])

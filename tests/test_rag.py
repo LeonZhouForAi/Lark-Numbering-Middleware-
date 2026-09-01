@@ -194,11 +194,47 @@ def _result(content="报销需要提交发票。"):
 
 
 class RagTests(unittest.TestCase):
+    def test_name_context_blocks_pii_but_not制度_phrases(self):
+        for question in (
+            "帮我查张三的报销流程",
+            "张三需要怎么报销",
+            "审批人是张三",
+            "请联系张三办理",
+        ):
+            with self.subTest(question=question):
+                faq = FakeFaqService()
+                RagService(RecordingStore([_result()]), FakeLLM(), faq_service=faq).answer(question)
+                self.assertEqual(faq.describe_calls, [])
+        for question in ("费用的报销流程", "安全的审批流程", "高效的流程"):
+            with self.subTest(question=question):
+                faq = FakeFaqService()
+                RagService(RecordingStore([_result()]), FakeLLM(), faq_service=faq).answer(question)
+                self.assertEqual(len(faq.describe_calls), 1)
+
+    def test_pii_and_disabled_requests_still_retry_on_revision_change(self):
+        for question, faq in (
+            ("张三需要怎么报销", FakeFaqService()),
+            ("报销流程", type("DisabledFaq", (), {"enabled": False})()),
+        ):
+            with self.subTest(question=question):
+                store = MutableRevisionStore([_result()])
+                llm = BumpingLLM(
+                    store,
+                    [
+                        {"answer": "旧答案", "evidence_sufficient": True},
+                        {"answer": "新答案", "evidence_sufficient": True},
+                    ],
+                )
+                answer = RagService(store, llm, faq_service=faq).answer(question)
+                self.assertEqual(answer.text, "新答案")
+                self.assertEqual(len(llm.calls), 2)
+
     def test_strict_personal_identifiers_skip_faq_and_do_not_store_question(self):
         for question in (
             "张三报销流程",
             "审批人是张三",
             "ou_1234567890abcdef",
+            "ou_1234567890abcdef1234567890abcdef",
             "AB123456",
         ):
             with self.subTest(question=question):
@@ -365,9 +401,9 @@ class RagTests(unittest.TestCase):
 
         answer = RagService(store, llm, faq_service=faq).answer("报销流程")
 
-        self.assertEqual(answer.text, "根据制度,员工需要先提交申请。")
-        self.assertEqual(len(store.calls), 1)
-        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(answer.text, "资料正在更新，请稍后重试。")
+        self.assertEqual(len(store.calls), 2)
+        self.assertEqual(len(llm.calls), 2)
         self.assertEqual(faq.lookup_calls, [])
         self.assertEqual(faq.describe_calls, [])
         self.assertEqual(faq.recorded, [])
