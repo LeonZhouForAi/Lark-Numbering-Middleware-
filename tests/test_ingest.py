@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import hashlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ from feishu_rag.ingest import (
     index_directory,
 )
 from feishu_rag.store import IndexStore
+from feishu_rag.models import Chunk
 
 
 class IngestTests(unittest.TestCase):
@@ -377,6 +379,115 @@ class IngestTests(unittest.TestCase):
                         index_directory(root, store)
                 self.assertEqual(store.count_documents(), 0)
                 self.assertEqual(store.knowledge_revision(), 0)
+            finally:
+                store.close()
+
+    def test_index_directory_prunes_deleted_files_and_invalidates_old_faqs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "docs"
+            root.mkdir()
+            first = root / "one.txt"
+            second = root / "two.txt"
+            first.write_text("第一份制度。", encoding="utf-8")
+            second.write_text("第二份制度。", encoding="utf-8")
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                self.assertEqual(index_directory(root, store), 2)
+                namespace = hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()
+                source_id = f"local:{namespace}:two.txt"
+                self.assertIsNotNone(store.document_checksum(source_id))
+                with store.connection:
+                    store.connection.execute(
+                        "INSERT INTO faq_entries(id,intent_key,scope_key,canonical_question,answer,"
+                        "source_signature,source_ids_json,knowledge_revision,state,created_at,updated_at) "
+                        "VALUES ('faq','intent','scope','问题','答案','sig','[]',1,'enabled',1,1)"
+                    )
+                first.unlink()
+
+                self.assertEqual(index_directory(root, store), 0)
+                self.assertEqual(store.knowledge_revision(), 2)
+                self.assertIsNone(store.document_checksum(f"local:{namespace}:one.txt"))
+                self.assertEqual(store.count_chunks(f"local:{namespace}:one.txt"), 0)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM chunks_fts WHERE chunk_id NOT IN "
+                        "(SELECT id FROM chunks)"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    store.connection.execute("SELECT state FROM faq_entries WHERE id='faq'").fetchone()[0],
+                    "stale",
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT invalidations FROM faq_metrics_daily WHERE scope_key='scope'"
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                store.close()
+
+    def test_first_local_snapshot_removes_legacy_ids_but_roots_do_not_interfere(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root_one = Path(tmp) / "one"
+            root_two = Path(tmp) / "two"
+            root_one.mkdir()
+            root_two.mkdir()
+            (root_one / "one.txt").write_text("一", encoding="utf-8")
+            (root_two / "two.txt").write_text("二", encoding="utf-8")
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.upsert_document(
+                    "legacy.txt", "遗留", "legacy.txt", "v1", [
+                        Chunk("legacy-chunk", "legacy.txt", "遗留", "遗留内容")
+                    ]
+                )
+                self.assertEqual(index_directory(root_one, store), 1)
+                self.assertIsNone(store.document_checksum("legacy.txt"))
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM chunks_fts WHERE chunk_id = 'legacy-chunk'"
+                    ).fetchone()[0],
+                    0,
+                )
+                store.upsert_document(
+                    "legacy-again.txt", "遗留", "legacy-again.txt", "v1", [
+                        Chunk("legacy-again-chunk", "legacy-again.txt", "遗留", "遗留内容")
+                    ]
+                )
+                self.assertEqual(index_directory(root_two, store), 1)
+                self.assertIsNotNone(store.document_checksum("legacy-again.txt"))
+                (root_two / "two.txt").unlink()
+                self.assertEqual(index_directory(root_two, store), 0)
+                namespace_one = hashlib.sha256(str(root_one.resolve()).encode("utf-8")).hexdigest()
+                self.assertIsNotNone(store.document_checksum(f"local:{namespace_one}:one.txt"))
+            finally:
+                store.close()
+
+    def test_local_snapshot_failure_does_not_prune_or_bump(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "docs"
+            root.mkdir()
+            first = root / "one.txt"
+            second = root / "two.txt"
+            first.write_text("第一份制度。", encoding="utf-8")
+            second.write_text("第二份制度。", encoding="utf-8")
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                self.assertEqual(index_directory(root, store), 2)
+                revision = store.knowledge_revision()
+                first.unlink()
+                second.write_text("第二份制度更新。", encoding="utf-8")
+                with patch(
+                    "feishu_rag.ingest.extract_sections",
+                    side_effect=RuntimeError("index failed"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "index failed"):
+                        index_directory(root, store)
+                namespace = hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()
+                self.assertIsNotNone(store.document_checksum(f"local:{namespace}:one.txt"))
+                self.assertEqual(store.knowledge_revision(), revision)
             finally:
                 store.close()
 

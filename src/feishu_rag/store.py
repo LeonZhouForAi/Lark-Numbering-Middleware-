@@ -35,6 +35,7 @@ _GENERIC_TERMS = ("流程", "制度", "规定", "办法")
 _GENERIC_RESIDUALS = frozenset({"这", "那", "呢", "都", "是", "有", "要", "吗", "么", "的", "了"})
 _QUERY_STOP_WORDS = frozenset({"and", "or", "not", "near"})
 _FEISHU_SOURCE_RE = re.compile(r"^feishu:([^:]+):")
+_LOCAL_SOURCE_RE = re.compile(r"^local:([0-9a-f]{64}):")
 _SQLITE_INT_MAX = 2**63 - 1
 _LOCK_RETRY_ATTEMPTS = 20
 _FAQ_PROMOTION_COUNT = 3
@@ -47,6 +48,7 @@ _FAQ_METRIC_FIELDS = frozenset(
         "promotions",
         "refreshes",
         "rejected_answers",
+        "invalidations",
     }
 )
 
@@ -261,6 +263,14 @@ class IndexStore:
                     updated_at REAL NOT NULL
                 )
                 """,
+                """
+                CREATE TABLE IF NOT EXISTS local_index_roots (
+                    root_key TEXT PRIMARY KEY,
+                    root_path TEXT NOT NULL,
+                    registered_at REAL NOT NULL,
+                    last_snapshot_at REAL NOT NULL
+                )
+                """,
                 _FAQ_ENTRIES_SCHEMA,
                 _FAQ_ALIASES_SCHEMA,
                 _FAQ_OBSERVATION_SCHEMA,
@@ -274,6 +284,7 @@ class IndexStore:
                     promotions INTEGER NOT NULL DEFAULT 0,
                     refreshes INTEGER NOT NULL DEFAULT 0,
                     rejected_answers INTEGER NOT NULL DEFAULT 0,
+                    invalidations INTEGER NOT NULL DEFAULT 0 CHECK(invalidations >= 0),
                     PRIMARY KEY(scope_key, day)
                 )
                 """,
@@ -288,6 +299,17 @@ class IndexStore:
                 "INSERT OR IGNORE INTO knowledge_state(singleton_id,revision,updated_at) "
                 "VALUES(1,0,0)"
             )
+            metric_columns = {
+                row[1]
+                for row in self.connection.execute(
+                    "PRAGMA table_info(faq_metrics_daily)"
+                ).fetchall()
+            }
+            if "invalidations" not in metric_columns:
+                self.connection.execute(
+                    "ALTER TABLE faq_metrics_daily ADD COLUMN invalidations "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK(invalidations >= 0)"
+                )
             self._migrate_faq_entries_constraints()
             self._migrate_faq_observation_constraints()
 
@@ -476,11 +498,23 @@ class IndexStore:
         *,
         prune_prefix: str | None = None,
         retained: Collection[str] | None = None,
+        local_root: str | Path | None = None,
     ) -> tuple[int, int]:
         updates = tuple(prepared_updates)
+        local_root_hash: str | None = None
+        if local_root is not None:
+            if prune_prefix is not None:
+                raise ValueError("local_root cannot be combined with prune_prefix")
+            if retained is None:
+                raise ValueError("retained is required when local_root is provided")
+            resolved_root = str(Path(local_root).resolve())
+            local_root_hash = sha256(resolved_root.encode("utf-8")).hexdigest()
+            prune_prefix = f"local:{local_root_hash}:"
         if prune_prefix is not None:
-            if re.fullmatch(r"feishu:[^:]+:", prune_prefix) is None:
-                raise ValueError("prefix must identify one Feishu space")
+            is_feishu_prefix = re.fullmatch(r"feishu:[^:]+:", prune_prefix) is not None
+            is_local_prefix = _LOCAL_SOURCE_RE.fullmatch(prune_prefix) is not None
+            if not (is_feishu_prefix or is_local_prefix):
+                raise ValueError("prefix must identify one Feishu space or local root")
             if retained is None:
                 raise ValueError("retained is required when prune_prefix is provided")
             if any(not source_id.startswith(prune_prefix) for source_id in retained):
@@ -516,12 +550,61 @@ class IndexStore:
             deleted = 0
             if prune_prefix is not None:
                 deleted = self._prune_documents_in_transaction(prune_prefix, retained or ())
+            if local_root_hash is not None:
+                any_registry = self.connection.execute(
+                    "SELECT 1 FROM local_index_roots LIMIT 1",
+                ).fetchone()
+                registry = self.connection.execute(
+                    "SELECT 1 FROM local_index_roots WHERE root_key = ?",
+                    (local_root_hash,),
+                ).fetchone()
+                resolved_root = str(Path(local_root).resolve())
+                timestamp = time.time()
+                if any_registry is None:
+                    legacy_rows = self.connection.execute(
+                        "SELECT source_id FROM documents"
+                    ).fetchall()
+                    legacy_ids = [
+                        str(row[0])
+                        for row in legacy_rows
+                        if not str(row[0]).startswith(("feishu:", "local:"))
+                    ]
+                    for source_id in legacy_ids:
+                        chunk_rows = self.connection.execute(
+                            "SELECT id FROM chunks WHERE source_id = ?", (source_id,)
+                        ).fetchall()
+                        if self._fts_available:
+                            self.connection.executemany(
+                                "DELETE FROM chunks_fts WHERE chunk_id = ?",
+                                ((row[0],) for row in chunk_rows),
+                            )
+                        self.connection.execute(
+                            "DELETE FROM documents WHERE source_id = ?", (source_id,)
+                        )
+                    deleted += len(legacy_ids)
+                    self.connection.execute(
+                        "INSERT INTO local_index_roots(root_key,root_path,registered_at,last_snapshot_at) "
+                        "VALUES(?,?,?,?)",
+                        (local_root_hash, resolved_root, timestamp, timestamp),
+                    )
+                elif registry is None:
+                    self.connection.execute(
+                        "INSERT INTO local_index_roots(root_key,root_path,registered_at,last_snapshot_at) "
+                        "VALUES(?,?,?,?)",
+                        (local_root_hash, resolved_root, timestamp, timestamp),
+                    )
+                else:
+                    self.connection.execute(
+                        "UPDATE local_index_roots SET last_snapshot_at = ? WHERE root_key = ?",
+                        (timestamp, local_root_hash),
+                    )
             if updated or deleted:
-                self.connection.execute(
+                revision_row = self.connection.execute(
                     "UPDATE knowledge_state SET revision = revision + 1, updated_at = ? "
-                    "WHERE singleton_id = 1",
+                    "WHERE singleton_id = 1 RETURNING revision",
                     (time.time(),),
-                )
+                ).fetchone()
+                self._invalidate_faqs_in_transaction(int(revision_row[0]), time.time())
             self.connection.commit()
             return updated, deleted
         except Exception:
@@ -1106,6 +1189,10 @@ class IndexStore:
                 "INSERT INTO faq_metrics_daily(scope_key,day,refreshes) VALUES(?,?,1) "
                 "ON CONFLICT(scope_key,day) DO UPDATE SET refreshes = refreshes + 1"
             ),
+            "invalidations": (
+                "INSERT INTO faq_metrics_daily(scope_key,day,invalidations) VALUES(?,?,1) "
+                "ON CONFLICT(scope_key,day) DO UPDATE SET invalidations = invalidations + 1"
+            ),
             "rejected_answers": (
                 "INSERT INTO faq_metrics_daily(scope_key,day,rejected_answers) VALUES(?,?,1) "
                 "ON CONFLICT(scope_key,day) DO UPDATE SET rejected_answers = rejected_answers + 1"
@@ -1178,7 +1265,7 @@ class IndexStore:
             self._validate_faq_day(since_day)
         statement = (
             "SELECT scope_key,day,eligible_questions,rag_answers,direct_hits,promotions,"
-            "refreshes,rejected_answers FROM faq_metrics_daily"
+            "refreshes,rejected_answers,invalidations FROM faq_metrics_daily"
         )
         parameters: tuple[object, ...] = ()
         if since_day is not None:
@@ -1745,6 +1832,29 @@ class IndexStore:
                 )
             self.connection.execute("DELETE FROM documents WHERE source_id = ?", (source_id,))
         return len(stale_ids)
+
+    def _invalidate_faqs_in_transaction(self, revision: int, timestamp: float) -> int:
+        rows = self.connection.execute(
+            "SELECT scope_key, COUNT(*) AS count FROM faq_entries "
+            "WHERE state = 'enabled' AND knowledge_revision < ? GROUP BY scope_key",
+            (revision,),
+        ).fetchall()
+        invalidated = sum(int(row["count"]) for row in rows)
+        if not invalidated:
+            return 0
+        self.connection.execute(
+            "UPDATE faq_entries SET state = 'stale', updated_at = ? "
+            "WHERE state = 'enabled' AND knowledge_revision < ?",
+            (timestamp, revision),
+        )
+        metric_day = datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+        for row in rows:
+            self.connection.execute(
+                "INSERT INTO faq_metrics_daily(scope_key,day,invalidations) VALUES(?,?,?) "
+                "ON CONFLICT(scope_key,day) DO UPDATE SET invalidations = invalidations + excluded.invalidations",
+                (row["scope_key"], metric_day, int(row["count"])),
+            )
+        return invalidated
 
     def document_checksum(self, source_id: str) -> str | None:
         row = self.connection.execute(

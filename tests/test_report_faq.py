@@ -44,6 +44,7 @@ def test_report_faq_outputs_only_aggregate_metrics(tmp_path, capsys):
     assert report_main([str(db)]) == 0
     output = capsys.readouterr().out
     assert "direct_hits" in output
+    assert "invalidations" in output
     assert "direct_hit_rate" in output
     assert "标准答案" not in output
     assert "内部问题" not in output

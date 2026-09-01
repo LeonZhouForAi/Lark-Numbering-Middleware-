@@ -1119,6 +1119,42 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_apply_document_snapshot_invalidates_enabled_faqs_and_reports_metric(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.upsert_document(
+                    "feishu:space:old", "旧", "old", "v1",
+                    [Chunk("old-chunk", "feishu:space:old", "旧", "旧内容")],
+                )
+                with store.connection:
+                    store.connection.execute(
+                        "INSERT INTO faq_entries(id,intent_key,scope_key,canonical_question,answer,"
+                        "source_signature,source_ids_json,knowledge_revision,state,created_at,updated_at) "
+                        "VALUES ('faq','intent','scope','问题','答案','sig','[]',0,'enabled',1,1)"
+                    )
+                updated, deleted = store.apply_document_snapshot(
+                    [PreparedDocument(
+                        "feishu:space:new", "新", "new", "v1",
+                        (Chunk("new-chunk", "feishu:space:new", "新", "新内容"),),
+                    )],
+                    prune_prefix="feishu:space:",
+                    retained={"feishu:space:new"},
+                )
+                self.assertEqual((updated, deleted), (1, 1))
+                self.assertEqual(store.knowledge_revision(), 1)
+                self.assertEqual(
+                    store.connection.execute("SELECT state FROM faq_entries WHERE id='faq'").fetchone()[0],
+                    "stale",
+                )
+                self.assertEqual(
+                    store.query_faq_metrics()[0]["invalidations"],
+                    1,
+                )
+                self.assertEqual(store.record_faq_metric("2026-09-01", "invalidations", scope_key="x"), None)
+            finally:
+                store.close()
+
     def test_apply_document_snapshot_rolls_back_all_updates_on_commit_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = IndexStore(Path(tmp) / "rag.sqlite3")
@@ -1145,6 +1181,85 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(store.count_documents(), 0)
                 self.assertEqual(store.knowledge_revision(), 0)
             finally:
+                store.close()
+
+    def test_first_local_snapshot_failure_rolls_back_legacy_cleanup_and_root_registration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.upsert_document(
+                    "legacy.txt", "遗留", "legacy.txt", "v1",
+                    [Chunk("legacy-chunk", "legacy.txt", "遗留", "遗留内容")],
+                )
+                root = Path(tmp) / "root"
+                root_hash = sha256(str(root.resolve()).encode("utf-8")).hexdigest()
+                updates = [
+                    PreparedDocument(
+                        f"local:{root_hash}:one.txt", "一", "one.txt", "v1",
+                        (Chunk("duplicate", f"local:{root_hash}:one.txt", "一", "内容一"),),
+                    ),
+                    PreparedDocument(
+                        f"local:{root_hash}:two.txt", "二", "two.txt", "v1",
+                        (Chunk("duplicate", f"local:{root_hash}:two.txt", "二", "内容二"),),
+                    ),
+                ]
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.apply_document_snapshot(updates, local_root=root, retained={item.source_id for item in updates})
+                self.assertIsNotNone(store.document_checksum("legacy.txt"))
+                self.assertEqual(
+                    store.connection.execute("SELECT COUNT(*) FROM local_index_roots").fetchone()[0],
+                    0,
+                )
+                self.assertEqual(store.knowledge_revision(), 0)
+            finally:
+                store.close()
+
+    def test_first_local_snapshot_commit_failure_rolls_back_legacy_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            real_connection = store.connection
+            try:
+                store.upsert_document(
+                    "legacy.txt", "遗留", "legacy.txt", "v1",
+                    [Chunk("legacy-chunk", "legacy.txt", "遗留", "遗留内容")],
+                )
+
+                class FailingCommitConnection:
+                    def execute(self, statement, parameters=()):
+                        return real_connection.execute(statement, parameters)
+
+                    def commit(self):
+                        raise sqlite3.OperationalError("simulated commit failure")
+
+                    def rollback(self):
+                        return real_connection.rollback()
+
+                    def __getattr__(self, name):
+                        return getattr(real_connection, name)
+
+                store.connection = FailingCommitConnection()
+                root = Path(tmp) / "root"
+                root_hash = sha256(str(root.resolve()).encode("utf-8")).hexdigest()
+                source_id = f"local:{root_hash}:one.txt"
+                with self.assertRaises(sqlite3.OperationalError):
+                    store.apply_document_snapshot(
+                        [PreparedDocument(
+                            source_id, "一", "one.txt", "v1",
+                            (Chunk("one-chunk", source_id, "一", "内容一"),),
+                        )],
+                        local_root=root,
+                        retained={source_id},
+                    )
+                store.connection = real_connection
+                self.assertIsNotNone(store.document_checksum("legacy.txt"))
+                self.assertIsNone(store.document_checksum(source_id))
+                self.assertEqual(
+                    store.connection.execute("SELECT COUNT(*) FROM local_index_roots").fetchone()[0],
+                    0,
+                )
+                self.assertEqual(store.knowledge_revision(), 0)
+            finally:
+                store.connection = real_connection
                 store.close()
 
     def test_knowledge_revision_bump_rolls_back_when_commit_fails(self):

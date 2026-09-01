@@ -46,7 +46,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary = store.query_faq_summary(cutoff_day=cutoff_day, promotion_count=args.promotion_count)
     finally:
         store.close()
-    print("day\tscope_key\teligible_questions\trag_answers\tdirect_hits\tdirect_hit_rate\tpromotions\trefreshes\trejected_answers")
+    print("day\tscope_key\teligible_questions\trag_answers\tdirect_hits\tdirect_hit_rate\tpromotions\trefreshes\trejected_answers\tinvalidations")
     for row in rows:
         eligible_questions = int(row["eligible_questions"])
         rag_answers = int(row["rag_answers"])
@@ -62,6 +62,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "promotions": int(row["promotions"]),
             "refreshes": int(row["refreshes"]),
             "rejected_answers": int(row["rejected_answers"]),
+            "invalidations": int(row["invalidations"]),
         }
         print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
     print("summary\t" + json.dumps(summary, separators=(",", ":")))

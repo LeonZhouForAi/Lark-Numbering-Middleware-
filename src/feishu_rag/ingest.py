@@ -151,6 +151,11 @@ def _file_checksum(
     ).hexdigest()
 
 
+def _local_source_id(root: Path, relative_path: str) -> str:
+    root_hash = hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()
+    return f"local:{root_hash}:{relative_path}"
+
+
 def _prepare_file(
     path: Path,
     root: Path,
@@ -160,7 +165,8 @@ def _prepare_file(
     chunk_strategy_version: str = "local-v1",
     chunk_model: str = "",
 ) -> PreparedDocument | None:
-    source_id = path.relative_to(root).as_posix()
+    relative_path = path.relative_to(root).as_posix()
+    source_id = _local_source_id(root, relative_path)
     title = path.stem
     checksum = _file_checksum(path, enable_ocr, chunk_strategy_version, chunk_model)
     sections = extract_sections(path, enable_ocr=enable_ocr)
@@ -201,7 +207,7 @@ def _prepare_file(
             chunks = local_chunks()
     if not chunks:
         return None
-    return PreparedDocument(source_id, title, source_id, checksum, tuple(chunks))
+    return PreparedDocument(source_id, title, relative_path, checksum, tuple(chunks))
 
 
 def index_file(
@@ -214,7 +220,7 @@ def index_file(
     chunk_strategy_version: str = "local-v1",
     chunk_model: str = "",
 ) -> bool:
-    source_id = path.relative_to(root).as_posix()
+    source_id = _local_source_id(root, path.relative_to(root).as_posix())
     checksum = _file_checksum(path, enable_ocr, chunk_strategy_version, chunk_model)
     if store.document_checksum(source_id) == checksum:
         return False
@@ -246,12 +252,18 @@ def index_directory(
 
     root_path = Path(root).resolve()
     prepared_updates: list[PreparedDocument] = []
+    retained_source_ids: set[str] = set()
     for path in sorted(root_path.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
             continue
-        source_id = path.relative_to(root_path).as_posix()
+        relative_path = path.relative_to(root_path).as_posix()
+        source_id = _local_source_id(root_path, relative_path)
         checksum = _file_checksum(path, enable_ocr, chunk_strategy_version, chunk_model)
         if store.document_checksum(source_id) == checksum:
+            prepared_updates.append(
+                PreparedDocument(source_id, path.stem, relative_path, checksum, None)
+            )
+            retained_source_ids.add(source_id)
             continue
         prepared = _prepare_file(
             path,
@@ -264,9 +276,12 @@ def index_directory(
         )
         if prepared is not None:
             prepared_updates.append(prepared)
-    if not prepared_updates:
-        return 0
-    indexed, _ = store.apply_document_snapshot(prepared_updates)
+            retained_source_ids.add(prepared.source_id)
+    indexed, _ = store.apply_document_snapshot(
+        prepared_updates,
+        local_root=root_path,
+        retained=retained_source_ids,
+    )
     return indexed
 
 
