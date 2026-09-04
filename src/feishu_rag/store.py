@@ -1388,6 +1388,19 @@ class IndexStore:
             ).fetchall()
         )
 
+    def structured_fact_rows(self, fact_type: str) -> list[sqlite3.Row]:
+        if fact_type not in {"upph", "series_hours", "part_hours"}:
+            raise ValueError("invalid fact_type")
+        return list(
+            self.connection.execute(
+                "SELECT source_id,sheet_name,row_number,fact_type,part_number,"
+                "series_name,process_stage,operation_name,metric_name,numeric_value,"
+                "text_value,unit FROM structured_facts WHERE fact_type=? "
+                "ORDER BY source_id,sheet_name,row_number,id",
+                (fact_type,),
+            ).fetchall()
+        )
+
     def knowledge_revision(self) -> int:
         return int(
             self.connection.execute(

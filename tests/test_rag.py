@@ -1024,6 +1024,38 @@ def test_rag_records_question_gap_for_non_answerable_statuses(
     assert store.gaps == [("global", expected_type, "工时是多少", 1)]
 
 
+def test_exact_query_hit_does_not_call_llm(tmp_path) -> None:
+    from feishu_rag.models import StructuredFact
+
+    store = IndexStore(tmp_path / "rag.sqlite3")
+    store.upsert_document(
+        "ie",
+        "UPPH",
+        "upph.xlsx",
+        "v1",
+        [Chunk("chunk", "ie", "UPPH", "Cell AOI2线开机 450")],
+        structured_facts=[
+            StructuredFact(
+                "ie",
+                "UPPH",
+                2,
+                "upph",
+                operation_name="Cell AOI2线开机",
+                metric_name="UPPH",
+                numeric_value=450,
+            )
+        ],
+    )
+    llm = FakeLLM()
+    try:
+        answer = RagService(store, llm).answer("Cell AOI2线开机UPPH是多少")
+        assert answer.text == "Cell AOI2线开机 UPPH：450"
+        assert answer.status == "answerable"
+        assert llm.calls == []
+    finally:
+        store.close()
+
+
 class DeepSeekClientTests(unittest.TestCase):
     def test_posts_chat_completion_payload(self):
         seen = {}

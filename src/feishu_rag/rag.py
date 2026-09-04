@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .faq import FaqService
+from .exact_query import ExactQueryService
 from .models import RetrievalScope, SearchResult
 from .store import IndexStore
 
@@ -110,6 +111,7 @@ class RagService:
         rate_limit_per_minute: int = 10,
         rate_limit_per_day: int = 200,
         faq_service: FaqService | None = None,
+        exact_query_service: ExactQueryService | None = None,
     ):
         if question_max_chars < 1:
             raise ValueError("question_max_chars 必须大于 0")
@@ -126,6 +128,11 @@ class RagService:
         self.rate_limit_per_minute = rate_limit_per_minute
         self.rate_limit_per_day = rate_limit_per_day
         self.faq_service = faq_service
+        self.exact_query_service = exact_query_service
+        if self.exact_query_service is None and callable(
+            getattr(store, "structured_fact_rows", None)
+        ):
+            self.exact_query_service = ExactQueryService(store)
 
     def _record_question_gap(
         self,
@@ -273,6 +280,19 @@ class RagService:
             return RagAnswer("请输入要查询的问题。", [])
         if len(question) > self.question_max_chars:
             return RagAnswer(f"问题过长，请精简到 {self.question_max_chars} 字以内。", [])
+        if self.exact_query_service is not None:
+            exact_answer = self.exact_query_service.answer(question)
+            if exact_answer is not None:
+                if exact_answer.status == "ambiguous":
+                    revision_reader = getattr(self.store, "knowledge_revision", None)
+                    revision = revision_reader() if callable(revision_reader) else None
+                    self._record_question_gap(
+                        question,
+                        "ambiguous",
+                        scope,
+                        revision,
+                    )
+                return RagAnswer(exact_answer.text, [], exact_answer.status)
         revision_reader = getattr(self.store, "knowledge_revision", None)
         revision_supported = callable(revision_reader)
         faq_configured = self.faq_service is not None and bool(
