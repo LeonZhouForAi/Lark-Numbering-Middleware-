@@ -145,6 +145,71 @@ class IngestTests(unittest.TestCase):
                 result = store.search("AOI2开机UPH")[0].chunk
                 self.assertEqual(result.title, "各岗位标准UPPH")
                 self.assertIn("UPH: 450", result.content)
+                fact = store.connection.execute(
+                    "SELECT operation_name,numeric_value FROM structured_facts"
+                ).fetchone()
+                self.assertEqual(tuple(fact), ("Cell AOI2线开机", 450.0))
+            finally:
+                store.close()
+
+    def test_xlsx_update_replaces_old_structured_facts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            documents = root / "documents"
+            documents.mkdir()
+            path = documents / "各岗位标准UPPH.xlsx"
+
+            def save(value):
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.append(["工序", "UPH"])
+                sheet.append(["Cell AOI2线开机", value])
+                workbook.save(path)
+
+            save(450)
+            store = IndexStore(root / "index.sqlite3")
+            try:
+                self.assertEqual(index_directory(documents, store), 1)
+                save(460)
+                self.assertEqual(index_directory(documents, store), 1)
+                values = [
+                    row[0]
+                    for row in store.connection.execute(
+                        "SELECT numeric_value FROM structured_facts"
+                    )
+                ]
+                self.assertEqual(values, [460.0])
+            finally:
+                store.close()
+
+    def test_deleted_xlsx_cascades_structured_facts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            documents = root / "documents"
+            documents.mkdir()
+            path = documents / "各岗位标准UPPH.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["工序", "UPH"])
+            sheet.append(["切割扫码", 200])
+            workbook.save(path)
+            store = IndexStore(root / "index.sqlite3")
+            try:
+                index_directory(documents, store)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM structured_facts"
+                    ).fetchone()[0],
+                    1,
+                )
+                path.unlink()
+                index_directory(documents, store)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM structured_facts"
+                    ).fetchone()[0],
+                    0,
+                )
             finally:
                 store.close()
 

@@ -24,6 +24,7 @@ from .models import (
     PreheatJob,
     RetrievalScope,
     SearchResult,
+    StructuredFact,
 )
 
 
@@ -133,6 +134,7 @@ class PreparedDocument:
     lifecycle_state: str = "current"
     parser_version: str = ""
     decision_reason: str = "unique-or-unversioned"
+    structured_facts: tuple[StructuredFact, ...] | None = None
 
 
 def _normalize(text: str) -> str:
@@ -573,6 +575,7 @@ class IndexStore:
         lifecycle_state: str = "current",
         parser_version: str = "",
         decision_reason: str = "unique-or-unversioned",
+        structured_facts: Iterable[StructuredFact] = (),
     ) -> None:
         chunk_list = list(chunks)
         with self.connection:
@@ -589,6 +592,7 @@ class IndexStore:
                 lifecycle_state=lifecycle_state,
                 parser_version=parser_version,
                 decision_reason=decision_reason,
+                structured_facts=structured_facts,
             )
 
     def _upsert_document_in_transaction(
@@ -606,6 +610,7 @@ class IndexStore:
         lifecycle_state: str = "current",
         parser_version: str = "",
         decision_reason: str = "unique-or-unversioned",
+        structured_facts: Iterable[StructuredFact] = (),
     ) -> None:
         chunk_list = list(chunks)
         old_ids = [
@@ -650,6 +655,35 @@ class IndexStore:
                 lifecycle_state,
                 decision_reason,
                 timestamp,
+            ),
+        )
+        fact_revision = int(
+            self.connection.execute(
+                "SELECT revision FROM knowledge_state WHERE singleton_id=1"
+            ).fetchone()[0]
+        ) + 1
+        self.connection.executemany(
+            "INSERT INTO structured_facts("
+            "source_id,sheet_name,row_number,fact_type,part_number,series_name,"
+            "process_stage,operation_name,metric_name,numeric_value,text_value,unit,"
+            "knowledge_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                (
+                    fact.source_id,
+                    fact.sheet_name,
+                    fact.row_number,
+                    fact.fact_type,
+                    fact.part_number,
+                    fact.series_name,
+                    fact.process_stage,
+                    fact.operation_name,
+                    fact.metric_name,
+                    fact.numeric_value,
+                    fact.text_value,
+                    fact.unit,
+                    fact_revision,
+                )
+                for fact in structured_facts
             ),
         )
         self.connection.executemany(
@@ -775,6 +809,7 @@ class IndexStore:
                     lifecycle_state=prepared.lifecycle_state,
                     parser_version=prepared.parser_version,
                     decision_reason=prepared.decision_reason,
+                    structured_facts=prepared.structured_facts or (),
                 )
                 updated += 1
 

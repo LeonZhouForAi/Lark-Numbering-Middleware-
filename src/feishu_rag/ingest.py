@@ -18,6 +18,7 @@ from .document_metadata import (
 )
 from .logging_utils import configure_logging
 from .store import IndexStore, PreparedDocument
+from .structured_facts import extract_structured_facts
 from .semantic_chunker import AtomicUnit, SemanticPlanner, semantic_chunks
 from .xlsx_reader import XlsxExtractionError, read_xlsx_sections
 
@@ -229,6 +230,11 @@ def _prepare_file(
     if not chunks:
         return None
     document_metadata = metadata or extract_document_metadata(path.name)
+    structured_facts = (
+        tuple(extract_structured_facts(path, source_id))
+        if path.suffix.lower() == ".xlsx"
+        else ()
+    )
     return PreparedDocument(
         source_id,
         title,
@@ -241,6 +247,7 @@ def _prepare_file(
         lifecycle_state=document_metadata.lifecycle_state,
         parser_version=parser_version,
         decision_reason=document_metadata.decision_reason,
+        structured_facts=structured_facts,
     )
 
 
