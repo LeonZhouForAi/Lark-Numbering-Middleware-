@@ -14,6 +14,7 @@ from .chunker import chunk_text
 from .logging_utils import configure_logging
 from .store import IndexStore, PreparedDocument
 from .semantic_chunker import AtomicUnit, SemanticPlanner, semantic_chunks
+from .xlsx_reader import XlsxExtractionError, read_xlsx_sections
 
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ class Section:
     section: str | None = None
 
 
-SUPPORTED_SUFFIXES = {".txt", ".md", ".markdown", ".pdf", ".docx"}
+SUPPORTED_SUFFIXES = {".txt", ".md", ".markdown", ".pdf", ".docx", ".xlsx"}
 
 
 def _ocr_pdf_page(path: Path, page_no: int) -> str | None:
@@ -135,6 +136,15 @@ def extract_sections(path: str | Path, enable_ocr: bool = True) -> list[Section]
         return _read_pdf(file_path, enable_ocr=enable_ocr)
     if suffix == ".docx":
         return _read_docx(file_path)
+    if suffix == ".xlsx":
+        try:
+            xlsx_sections = read_xlsx_sections(file_path)
+        except XlsxExtractionError as exc:
+            raise DocumentExtractionError(str(exc)) from exc
+        return [
+            Section(text=section.text, section=section.section)
+            for section in xlsx_sections
+        ]
     raise UnsupportedFileError(f"不支持的文件格式: {file_path.suffix or '(无扩展名)'}")
 
 
@@ -143,11 +153,13 @@ def _file_checksum(
     enable_ocr: bool,
     chunk_strategy_version: str,
     chunk_model: str,
+    parser_version: str,
 ) -> str:
     content_checksum = hashlib.sha256(path.read_bytes()).hexdigest()
     ocr_cache_mode = str(enable_ocr).lower() if path.suffix.lower() == ".pdf" else "na"
     return hashlib.sha256(
-        f"{content_checksum}:{chunk_strategy_version}:{chunk_model}:ocr={ocr_cache_mode}".encode("utf-8")
+        f"{content_checksum}:{chunk_strategy_version}:{chunk_model}:"
+        f"parser={parser_version}:ocr={ocr_cache_mode}".encode("utf-8")
     ).hexdigest()
 
 
@@ -164,11 +176,14 @@ def _prepare_file(
     semantic_planner: SemanticPlanner | None = None,
     chunk_strategy_version: str = "local-v1",
     chunk_model: str = "",
+    parser_version: str = "parser-v2",
 ) -> PreparedDocument | None:
     relative_path = path.relative_to(root).as_posix()
     source_id = _local_source_id(root, relative_path)
     title = path.stem
-    checksum = _file_checksum(path, enable_ocr, chunk_strategy_version, chunk_model)
+    checksum = _file_checksum(
+        path, enable_ocr, chunk_strategy_version, chunk_model, parser_version
+    )
     sections = extract_sections(path, enable_ocr=enable_ocr)
     overlap = max(0, min(120, max_chars // 5))
 
@@ -219,9 +234,12 @@ def index_file(
     semantic_planner: SemanticPlanner | None = None,
     chunk_strategy_version: str = "local-v1",
     chunk_model: str = "",
+    parser_version: str = "parser-v2",
 ) -> bool:
     source_id = _local_source_id(root, path.relative_to(root).as_posix())
-    checksum = _file_checksum(path, enable_ocr, chunk_strategy_version, chunk_model)
+    checksum = _file_checksum(
+        path, enable_ocr, chunk_strategy_version, chunk_model, parser_version
+    )
     if store.document_checksum(source_id) == checksum:
         return False
     prepared = _prepare_file(
@@ -232,6 +250,7 @@ def index_file(
         semantic_planner=semantic_planner,
         chunk_strategy_version=chunk_strategy_version,
         chunk_model=chunk_model,
+        parser_version=parser_version,
     )
     if prepared is None:
         return False
@@ -247,6 +266,7 @@ def index_directory(
     semantic_planner: SemanticPlanner | None = None,
     chunk_strategy_version: str = "local-v1",
     chunk_model: str = "",
+    parser_version: str = "parser-v2",
 ) -> int:
     """递归索引目录，返回成功索引的文件数量。"""
 
@@ -260,7 +280,9 @@ def index_directory(
             continue
         relative_path = path.relative_to(root_path).as_posix()
         source_id = _local_source_id(root_path, relative_path)
-        checksum = _file_checksum(path, enable_ocr, chunk_strategy_version, chunk_model)
+        checksum = _file_checksum(
+            path, enable_ocr, chunk_strategy_version, chunk_model, parser_version
+        )
         if store.document_checksum(source_id) == checksum:
             prepared_updates.append(
                 PreparedDocument(source_id, path.stem, relative_path, checksum, None)
@@ -275,6 +297,7 @@ def index_directory(
             semantic_planner=semantic_planner,
             chunk_strategy_version=chunk_strategy_version,
             chunk_model=chunk_model,
+            parser_version=parser_version,
         )
         if prepared is not None:
             prepared_updates.append(prepared)
@@ -288,7 +311,9 @@ def index_directory(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="索引本地 PDF/DOCX/Markdown/TXT 文件")
+    parser = argparse.ArgumentParser(
+        description="索引本地 PDF/DOCX/XLSX/Markdown/TXT 文件"
+    )
     parser.add_argument("root", type=Path, help="文档目录")
     parser.add_argument("--db", type=Path, default=Path("./data/rag.sqlite3"), help="SQLite 数据库路径")
     parser.add_argument("--max-chars", type=int, default=900)
@@ -297,7 +322,14 @@ def main() -> None:
     configure_logging(os.getenv("LOG_LEVEL", "INFO"))
     store = IndexStore(args.db)
     try:
-        count = index_directory(args.root, store, max_chars=args.max_chars, enable_ocr=not args.no_ocr)
+        count = index_directory(
+            args.root,
+            store,
+            max_chars=args.max_chars,
+            enable_ocr=not args.no_ocr,
+            parser_version=os.getenv("RAG_PARSER_VERSION", "parser-v2").strip()
+            or "parser-v2",
+        )
         print(f"indexed_files={count} indexed_chunks={store.count_chunks()}")
     finally:
         store.close()

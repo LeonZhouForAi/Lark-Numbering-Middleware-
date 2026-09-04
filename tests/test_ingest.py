@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from docx import Document
+from openpyxl import Workbook
 
 from feishu_rag.ingest import (
     DocumentExtractionError,
@@ -21,6 +22,25 @@ from feishu_rag.models import Chunk
 
 
 class IngestTests(unittest.TestCase):
+    def test_parser_version_change_reindexes_same_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "制度.txt"
+            path.write_text("制度正文", encoding="utf-8")
+            store = IndexStore(root / "rag.sqlite3")
+            try:
+                self.assertTrue(
+                    index_file(path, root, store, parser_version="parser-v1")
+                )
+                self.assertFalse(
+                    index_file(path, root, store, parser_version="parser-v1")
+                )
+                self.assertTrue(
+                    index_file(path, root, store, parser_version="parser-v2")
+                )
+            finally:
+                store.close()
+
     def test_pdf_ocr_mode_change_reindexes_file_and_same_mode_skips(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -108,6 +128,25 @@ class IngestTests(unittest.TestCase):
 
             self.assertIn("报销制度", "\n".join(section.text for section in txt_sections))
             self.assertIn("付款申请流程", "\n".join(section.text for section in docx_sections))
+
+    def test_indexes_xlsx_without_markdown_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            documents = root / "documents"
+            documents.mkdir()
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["工序", "UPH"])
+            sheet.append(["Cell AOI2线开机", 450])
+            workbook.save(documents / "各岗位标准UPPH.xlsx")
+            store = IndexStore(root / "index.sqlite3")
+            try:
+                self.assertEqual(index_directory(documents, store), 1)
+                result = store.search("AOI2开机UPH")[0].chunk
+                self.assertEqual(result.title, "各岗位标准UPPH")
+                self.assertIn("UPH: 450", result.content)
+            finally:
+                store.close()
 
     def test_extracts_docx_paragraphs_and_table_rows_in_document_order(self):
         with tempfile.TemporaryDirectory() as tmp:

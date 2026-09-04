@@ -20,6 +20,16 @@ def _chunk_strategy_version(environ=os.environ) -> str:
     return value
 
 
+def _parser_version(environ=os.environ) -> str:
+    raw_value = environ.get("RAG_PARSER_VERSION")
+    if raw_value is None:
+        return "parser-v2"
+    value = raw_value.strip()
+    if not value:
+        raise SystemExit("RAG_PARSER_VERSION 不能为空")
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("root", type=Path)
@@ -35,6 +45,7 @@ def main() -> None:
             max_chars=args.max_chars,
             enable_ocr=not args.no_ocr,
             chunk_strategy_version=_chunk_strategy_version(),
+            parser_version=_parser_version(),
         )
         print(f"indexed_files={count} indexed_chunks={store.count_chunks()}")
     finally:
