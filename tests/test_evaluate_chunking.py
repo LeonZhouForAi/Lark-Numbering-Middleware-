@@ -185,17 +185,43 @@ def test_explicit_cli_min_relevance_overrides_settings_everywhere(monkeypatch) -
 
 
 def test_thresholds_return_failure_when_summary_does_not_meet_gate() -> None:
-    report = {"hit_rate": 0.7, "mrr": 0.5, "source_leak_rate": 0.1}
+    report = {
+        "hit_rate": 0.7,
+        "mrr": 0.5,
+        "source_leak_rate": 0.1,
+        "status_accuracy": 0.8,
+        "answerable_insufficient_rate": 0.2,
+        "unanswerable_answer_rate": 0.1,
+    }
 
     assert threshold_failed(report, min_hit_rate=0.8) is True
     assert threshold_failed(report, min_mrr=0.6) is True
     assert threshold_failed(report, max_leak_rate=0.05) is True
-    assert threshold_failed(report, min_hit_rate=0.7, min_mrr=0.5, max_leak_rate=0.1) is False
+    assert threshold_failed(report, min_status_accuracy=0.9) is True
+    assert threshold_failed(report, max_answerable_insufficient_rate=0.1) is True
+    assert threshold_failed(report, max_unanswerable_answer_rate=0.05) is True
+    assert threshold_failed(
+        report,
+        min_hit_rate=0.7,
+        min_mrr=0.5,
+        max_leak_rate=0.1,
+        min_status_accuracy=0.8,
+        max_answerable_insufficient_rate=0.2,
+        max_unanswerable_answer_rate=0.1,
+    ) is False
 
 
 @pytest.mark.parametrize(
     "option",
-    ["--min-hit-rate", "--min-mrr", "--max-leak-rate", "--min-relevance"],
+    [
+        "--min-hit-rate",
+        "--min-mrr",
+        "--max-leak-rate",
+        "--min-relevance",
+        "--min-status-accuracy",
+        "--max-answerable-insufficient-rate",
+        "--max-unanswerable-answer-rate",
+    ],
 )
 @pytest.mark.parametrize("value", ["nan", "inf", "-0.1", "1.1"])
 def test_cli_rejects_non_finite_and_out_of_range_thresholds(option: str, value: str) -> None:
@@ -203,7 +229,30 @@ def test_cli_rejects_non_finite_and_out_of_range_thresholds(option: str, value: 
         main([option, value])
 
 
-@pytest.mark.parametrize("option", ["--min-hit-rate", "--min-mrr", "--max-leak-rate"])
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--min-hit-rate",
+        "--min-mrr",
+        "--max-leak-rate",
+        "--min-status-accuracy",
+        "--max-answerable-insufficient-rate",
+        "--max-unanswerable-answer-rate",
+    ],
+)
 def test_cli_rejects_question_mode_with_thresholds(option: str) -> None:
     with pytest.raises(SystemExit, match="2"):
         main(["--question", "匿名问题", option, "0.5"])
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--min-status-accuracy",
+        "--max-answerable-insufficient-rate",
+        "--max-unanswerable-answer-rate",
+    ],
+)
+def test_retrieval_only_rejects_answer_quality_thresholds(option: str) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        main(["--retrieval-only", option, "0.5"])

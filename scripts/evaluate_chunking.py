@@ -48,12 +48,29 @@ def threshold_failed(
     min_hit_rate: float | None = None,
     min_mrr: float | None = None,
     max_leak_rate: float | None = None,
+    min_status_accuracy: float | None = None,
+    max_answerable_insufficient_rate: float | None = None,
+    max_unanswerable_answer_rate: float | None = None,
 ) -> bool:
     """判断质量门禁；未设置的阈值不参与判定。"""
     return (
         (min_hit_rate is not None and float(report["hit_rate"]) < min_hit_rate)
         or (min_mrr is not None and float(report["mrr"]) < min_mrr)
         or (max_leak_rate is not None and float(report["source_leak_rate"]) > max_leak_rate)
+        or (
+            min_status_accuracy is not None
+            and float(report["status_accuracy"]) < min_status_accuracy
+        )
+        or (
+            max_answerable_insufficient_rate is not None
+            and float(report["answerable_insufficient_rate"])
+            > max_answerable_insufficient_rate
+        )
+        or (
+            max_unanswerable_answer_rate is not None
+            and float(report["unanswerable_answer_rate"])
+            > max_unanswerable_answer_rate
+        )
     )
 
 
@@ -76,11 +93,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--min-hit-rate", type=_rate)
     parser.add_argument("--min-mrr", type=_rate)
     parser.add_argument("--max-leak-rate", type=_rate)
+    parser.add_argument("--min-status-accuracy", type=_rate)
+    parser.add_argument("--max-answerable-insufficient-rate", type=_rate)
+    parser.add_argument("--max-unanswerable-answer-rate", type=_rate)
     parser.add_argument("--min-relevance", type=_rate)
     args = parser.parse_args(argv)
 
-    if args.questions and any(value is not None for value in (args.min_hit_rate, args.min_mrr, args.max_leak_rate)):
+    quality_thresholds = (
+        args.min_hit_rate,
+        args.min_mrr,
+        args.max_leak_rate,
+        args.min_status_accuracy,
+        args.max_answerable_insufficient_rate,
+        args.max_unanswerable_answer_rate,
+    )
+    if args.questions and any(value is not None for value in quality_thresholds):
         parser.error("--question cannot be combined with quality thresholds")
+    if args.retrieval_only and any(
+        value is not None
+        for value in (
+            args.min_status_accuracy,
+            args.max_answerable_insufficient_rate,
+            args.max_unanswerable_answer_rate,
+        )
+    ):
+        parser.error("--retrieval-only cannot use answer quality thresholds")
 
     store = IndexStore(args.db)
     try:
@@ -164,7 +201,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             min_relevance=min_relevance,
         ).to_report()
         print(json.dumps(report, ensure_ascii=False))
-        return int(threshold_failed(report, min_hit_rate=args.min_hit_rate, min_mrr=args.min_mrr, max_leak_rate=args.max_leak_rate))
+        return int(
+            threshold_failed(
+                report,
+                min_hit_rate=args.min_hit_rate,
+                min_mrr=args.min_mrr,
+                max_leak_rate=args.max_leak_rate,
+                min_status_accuracy=args.min_status_accuracy,
+                max_answerable_insufficient_rate=(
+                    args.max_answerable_insufficient_rate
+                ),
+                max_unanswerable_answer_rate=args.max_unanswerable_answer_rate,
+            )
+        )
     finally:
         store.close()
 
