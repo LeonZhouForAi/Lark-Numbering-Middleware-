@@ -4,10 +4,22 @@ import json
 import sqlite3
 import time
 
+from datetime import date
+
 import pytest
 
 from feishu_rag.store import IndexStore
 from scripts.report_faq import main as report_main
+
+
+@pytest.fixture(autouse=True)
+def _freeze_today(monkeypatch):
+    class _FixedDate(date):
+        @classmethod
+        def today(cls):
+            return date(2026, 8, 31)
+
+    monkeypatch.setattr("scripts.report_faq.date", _FixedDate)
 
 
 def _seed(path):
