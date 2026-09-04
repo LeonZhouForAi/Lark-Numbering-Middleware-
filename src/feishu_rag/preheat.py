@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from hashlib import sha256
 from typing import Iterable
 
-from .models import Chunk, PreheatCandidate
+from .faq import FaqService
+from .models import (
+    Chunk,
+    FaqObservation,
+    PreheatCandidate,
+    RetrievalScope,
+)
 
 
 _TITLE_SIGNALS = (
@@ -104,3 +112,165 @@ def select_preheat_candidates(
         if len(candidates) >= max_per_scope:
             break
     return candidates
+
+
+@dataclass(frozen=True)
+class PreheatRunResult:
+    job_id: str
+    generated: int
+    failed: int
+    candidates: int
+
+
+@dataclass(frozen=True)
+class _GeneratedFaq:
+    canonical_question: str
+    aliases: tuple[str, ...]
+    answer: str
+
+
+class PreheatWorker:
+    def __init__(
+        self,
+        store,
+        llm,
+        *,
+        max_per_scope: int = 10,
+        workers: int = 2,
+    ) -> None:
+        if not 1 <= max_per_scope <= 50:
+            raise ValueError("max_per_scope must be between 1 and 50")
+        if not 1 <= workers <= 8:
+            raise ValueError("workers must be between 1 and 8")
+        self.store = store
+        self.llm = llm
+        self.max_per_scope = max_per_scope
+        self.workers = workers
+
+    @staticmethod
+    def _validated_generation(response: object) -> _GeneratedFaq:
+        required = {
+            "canonical_question",
+            "aliases",
+            "answer",
+            "evidence_sufficient",
+        }
+        if not isinstance(response, dict) or set(response) != required:
+            raise ValueError("invalid preheat response fields")
+        canonical = response["canonical_question"]
+        aliases = response["aliases"]
+        answer = response["answer"]
+        evidence = response["evidence_sufficient"]
+        if not isinstance(canonical, str) or not canonical.strip():
+            raise ValueError("invalid canonical question")
+        if not isinstance(aliases, list) or len(aliases) > 5 or any(
+            not isinstance(alias, str) or not alias.strip() for alias in aliases
+        ):
+            raise ValueError("invalid aliases")
+        if not isinstance(answer, str) or not answer.strip() or evidence is not True:
+            raise ValueError("invalid preheat answer")
+        texts = [canonical, answer, *aliases]
+        if any(FaqService.contains_personal_identifier(text) for text in texts):
+            raise ValueError("personal identifier in preheat output")
+        from .rag import INSUFFICIENT_ANSWER, UNSAFE_ANSWER, RagService
+
+        cleaned = RagService._clean_answer(answer)
+        if cleaned in {INSUFFICIENT_ANSWER, UNSAFE_ANSWER}:
+            raise ValueError("unsafe preheat answer")
+        return _GeneratedFaq(
+            canonical.strip(),
+            tuple(alias.strip() for alias in aliases),
+            cleaned,
+        )
+
+    def _generate(self, candidate: PreheatCandidate) -> _GeneratedFaq:
+        response = self.llm.complete_json(
+            "你是公司知识库 FAQ 预热器。仅依据资料生成一个标准问题、最多五个同义问法和简洁答案。"
+            "不得补造事实,不得输出来源。只返回 canonical_question、aliases、answer、"
+            "evidence_sufficient 四个字段的 JSON。",
+            f"资料：{candidate.content}",
+            purpose="preheat",
+        )
+        return self._validated_generation(response)
+
+    def run_once(self) -> PreheatRunResult:
+        job = self.store.claim_preheat_job()
+        if job is None:
+            return PreheatRunResult("", 0, 0, 0)
+        if self.store.knowledge_revision() != job.knowledge_revision:
+            self.store.complete_preheat_job(job.id, generated=0, failed=0)
+            return PreheatRunResult(job.id, 0, 0, 0)
+
+        candidates = select_preheat_candidates(
+            self.store.preheat_chunks(job.scope_key),
+            scope_key=job.scope_key,
+            knowledge_revision=job.knowledge_revision,
+            max_per_scope=self.max_per_scope,
+        )
+        pending = [
+            candidate
+            for candidate in candidates
+            if not self.store.preheat_candidate_exists(candidate.signature)
+        ]
+        generated_count = 0
+        failed_count = 0
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = [executor.submit(self._generate, candidate) for candidate in pending]
+            for candidate, future in zip(pending, futures, strict=True):
+                try:
+                    generated = future.result()
+                    normalized, intent_key = FaqService._question_features(
+                        generated.canonical_question
+                    )
+                    normalized_aliases = []
+                    for alias in generated.aliases:
+                        alias_normalized, alias_intent = FaqService._question_features(alias)
+                        if alias_normalized and alias_intent == intent_key:
+                            normalized_aliases.append(alias_normalized)
+                    faq_scope = FaqService._scope_key(
+                        RetrievalScope(frozenset({job.scope_key}))
+                    )
+                    source_ids = (candidate.source_id,)
+                    observation = FaqObservation(
+                        intent_key=intent_key,
+                        scope_key=faq_scope,
+                        normalized_question=normalized,
+                        source_signature=FaqService._signature(source_ids),
+                        knowledge_revision=job.knowledge_revision,
+                        source_ids=source_ids,
+                    )
+                    match = self.store.upsert_preheated_faq(
+                        candidate,
+                        observation,
+                        canonical_question=generated.canonical_question,
+                        aliases=normalized_aliases,
+                        answer=generated.answer,
+                    )
+                    if match is None:
+                        raise ValueError("knowledge revision changed")
+                    self.store.record_preheat_candidate(
+                        job.id,
+                        candidate,
+                        "generated",
+                        faq_id=match.entry_id,
+                    )
+                    generated_count += 1
+                except Exception:
+                    self.store.record_preheat_candidate(
+                        job.id,
+                        candidate,
+                        "failed",
+                    )
+                    failed_count += 1
+        self.store.complete_preheat_job(
+            job.id,
+            generated=generated_count,
+            failed=failed_count,
+            candidate_count=len(pending),
+        )
+        return PreheatRunResult(
+            job.id,
+            generated_count,
+            failed_count,
+            len(pending),
+        )

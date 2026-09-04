@@ -20,6 +20,7 @@ from .models import (
     Chunk,
     FaqMatch,
     FaqObservation,
+    PreheatCandidate,
     PreheatJob,
     RetrievalScope,
     SearchResult,
@@ -1092,6 +1093,170 @@ class IndexStore:
             )
             self.connection.commit()
             return queued
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def preheat_chunks(self, scope_key: str) -> list[Chunk]:
+        if not isinstance(scope_key, str) or not scope_key.strip():
+            raise ValueError("scope_key must not be empty")
+        rows = self.connection.execute(
+            "SELECT c.id,c.source_id,c.title,c.content,c.page,c.section,c.search_text "
+            "FROM chunks c JOIN documents d ON d.source_id=c.source_id "
+            "WHERE d.space_id=? AND d.lifecycle_state!='superseded' "
+            "ORDER BY c.source_id,c.id",
+            (scope_key,),
+        ).fetchall()
+        return [
+            Chunk(
+                str(row["id"]),
+                str(row["source_id"]),
+                str(row["title"]),
+                str(row["content"]),
+                row["page"],
+                row["section"],
+                str(row["search_text"] or ""),
+            )
+            for row in rows
+        ]
+
+    def preheat_candidate_exists(self, signature: str) -> bool:
+        return self.connection.execute(
+            "SELECT 1 FROM faq_preheat_candidates WHERE candidate_signature=? "
+            "AND state='generated'",
+            (signature,),
+        ).fetchone() is not None
+
+    def record_preheat_candidate(
+        self,
+        job_id: str,
+        candidate: PreheatCandidate,
+        state: str,
+        *,
+        faq_id: str = "",
+        now: float | None = None,
+    ) -> None:
+        if state not in {"selected", "generated", "rejected", "failed"}:
+            raise ValueError("invalid preheat candidate state")
+        timestamp = self._validate_faq_now(time.time() if now is None else now)
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO faq_preheat_candidates("
+                "candidate_signature,job_id,scope_key,knowledge_revision,chunk_id,"
+                "source_id,score,state,faq_id,created_at,updated_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(candidate_signature) DO UPDATE SET "
+                "state=excluded.state,faq_id=excluded.faq_id,updated_at=excluded.updated_at",
+                (
+                    candidate.signature,
+                    job_id,
+                    candidate.scope_key,
+                    candidate.knowledge_revision,
+                    candidate.chunk_id,
+                    candidate.source_id,
+                    candidate.score,
+                    state,
+                    faq_id,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+    def upsert_preheated_faq(
+        self,
+        candidate: PreheatCandidate,
+        observation: FaqObservation,
+        *,
+        canonical_question: str,
+        aliases: Iterable[str],
+        answer: str,
+        now: float | None = None,
+    ) -> FaqMatch | None:
+        self._validate_faq_observation(observation)
+        safe_answer = self._faq_answer(answer)
+        question = self._faq_question(observation)
+        timestamp = self._validate_faq_now(time.time() if now is None else now)
+        alias_values = list(dict.fromkeys([question, *(_normalize(value) for value in aliases)]))
+        if any(not value for value in alias_values):
+            raise ValueError("aliases must not be empty")
+        self._begin_faq_transaction()
+        try:
+            current_revision = self.connection.execute(
+                "SELECT revision FROM knowledge_state WHERE singleton_id=1"
+            ).fetchone()[0]
+            if int(current_revision) != candidate.knowledge_revision:
+                self.connection.commit()
+                return None
+            source_ids_json = self._faq_source_ids_json(observation)
+            existing = self.connection.execute(
+                "SELECT id FROM faq_entries WHERE scope_key=? AND intent_key=?",
+                (observation.scope_key, observation.intent_key),
+            ).fetchone()
+            entry_id = str(existing["id"]) if existing is not None else uuid.uuid4().hex
+            if existing is None:
+                self.connection.execute(
+                    "INSERT INTO faq_entries("
+                    "id,intent_key,scope_key,canonical_question,answer,source_signature,"
+                    "source_ids_json,knowledge_revision,state,direct_hits,created_at,"
+                    "updated_at,last_hit_at,origin,preheat_candidate_signature"
+                    ") VALUES(?,?,?,?,?,?,?,?,'enabled',0,?,?,NULL,'preheated',?)",
+                    (
+                        entry_id,
+                        observation.intent_key,
+                        observation.scope_key,
+                        canonical_question.strip(),
+                        safe_answer,
+                        observation.source_signature,
+                        source_ids_json,
+                        observation.knowledge_revision,
+                        timestamp,
+                        timestamp,
+                        candidate.signature,
+                    ),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE faq_entries SET canonical_question=?,answer=?,"
+                    "source_signature=?,source_ids_json=?,knowledge_revision=?,"
+                    "state='enabled',updated_at=?,origin='preheated',"
+                    "preheat_candidate_signature=? WHERE id=?",
+                    (
+                        canonical_question.strip(),
+                        safe_answer,
+                        observation.source_signature,
+                        source_ids_json,
+                        observation.knowledge_revision,
+                        timestamp,
+                        candidate.signature,
+                        entry_id,
+                    ),
+                )
+                self.connection.execute(
+                    "DELETE FROM faq_aliases WHERE faq_id=?",
+                    (entry_id,),
+                )
+            self.connection.executemany(
+                "INSERT INTO faq_aliases("
+                "faq_id,normalized_question,search_text,first_seen_at,last_seen_at,total_seen"
+                ") VALUES(?,?,?,?,?,1)",
+                (
+                    (
+                        entry_id,
+                        alias,
+                        _pretokenize(alias),
+                        timestamp,
+                        timestamp,
+                    )
+                    for alias in alias_values
+                ),
+            )
+            self.connection.commit()
+            return FaqMatch(
+                entry_id,
+                safe_answer,
+                observation.intent_key,
+                observation.knowledge_revision,
+            )
         except Exception:
             self.connection.rollback()
             raise
