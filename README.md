@@ -191,6 +191,17 @@ FAQ 在最近 15 天内同一意图/同义问法第 3 次安全回答后晋级�
 
 报表摘要中的“估算节省 DeepSeek 请求数”按 FAQ 直接命中次数统计，并非账单数据；`--promotion-count` 缺省读取 `RAG_FAQ_PROMOTION_COUNT`（未设置时为 3）。
 
+回答质量评测包含 `answerable`、`ambiguous`、`insufficient`、`missing` 四种状态。可用以下门禁阻止低质量发布：
+
+```bash
+python scripts/evaluate_chunking.py --cases eval/golden_questions.json \
+  --min-hit-rate 0.80 --min-status-accuracy 0.85 \
+  --max-answerable-insufficient-rate 0.10 \
+  --max-unanswerable-answer-rate 0.05 --max-leak-rate 0
+```
+
+`--retrieval-only` 不允许使用回答质量阈值，因为该模式不会调用回答服务。评测报告只包含用例编号、状态与聚合指标，不保存问题对应的回答正文。
+
 该报表只汇总 DeepSeek 成功响应中返回的 `usage`，属于本地观测值而非服务商账单。网络中断、超时、429 或 5xx 等未返回可用 `usage` 的调用可能已经产生费用，但本地无法取得其 Token 数，因此不会进入报表；成本核对应以 DeepSeek 账单为准。
 
 你当前的三个知识库 ID 如下，可分别执行同步：
@@ -208,7 +219,8 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 - 先使用 SQLite FTS5/BM25 和字面关键词检索生成候选，再以 RRF 混排；confidence 低于 `RAG_MIN_RELEVANCE`（默认 0.42）的泛词或无关命中会被过滤。
 - 当前不使用向量数据库或外部 Embedding 服务；针对中文制度文档，检索完全在本地 SQLite 完成。
 - 回答模型只接收匿名结构化 JSON 中的原始正文，不接收标题、来源、页码或引用编号；员工不会看到来源列表或 `[1]`、`[2]` 引用编号。
-- 回答严格校验 `answer` 与 `evidence_sufficient` 字段；证据不足、来源/链接/密钥泄漏或其他危险输出均 fail-closed，返回固定提示。
+- 回答严格校验结构化 JSON；证据不足、来源/链接/密钥泄漏或其他危险输出均 fail-closed，返回固定提示。
+- 新回答协议严格校验 `status`、`answer`、`clarifying_question`：有歧义时只追问一个关键条件，证据不足时返回固定提示；旧 `answer` 与 `evidence_sufficient` 两字段协议仅用于滚动升级兼容。
 - 无命中时不会调用 DeepSeek，直接返回“知识库中暂无依据”。
 - 提示词要求模型只依据召回资料回答，不补造金额、日期、审批人或制度条款。
 - `RAG_SEMANTIC_CHUNKING=true` 时使用本地结构切片加 DeepSeek 语义分组；失败自动回退本地切片。
@@ -237,6 +249,6 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 - 缺少 API Key 时服务健康检查报配置不完整，且不会发起外部请求。
 - 回滚预检不修改数据库；带 `--execute` 才会创建独占备份并移除 v2 FTS。
 
-v0.6.0 开发候选发布状态：增加 XLSX 原生解析和文档版本生命周期，尚未部署生产；仍使用 SQLite（含 FTS5/BM25）和 `hybrid-v4`，没有引入向量数据库。FAQ 仅保存经过 PII 过滤的归一化意图、安全答案和资料特征；report 与日志不输出员工身份、问题、答案或来源。
+v0.7.0 开发候选发布状态：增加四类回答状态、单一澄清问题和质量发布门禁，尚未部署生产；仍使用 SQLite（含 FTS5/BM25）和 `hybrid-v4`，没有引入向量数据库。FAQ 仅保存经过 PII 过滤的归一化意图、安全答案和资料特征；report 与日志不输出员工身份、问题、答案或来源。
 
 长连接适配器依赖 `lark-oapi==1.7.3` 的私有 ACK 契约。升级 SDK 必须显式修改锁定版本，并通过 `tests/test_lark_sdk_contract.py` 的真实 SDK 合约测试后才能发布。
