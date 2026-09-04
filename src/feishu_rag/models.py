@@ -79,3 +79,19 @@ class PreheatCandidate:
     title: str
     content: str
     score: int
+
+
+@dataclass(frozen=True)
+class StructuredFact:
+    source_id: str
+    sheet_name: str
+    row_number: int
+    fact_type: str
+    part_number: str = ""
+    series_name: str = ""
+    process_stage: str = ""
+    operation_name: str = ""
+    metric_name: str = ""
+    numeric_value: float | None = None
+    text_value: str = ""
+    unit: str = ""

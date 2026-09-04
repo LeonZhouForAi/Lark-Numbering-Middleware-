@@ -344,6 +344,24 @@ class IndexStore:
                     PRIMARY KEY(scope_key,gap_type,normalized_key,knowledge_revision)
                 )
                 """,
+                """
+                CREATE TABLE IF NOT EXISTS structured_facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id TEXT NOT NULL REFERENCES documents(source_id) ON DELETE CASCADE,
+                    sheet_name TEXT NOT NULL,
+                    row_number INTEGER NOT NULL CHECK(row_number >= 1),
+                    fact_type TEXT NOT NULL CHECK(fact_type IN ('upph','series_hours','part_hours')),
+                    part_number TEXT NOT NULL DEFAULT '',
+                    series_name TEXT NOT NULL DEFAULT '',
+                    process_stage TEXT NOT NULL DEFAULT '',
+                    operation_name TEXT NOT NULL DEFAULT '',
+                    metric_name TEXT NOT NULL,
+                    numeric_value REAL,
+                    text_value TEXT NOT NULL DEFAULT '',
+                    unit TEXT NOT NULL DEFAULT '',
+                    knowledge_revision INTEGER NOT NULL DEFAULT 0 CHECK(knowledge_revision >= 0)
+                )
+                """,
                 _FAQ_ENTRIES_SCHEMA,
                 _FAQ_ALIASES_SCHEMA,
                 _FAQ_OBSERVATION_SCHEMA,
@@ -365,6 +383,8 @@ class IndexStore:
                 "CREATE INDEX IF NOT EXISTS idx_faq_aliases_normalized_question ON faq_aliases(normalized_question)",
                 "CREATE INDEX IF NOT EXISTS idx_faq_observation_daily_day ON faq_observation_daily(day)",
                 "CREATE INDEX IF NOT EXISTS idx_faq_metrics_daily_day ON faq_metrics_daily(day)",
+                "CREATE INDEX IF NOT EXISTS idx_structured_facts_source ON structured_facts(source_id)",
+                "CREATE INDEX IF NOT EXISTS idx_structured_facts_lookup ON structured_facts(fact_type,part_number,series_name,process_stage,operation_name)",
             )
             for statement in schema_statements:
                 self.connection.execute(statement)

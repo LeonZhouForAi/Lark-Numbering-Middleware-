@@ -988,6 +988,7 @@ class StoreTests(unittest.TestCase):
                         "faq_metrics_daily",
                         "faq_preheat_jobs",
                         "faq_preheat_candidates",
+                        "structured_facts",
                     }.issubset(table_names)
                 )
                 faq_columns = {
