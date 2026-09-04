@@ -177,3 +177,43 @@ def test_stale_preheat_job_does_not_call_llm(tmp_path) -> None:
         assert llm.calls == []
     finally:
         store.close()
+
+
+def test_preheat_cli_outputs_counts_without_generated_content(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    from types import SimpleNamespace
+
+    from scripts import preheat_faq
+
+    settings = SimpleNamespace(
+        deepseek_api_key="secret",
+        deepseek_base_url="https://example.invalid",
+        deepseek_model="model",
+        api_retry_max_attempts=1,
+        api_retry_base_delay=0.0,
+        rag_faq_preheat_max_per_space=10,
+        rag_faq_preheat_workers=2,
+    )
+    fake_store = SimpleNamespace(close=lambda: None)
+
+    class FakeWorker:
+        def __init__(self, store, llm, *, max_per_scope, workers):
+            assert store is fake_store
+            assert (max_per_scope, workers) == (10, 2)
+
+        def run_once(self):
+            return SimpleNamespace(
+                job_id="job-1", candidates=3, generated=2, failed=1
+            )
+
+    monkeypatch.setattr(preheat_faq.Settings, "from_env", lambda: settings)
+    monkeypatch.setattr(preheat_faq, "IndexStore", lambda path: fake_store)
+    monkeypatch.setattr(preheat_faq, "DeepSeekClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(preheat_faq, "PreheatWorker", FakeWorker)
+
+    assert preheat_faq.main([str(tmp_path / "rag.sqlite3"), "--once"]) == 0
+
+    output = capsys.readouterr().out
+    assert output == "job_id=job-1 candidates=3 generated=2 failed=1\n"
+    assert "标准问题" not in output

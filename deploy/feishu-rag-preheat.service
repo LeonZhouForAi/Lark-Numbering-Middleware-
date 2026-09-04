@@ -1,0 +1,9 @@
+[Unit]
+Description=Generate preheated FAQ answers for Feishu RAG
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/data-assistant/feishu-rag
+ExecStart=/usr/bin/docker compose exec -T rag python scripts/preheat_faq.py /app/data/rag.sqlite3 --once

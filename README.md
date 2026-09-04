@@ -189,6 +189,15 @@ python scripts/cleanup_faq.py data/rag.sqlite3 --today 2026-08-31
 
 FAQ 在最近 15 天内同一意图/同义问法第 3 次安全回答后晋级，第 4 次起可直接回复；知识库资料更新后，首个安全回答会刷新旧条目。可将 `RAG_FAQ_ENABLED=false` 关闭 FAQ 功能，其余阈值由 `.env` 中的 `RAG_FAQ_PROMOTION_COUNT`、`RAG_FAQ_WINDOW_DAYS`、`RAG_FAQ_MIN_TEXT_SIMILARITY` 和 `RAG_FAQ_MIN_SOURCE_OVERLAP` 控制。
 
+资料同步发生变化后会写入后台预热作业。预热器按本地规则为每个空间选出最多 10 个高价值切片，再以最多 2 个并行 DeepSeek 请求生成标准问题、同义问法和答案；员工首次命中即可从 SQLite 直接回复。未变化候选不会重复调用模型，资料更新会使旧预热答案失效。
+
+```bash
+python scripts/preheat_faq.py data/rag.sqlite3 --once
+python scripts/report_question_gaps.py --db data/rag.sqlite3 --min-count 2
+```
+
+生产环境可安装并启用 `deploy/feishu-rag-preheat.service` 与 `deploy/feishu-rag-preheat.timer`，每分钟处理一个待办作业。关闭 `RAG_FAQ_PREHEAT_ENABLED` 后同步不再创建新作业，普通 FAQ 和 RAG 不受影响。资料缺口报告只显示归一化问题和聚合次数，不包含员工身份、答案或来源。
+
 报表摘要中的“估算节省 DeepSeek 请求数”按 FAQ 直接命中次数统计，并非账单数据；`--promotion-count` 缺省读取 `RAG_FAQ_PROMOTION_COUNT`（未设置时为 3）。
 
 回答质量评测包含 `answerable`、`ambiguous`、`insufficient`、`missing` 四种状态。可用以下门禁阻止低质量发布：
@@ -249,6 +258,6 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 - 缺少 API Key 时服务健康检查报配置不完整，且不会发起外部请求。
 - 回滚预检不修改数据库；带 `--execute` 才会创建独占备份并移除 v2 FTS。
 
-v0.7.0 开发候选发布状态：增加四类回答状态、单一澄清问题和质量发布门禁，尚未部署生产；仍使用 SQLite（含 FTS5/BM25）和 `hybrid-v4`，没有引入向量数据库。FAQ 仅保存经过 PII 过滤的归一化意图、安全答案和资料特征；report 与日志不输出员工身份、问题、答案或来源。
+v0.8.0 开发候选发布状态：增加 FAQ 后台预热、首次命中直发和资料缺口聚合，尚未部署生产；仍使用 SQLite（含 FTS5/BM25）和 `hybrid-v4`，没有引入向量数据库。FAQ 仅保存经过 PII 过滤的归一化意图、安全答案和资料特征；report 与日志不输出员工身份、答案或来源。
 
 长连接适配器依赖 `lark-oapi==1.7.3` 的私有 ACK 契约。升级 SDK 必须显式修改锁定版本，并通过 `tests/test_lark_sdk_contract.py` 的真实 SDK 合约测试后才能发布。

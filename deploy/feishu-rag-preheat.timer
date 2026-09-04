@@ -1,0 +1,11 @@
+[Unit]
+Description=Process Feishu RAG FAQ preheat jobs every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+Persistent=true
+Unit=feishu-rag-preheat.service
+
+[Install]
+WantedBy=timers.target
