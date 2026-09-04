@@ -898,6 +898,17 @@ class IndexStore:
     def count_documents(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
 
+    def document_lifecycle_counts(self) -> dict[str, int]:
+        counts = {"current": 0, "superseded": 0, "conflict": 0}
+        for row in self.connection.execute(
+            "SELECT lifecycle_state,COUNT(*) AS count FROM documents "
+            "GROUP BY lifecycle_state"
+        ).fetchall():
+            state = str(row["lifecycle_state"])
+            if state in counts:
+                counts[state] = int(row["count"])
+        return counts
+
     def knowledge_revision(self) -> int:
         return int(
             self.connection.execute(

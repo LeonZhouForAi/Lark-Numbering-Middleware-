@@ -47,7 +47,13 @@ def main() -> None:
             chunk_strategy_version=_chunk_strategy_version(),
             parser_version=_parser_version(),
         )
-        print(f"indexed_files={count} indexed_chunks={store.count_chunks()}")
+        lifecycle = store.document_lifecycle_counts()
+        print(
+            f"indexed_files={count} indexed_chunks={store.count_chunks()} "
+            f"current={lifecycle['current']} "
+            f"superseded={lifecycle['superseded']} "
+            f"conflict={lifecycle['conflict']}"
+        )
     finally:
         store.close()
 

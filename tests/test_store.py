@@ -1202,6 +1202,33 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_document_lifecycle_counts_include_zero_states(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                self.assertEqual(
+                    store.document_lifecycle_counts(),
+                    {"current": 0, "superseded": 0, "conflict": 0},
+                )
+                store.apply_document_snapshot(
+                    [
+                        PreparedDocument(
+                            "policy",
+                            "制度",
+                            "policy.txt",
+                            "v1",
+                            (Chunk("policy-chunk", "policy", "制度", "正文"),),
+                            lifecycle_state="conflict",
+                        )
+                    ]
+                )
+                self.assertEqual(
+                    store.document_lifecycle_counts(),
+                    {"current": 0, "superseded": 0, "conflict": 1},
+                )
+            finally:
+                store.close()
+
     def test_faq_migration_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "rag.sqlite3"

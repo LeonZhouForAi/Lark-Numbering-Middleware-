@@ -44,8 +44,14 @@ def test_parser_version_rejects_empty_values():
             raise AssertionError("expected empty parser version to be rejected")
 
 
-def test_main_passes_chunk_strategy_version_to_index_directory():
+def test_main_passes_versions_to_index_directory_and_prints_lifecycle(capsys):
     store = MagicMock()
+    store.count_chunks.return_value = 42
+    store.document_lifecycle_counts.return_value = {
+        "current": 3,
+        "superseded": 1,
+        "conflict": 2,
+    }
     with (
         patch.object(sys, "argv", ["index_local_documents.py", "docs"]),
         patch.dict(
@@ -67,4 +73,8 @@ def test_main_passes_chunk_strategy_version_to_index_directory():
         enable_ocr=True,
         chunk_strategy_version="hybrid-v4",
         parser_version="parser-v2",
+    )
+    assert (
+        capsys.readouterr().out
+        == "indexed_files=0 indexed_chunks=42 current=3 superseded=1 conflict=2\n"
     )
