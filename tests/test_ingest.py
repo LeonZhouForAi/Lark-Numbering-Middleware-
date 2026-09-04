@@ -400,6 +400,85 @@ class IngestTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_directory_marks_lower_revision_superseded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            documents = root / "documents"
+            documents.mkdir()
+            (documents / "HBW-OP-022 不合格品控制程序A1.txt").write_text(
+                "作废隔离代号红区", encoding="utf-8"
+            )
+            (documents / "HBW-OP-022 不合格品控制程序B1.txt").write_text(
+                "现行隔离代号蓝区", encoding="utf-8"
+            )
+            store = IndexStore(root / "index.sqlite3")
+            try:
+                self.assertEqual(index_directory(documents, store), 2)
+                self.assertEqual(store.search("红区"), [])
+                self.assertEqual(
+                    store.search("蓝区")[0].chunk.content,
+                    "现行隔离代号蓝区",
+                )
+                states = {
+                    row["document_version"]: row["lifecycle_state"]
+                    for row in store.connection.execute(
+                        "SELECT document_version,lifecycle_state FROM documents"
+                    )
+                }
+                self.assertEqual(states, {"A1": "superseded", "B1": "current"})
+            finally:
+                store.close()
+
+    def test_directory_keeps_uncomparable_duplicate_codes_searchable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            documents = root / "documents"
+            documents.mkdir()
+            (documents / "HBW-OP-022 不合格品控制程序.txt").write_text(
+                "未标版本处置规则", encoding="utf-8"
+            )
+            (documents / "HBW-OP-022 不合格品控制程序B1.txt").write_text(
+                "标注版本处置规则", encoding="utf-8"
+            )
+            store = IndexStore(root / "index.sqlite3")
+            try:
+                self.assertEqual(index_directory(documents, store), 2)
+                self.assertTrue(store.search("未标版本处置规则"))
+                self.assertTrue(store.search("标注版本处置规则"))
+                states = {
+                    row[0]
+                    for row in store.connection.execute(
+                        "SELECT lifecycle_state FROM documents"
+                    )
+                }
+                self.assertEqual(states, {"conflict"})
+            finally:
+                store.close()
+
+    def test_unchanged_directory_preserves_resolved_metadata_without_reextracting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            documents = root / "documents"
+            documents.mkdir()
+            path = documents / "HBW-OP-022 不合格品控制程序B1.txt"
+            path.write_text("现行处置规则", encoding="utf-8")
+            store = IndexStore(root / "index.sqlite3")
+            try:
+                self.assertEqual(index_directory(documents, store), 1)
+                with patch("feishu_rag.ingest.extract_sections") as extract:
+                    self.assertEqual(index_directory(documents, store), 0)
+                extract.assert_not_called()
+                metadata = store.connection.execute(
+                    "SELECT document_code,document_version,lifecycle_state,"
+                    "parser_version FROM documents"
+                ).fetchone()
+                self.assertEqual(
+                    tuple(metadata),
+                    ("HBW-OP-022", "B1", "current", "parser-v2"),
+                )
+            finally:
+                store.close()
+
     def test_index_directory_does_not_write_or_bump_when_indexing_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

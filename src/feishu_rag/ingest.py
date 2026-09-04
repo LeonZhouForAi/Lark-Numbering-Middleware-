@@ -11,6 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .chunker import chunk_text
+from .document_metadata import (
+    DocumentMetadata,
+    extract_document_metadata,
+    resolve_lifecycle_states,
+)
 from .logging_utils import configure_logging
 from .store import IndexStore, PreparedDocument
 from .semantic_chunker import AtomicUnit, SemanticPlanner, semantic_chunks
@@ -177,6 +182,7 @@ def _prepare_file(
     chunk_strategy_version: str = "local-v1",
     chunk_model: str = "",
     parser_version: str = "parser-v2",
+    metadata: DocumentMetadata | None = None,
 ) -> PreparedDocument | None:
     relative_path = path.relative_to(root).as_posix()
     source_id = _local_source_id(root, relative_path)
@@ -222,7 +228,20 @@ def _prepare_file(
             chunks = local_chunks()
     if not chunks:
         return None
-    return PreparedDocument(source_id, title, relative_path, checksum, tuple(chunks))
+    document_metadata = metadata or extract_document_metadata(path.name)
+    return PreparedDocument(
+        source_id,
+        title,
+        relative_path,
+        checksum,
+        tuple(chunks),
+        document_code=document_metadata.document_code or "",
+        document_version=document_metadata.document_version or "",
+        effective_date=document_metadata.effective_date or "",
+        lifecycle_state=document_metadata.lifecycle_state,
+        parser_version=parser_version,
+        decision_reason=document_metadata.decision_reason,
+    )
 
 
 def index_file(
@@ -251,6 +270,7 @@ def index_file(
         chunk_strategy_version=chunk_strategy_version,
         chunk_model=chunk_model,
         parser_version=parser_version,
+        metadata=extract_document_metadata(path.name),
     )
     if prepared is None:
         return False
@@ -275,17 +295,39 @@ def index_directory(
         raise FileNotFoundError(f"local root is not a directory: {root_path}")
     prepared_updates: list[PreparedDocument] = []
     retained_source_ids: set[str] = set()
-    for path in sorted(root_path.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
-            continue
+    supported_paths = [
+        path
+        for path in sorted(root_path.rglob("*"))
+        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+    ]
+    metadata_by_path = resolve_lifecycle_states(
+        {
+            path.relative_to(root_path).as_posix(): extract_document_metadata(path.name)
+            for path in supported_paths
+        }
+    )
+    for path in supported_paths:
         relative_path = path.relative_to(root_path).as_posix()
+        metadata = metadata_by_path[relative_path]
         source_id = _local_source_id(root_path, relative_path)
         checksum = _file_checksum(
             path, enable_ocr, chunk_strategy_version, chunk_model, parser_version
         )
         if store.document_checksum(source_id) == checksum:
             prepared_updates.append(
-                PreparedDocument(source_id, path.stem, relative_path, checksum, None)
+                PreparedDocument(
+                    source_id,
+                    path.stem,
+                    relative_path,
+                    checksum,
+                    None,
+                    document_code=metadata.document_code or "",
+                    document_version=metadata.document_version or "",
+                    effective_date=metadata.effective_date or "",
+                    lifecycle_state=metadata.lifecycle_state,
+                    parser_version=parser_version,
+                    decision_reason=metadata.decision_reason,
+                )
             )
             retained_source_ids.add(source_id)
             continue
@@ -298,6 +340,7 @@ def index_directory(
             chunk_strategy_version=chunk_strategy_version,
             chunk_model=chunk_model,
             parser_version=parser_version,
+            metadata=metadata,
         )
         if prepared is not None:
             prepared_updates.append(prepared)
