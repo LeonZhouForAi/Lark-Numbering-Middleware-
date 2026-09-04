@@ -1289,6 +1289,27 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_question_gap_aggregates_by_scope_status_and_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.record_question_gap(
+                    "global", "missing", "宠物补贴", 1, now=1.0
+                )
+                store.record_question_gap(
+                    "global", "missing", "宠物补贴", 1, now=2.0
+                )
+                store.record_question_gap(
+                    "global", "missing", "宠物补贴", 2, now=3.0
+                )
+                rows = store.query_question_gaps(min_count=1)
+                self.assertEqual(
+                    [(row["knowledge_revision"], row["count"]) for row in rows],
+                    [(1, 2), (2, 1)],
+                )
+            finally:
+                store.close()
+
     def test_faq_migration_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "rag.sqlite3"

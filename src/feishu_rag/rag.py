@@ -127,6 +127,36 @@ class RagService:
         self.rate_limit_per_day = rate_limit_per_day
         self.faq_service = faq_service
 
+    def _record_question_gap(
+        self,
+        question: str,
+        gap_type: str,
+        scope: RetrievalScope | None,
+        knowledge_revision: int | None,
+    ) -> None:
+        recorder = getattr(self.store, "record_question_gap", None)
+        if not callable(recorder) or FaqService.contains_personal_identifier(question):
+            return
+        if not isinstance(knowledge_revision, int) or isinstance(
+            knowledge_revision, bool
+        ):
+            return
+        scope_key = FaqService._scope_key(scope)
+        if not scope_key:
+            return
+        try:
+            recorder(
+                scope_key,
+                gap_type,
+                question,
+                knowledge_revision,
+            )
+        except Exception as exc:
+            logger.warning(
+                "question_gap_record_failed error_type=%s",
+                type(exc).__name__,
+            )
+
     @staticmethod
     def _context(results: list[SearchResult]) -> tuple[str, list[Citation]]:
         citations: list[Citation] = []
@@ -277,6 +307,12 @@ class RagService:
                 scope=scope,
             )
             if not results:
+                self._record_question_gap(
+                    question,
+                    "missing",
+                    scope,
+                    snapshot_revision,
+                )
                 return RagAnswer(
                     "知识库中暂无依据，请换一种问法或联系文控管理员。",
                     [],
@@ -364,8 +400,20 @@ class RagService:
                         continue
                     return RagAnswer(UPDATING_ANSWER, [])
             if decision.status == "ambiguous":
+                self._record_question_gap(
+                    question,
+                    "ambiguous",
+                    scope,
+                    snapshot_revision,
+                )
                 return RagAnswer(decision.clarifying_question, [], "ambiguous")
             if decision.status == "insufficient":
+                self._record_question_gap(
+                    question,
+                    "insufficient",
+                    scope,
+                    snapshot_revision,
+                )
                 if faq_active and observation is not None:
                     try:
                         self.faq_service.record_rejected_answer(observation)

@@ -330,6 +330,20 @@ class IndexStore:
                     updated_at REAL NOT NULL CHECK(updated_at >= 0)
                 )
                 """,
+                """
+                CREATE TABLE IF NOT EXISTS question_gaps (
+                    scope_key TEXT NOT NULL,
+                    gap_type TEXT NOT NULL
+                        CHECK(gap_type IN ('missing','insufficient','ambiguous')),
+                    normalized_key TEXT NOT NULL,
+                    display_question TEXT NOT NULL,
+                    knowledge_revision INTEGER NOT NULL CHECK(knowledge_revision >= 0),
+                    count INTEGER NOT NULL DEFAULT 1 CHECK(count >= 1),
+                    first_seen_at REAL NOT NULL CHECK(first_seen_at >= 0),
+                    last_seen_at REAL NOT NULL CHECK(last_seen_at >= 0),
+                    PRIMARY KEY(scope_key,gap_type,normalized_key,knowledge_revision)
+                )
+                """,
                 _FAQ_ENTRIES_SCHEMA,
                 _FAQ_ALIASES_SCHEMA,
                 _FAQ_OBSERVATION_SCHEMA,
@@ -1260,6 +1274,64 @@ class IndexStore:
         except Exception:
             self.connection.rollback()
             raise
+
+    def record_question_gap(
+        self,
+        scope_key: str,
+        gap_type: str,
+        display_question: str,
+        knowledge_revision: int,
+        *,
+        now: float | None = None,
+    ) -> None:
+        if not isinstance(scope_key, str) or not scope_key.strip():
+            raise ValueError("scope_key must not be empty")
+        if gap_type not in {"missing", "insufficient", "ambiguous"}:
+            raise ValueError("invalid gap_type")
+        if type(knowledge_revision) is not int or knowledge_revision < 0:
+            raise ValueError("knowledge_revision must be non-negative")
+        normalized = _normalize(display_question)
+        if not normalized:
+            raise ValueError("display_question must not be empty")
+        normalized_key = sha256(normalized.encode("utf-8")).hexdigest()
+        timestamp = self._validate_faq_now(time.time() if now is None else now)
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO question_gaps("
+                "scope_key,gap_type,normalized_key,display_question,knowledge_revision,"
+                "count,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,1,?,?) "
+                "ON CONFLICT(scope_key,gap_type,normalized_key,knowledge_revision) "
+                "DO UPDATE SET count=count+1,last_seen_at=excluded.last_seen_at,"
+                "display_question=excluded.display_question",
+                (
+                    scope_key.strip(),
+                    gap_type,
+                    normalized_key,
+                    normalized,
+                    knowledge_revision,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+    def query_question_gaps(
+        self,
+        *,
+        min_count: int = 2,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        if type(min_count) is not int or min_count < 1:
+            raise ValueError("min_count must be positive")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        return list(
+            self.connection.execute(
+                "SELECT scope_key,gap_type,display_question,knowledge_revision,count,"
+                "first_seen_at,last_seen_at FROM question_gaps WHERE count>=? "
+                "ORDER BY count DESC,last_seen_at DESC,scope_key,gap_type LIMIT ?",
+                (min_count, limit),
+            ).fetchall()
+        )
 
     def knowledge_revision(self) -> int:
         return int(

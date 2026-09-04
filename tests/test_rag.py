@@ -49,6 +49,19 @@ class RecordingStore:
         return 1
 
 
+class GapRecordingStore(RecordingStore):
+    def __init__(self, results=None):
+        super().__init__(results)
+        self.gaps = []
+
+    def record_question_gap(
+        self, scope_key, gap_type, display_question, knowledge_revision, *, now=None
+    ):
+        self.gaps.append(
+            (scope_key, gap_type, display_question, knowledge_revision)
+        )
+
+
 class StaleDirectHitStore(RecordingStore):
     def __init__(self, results=None):
         super().__init__(results)
@@ -974,6 +987,41 @@ def test_multiple_clarifying_questions_are_rejected() -> None:
 
     with pytest.raises(RagResponseError, match="一个"):
         RagService(RecordingStore([_result()]), llm).answer("工时是多少")
+
+
+@pytest.mark.parametrize(
+    ("results", "response", "expected_type"),
+    [
+        ([], None, "missing"),
+        (
+            [_result()],
+            {
+                "status": "insufficient",
+                "answer": "",
+                "clarifying_question": "",
+            },
+            "insufficient",
+        ),
+        (
+            [_result()],
+            {
+                "status": "ambiguous",
+                "answer": "",
+                "clarifying_question": "请说明产品系列？",
+            },
+            "ambiguous",
+        ),
+    ],
+)
+def test_rag_records_question_gap_for_non_answerable_statuses(
+    results, response, expected_type
+) -> None:
+    store = GapRecordingStore(results)
+    llm = FakeLLM() if response is None else FakeLLM(response)
+
+    RagService(store, llm).answer("工时是多少")
+
+    assert store.gaps == [("global", expected_type, "工时是多少", 1)]
 
 
 class DeepSeekClientTests(unittest.TestCase):
