@@ -1393,10 +1393,12 @@ class IndexStore:
             raise ValueError("invalid fact_type")
         return list(
             self.connection.execute(
-                "SELECT source_id,sheet_name,row_number,fact_type,part_number,"
-                "series_name,process_stage,operation_name,metric_name,numeric_value,"
-                "text_value,unit FROM structured_facts WHERE fact_type=? "
-                "ORDER BY source_id,sheet_name,row_number,id",
+                "SELECT f.source_id,f.sheet_name,f.row_number,f.fact_type,"
+                "f.part_number,f.series_name,f.process_stage,f.operation_name,"
+                "f.metric_name,f.numeric_value,f.text_value,f.unit "
+                "FROM structured_facts f JOIN documents d ON d.source_id=f.source_id "
+                "WHERE f.fact_type=? AND d.lifecycle_state!='superseded' "
+                "ORDER BY f.source_id,f.sheet_name,f.row_number,f.id",
                 (fact_type,),
             ).fetchall()
         )

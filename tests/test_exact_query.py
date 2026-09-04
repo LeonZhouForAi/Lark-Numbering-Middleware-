@@ -99,3 +99,30 @@ def test_unknown_part_number_falls_back_to_rag(tmp_path) -> None:
         assert ExactQueryService(store).answer("UNKNOWN99总工时") is None
     finally:
         store.close()
+
+
+def test_exact_query_excludes_superseded_document_facts(tmp_path) -> None:
+    store = _store_with_facts(tmp_path)
+    old_fact = StructuredFact(
+        "old-ie",
+        "UPPH",
+        2,
+        "upph",
+        operation_name="Cell AOI2线开机",
+        metric_name="UPPH",
+        numeric_value=999,
+    )
+    store.upsert_document(
+        "old-ie",
+        "旧UPPH",
+        "old.xlsx",
+        "old-v1",
+        [Chunk("old-chunk", "old-ie", "旧UPPH", "旧数据")],
+        lifecycle_state="superseded",
+        structured_facts=[old_fact],
+    )
+    try:
+        answer = ExactQueryService(store).answer("Cell AOI2线开机UPPH是多少")
+        assert answer.text == "Cell AOI2线开机 UPPH：450"
+    finally:
+        store.close()
