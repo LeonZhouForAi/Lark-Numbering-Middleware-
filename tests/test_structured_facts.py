@@ -47,7 +47,7 @@ def test_extracts_part_number_stage_and_total_hours(tmp_path) -> None:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "By料号"
-    sheet.append(["序号", "系列", "料号", "工时", None, "合计"])
+    sheet.append(["序号", "类别", "料号", "工时", None, "合计"])
     sheet.append([None, None, None, "切割", "绑定", None])
     sheet.append([1, "常规系列", "055010D", 99, 90, 1026])
     workbook.save(path)

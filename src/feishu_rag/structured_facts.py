@@ -108,10 +108,10 @@ def _part_hour_facts(sheet: Any, source_id: str) -> list[StructuredFact] | None:
         return None
     first = [_text(value) for value in rows[0]]
     second = [_text(value) for value in rows[1]]
-    if "料号" not in first or "系列" not in first:
+    if "料号" not in first or not ({"系列", "类别"} & set(first)):
         return None
     part_col = first.index("料号")
-    series_col = first.index("系列")
+    series_col = first.index("系列") if "系列" in first else first.index("类别")
     stage_columns = []
     for column in range(len(first)):
         stage = second[column] or first[column]
