@@ -16,7 +16,14 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Collection, Iterable
 
-from .models import Chunk, FaqMatch, FaqObservation, RetrievalScope, SearchResult
+from .models import (
+    Chunk,
+    FaqMatch,
+    FaqObservation,
+    PreheatJob,
+    RetrievalScope,
+    SearchResult,
+)
 
 
 _TOKEN_RE = re.compile(r"[\u4e00-\u9fff]+|[a-z0-9_]+")
@@ -957,6 +964,137 @@ class IndexStore:
             if state in counts:
                 counts[state] = int(row["count"])
         return counts
+
+    def enqueue_preheat_job(
+        self,
+        scope_key: str,
+        knowledge_revision: int,
+        *,
+        max_retries: int = 1,
+        now: float | None = None,
+    ) -> bool:
+        if not isinstance(scope_key, str) or not scope_key.strip():
+            raise ValueError("scope_key must not be empty")
+        if type(knowledge_revision) is not int or knowledge_revision < 0:
+            raise ValueError("knowledge_revision must be a non-negative integer")
+        if type(max_retries) is not int or not 0 <= max_retries <= 2:
+            raise ValueError("max_retries must be between 0 and 2")
+        timestamp = self._validate_faq_now(time.time() if now is None else now)
+        with self.connection:
+            cursor = self.connection.execute(
+                "INSERT OR IGNORE INTO faq_preheat_jobs("
+                "id,scope_key,knowledge_revision,state,retry_count,max_retries,"
+                "created_at) VALUES(?,?,?,'queued',0,?,?)",
+                (
+                    uuid.uuid4().hex,
+                    scope_key.strip(),
+                    knowledge_revision,
+                    max_retries,
+                    timestamp,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def claim_preheat_job(
+        self,
+        *,
+        now: float | None = None,
+        lease_seconds: float = 600.0,
+    ) -> PreheatJob | None:
+        timestamp = self._validate_faq_now(time.time() if now is None else now)
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        _execute_with_lock_retry(self.connection, "BEGIN IMMEDIATE")
+        try:
+            self.connection.execute(
+                "UPDATE faq_preheat_jobs SET state='queued',started_at=NULL,"
+                "lease_expires_at=NULL WHERE state='running' "
+                "AND lease_expires_at IS NOT NULL AND lease_expires_at <= ? "
+                "AND retry_count <= max_retries",
+                (timestamp,),
+            )
+            row = self.connection.execute(
+                "SELECT id,scope_key,knowledge_revision,retry_count "
+                "FROM faq_preheat_jobs WHERE state='queued' "
+                "ORDER BY created_at,id LIMIT 1"
+            ).fetchone()
+            if row is None:
+                self.connection.commit()
+                return None
+            self.connection.execute(
+                "UPDATE faq_preheat_jobs SET state='running',started_at=?,"
+                "lease_expires_at=? WHERE id=? AND state='queued'",
+                (timestamp, timestamp + lease_seconds, row["id"]),
+            )
+            self.connection.commit()
+            return PreheatJob(
+                str(row["id"]),
+                str(row["scope_key"]),
+                int(row["knowledge_revision"]),
+                int(row["retry_count"]),
+            )
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def complete_preheat_job(
+        self,
+        job_id: str,
+        *,
+        generated: int,
+        failed: int,
+        candidate_count: int | None = None,
+        now: float | None = None,
+    ) -> None:
+        if any(type(value) is not int or value < 0 for value in (generated, failed)):
+            raise ValueError("generated and failed must be non-negative integers")
+        total = generated + failed if candidate_count is None else candidate_count
+        if type(total) is not int or total < generated + failed:
+            raise ValueError("candidate_count must cover generated and failed")
+        timestamp = self._validate_faq_now(time.time() if now is None else now)
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE faq_preheat_jobs SET state='completed',finished_at=?,"
+                "lease_expires_at=NULL,candidate_count=?,generated_count=?,"
+                "failed_count=? WHERE id=? AND state='running'",
+                (timestamp, total, generated, failed, job_id),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError("preheat job is not running")
+
+    def fail_preheat_job(
+        self,
+        job_id: str,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        timestamp = self._validate_faq_now(time.time() if now is None else now)
+        _execute_with_lock_retry(self.connection, "BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT retry_count,max_retries FROM faq_preheat_jobs "
+                "WHERE id=? AND state='running'",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("preheat job is not running")
+            retry_count = int(row["retry_count"]) + 1
+            queued = retry_count <= int(row["max_retries"])
+            self.connection.execute(
+                "UPDATE faq_preheat_jobs SET state=?,retry_count=?,"
+                "started_at=NULL,lease_expires_at=NULL,finished_at=? WHERE id=?",
+                (
+                    "queued" if queued else "failed",
+                    retry_count,
+                    None if queued else timestamp,
+                    job_id,
+                ),
+            )
+            self.connection.commit()
+            return queued
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def knowledge_revision(self) -> int:
         return int(

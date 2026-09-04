@@ -522,6 +522,24 @@ class FeishuSyncTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_changed_space_sync_enqueues_one_preheat_job(self):
+        client = FakeFeishuClient()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                first = sync_wiki_space("space-1", client, store)
+                self.assertGreater(first.indexed, 0)
+                job = store.claim_preheat_job(now=10.0)
+                self.assertIsNotNone(job)
+                self.assertEqual(job.scope_key, "space-1")
+                store.complete_preheat_job(job.id, generated=0, failed=0, now=11.0)
+
+                second = sync_wiki_space("space-1", client, store)
+                self.assertEqual((second.indexed, second.deleted), (0, 0))
+                self.assertIsNone(store.claim_preheat_job(now=12.0))
+            finally:
+                store.close()
+
     def test_sync_does_not_bump_revision_after_mid_sync_failure(self):
         client = PaginationFailureClient("second_page")
         with tempfile.TemporaryDirectory() as tmp:

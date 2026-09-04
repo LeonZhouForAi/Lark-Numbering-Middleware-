@@ -154,6 +154,8 @@ def sync_wiki_space(
     chunk_strategy_version: str = "local-v1",
     chunk_model: str = "",
     enable_ocr: bool = True,
+    preheat_enabled: bool = True,
+    preheat_max_retries: int = 1,
 ) -> SyncResult:
     nodes_seen = skipped = 0
     prepared_updates: list[PreparedDocument] = []
@@ -318,6 +320,18 @@ def sync_wiki_space(
         prune_prefix=f"feishu:{space_id}:",
         retained=retained_source_ids,
     )
+    if preheat_enabled and (indexed or deleted):
+        try:
+            store.enqueue_preheat_job(
+                space_id,
+                store.knowledge_revision(),
+                max_retries=preheat_max_retries,
+            )
+        except Exception as exc:
+            logger.warning(
+                "preheat_enqueue_failed error_type=%s",
+                type(exc).__name__,
+            )
     return SyncResult(nodes_seen, indexed, skipped, deleted)
 
 
@@ -364,6 +378,8 @@ def main() -> None:
             semantic_planner=semantic_planner,
             chunk_strategy_version=settings.rag_chunk_strategy_version,
             chunk_model=settings.deepseek_chunk_model if semantic_planner else "",
+            preheat_enabled=settings.rag_faq_preheat_enabled,
+            preheat_max_retries=settings.rag_faq_preheat_max_retries,
         )
         logger.info(
             "sync_completed nodes_seen=%d indexed=%d skipped=%d deleted=%d",

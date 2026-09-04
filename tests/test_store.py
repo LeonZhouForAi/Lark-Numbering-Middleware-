@@ -1240,6 +1240,55 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_preheat_job_is_deduplicated_and_claimed_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                self.assertTrue(
+                    store.enqueue_preheat_job(
+                        "space-a", 3, max_retries=1, now=10.0
+                    )
+                )
+                self.assertFalse(
+                    store.enqueue_preheat_job(
+                        "space-a", 3, max_retries=1, now=11.0
+                    )
+                )
+                job = store.claim_preheat_job(now=12.0)
+                self.assertIsNotNone(job)
+                self.assertEqual(job.scope_key, "space-a")
+                self.assertEqual(job.knowledge_revision, 3)
+                self.assertIsNone(store.claim_preheat_job(now=12.0))
+                store.complete_preheat_job(
+                    job.id, generated=4, failed=1, now=13.0
+                )
+                self.assertEqual(
+                    tuple(
+                        store.connection.execute(
+                            "SELECT state,generated_count,failed_count "
+                            "FROM faq_preheat_jobs WHERE id=?",
+                            (job.id,),
+                        ).fetchone()
+                    ),
+                    ("completed", 4, 1),
+                )
+            finally:
+                store.close()
+
+    def test_failed_preheat_job_retries_once_then_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                store.enqueue_preheat_job("space-a", 1, max_retries=1, now=1.0)
+                first = store.claim_preheat_job(now=2.0)
+                self.assertTrue(store.fail_preheat_job(first.id, now=3.0))
+                second = store.claim_preheat_job(now=4.0)
+                self.assertEqual(second.id, first.id)
+                self.assertFalse(store.fail_preheat_job(second.id, now=5.0))
+                self.assertIsNone(store.claim_preheat_job(now=6.0))
+            finally:
+                store.close()
+
     def test_faq_migration_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "rag.sqlite3"
