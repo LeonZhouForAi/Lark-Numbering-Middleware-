@@ -191,6 +191,14 @@ FAQ 在最近 15 天内同一意图/同义问法第 3 次安全回答后晋级�
 
 资料同步发生变化后会写入后台预热作业。预热器按本地规则为每个空间选出最多 10 个高价值切片，再以最多 2 个并行 DeepSeek 请求生成标准问题、同义问法和答案；员工首次命中即可从 SQLite 直接回复。未变化候选不会重复调用模型，资料更新会使旧预热答案失效。
 
+IE 工作簿会额外生成结构化事实，当前支持三类精确问题：
+
+- “Cell AOI2线开机的 UPPH 是多少？”
+- “氧化物系列绑定工时是多少？”
+- “055010D 总工时是多少？”
+
+精确命中直接读取 SQLite 原值，不调用 DeepSeek，也不让模型计算数字。问题缺少产品系列、工序或工段时只追问一个必要条件；未知料号或无法唯一命中时回退普通 RAG。Excel 中的 `0` 是有效值，不会被当成无结果。
+
 ```bash
 python scripts/preheat_faq.py data/rag.sqlite3 --once
 python scripts/report_question_gaps.py --db data/rag.sqlite3 --min-count 2
@@ -258,6 +266,6 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 - 缺少 API Key 时服务健康检查报配置不完整，且不会发起外部请求。
 - 回滚预检不修改数据库；带 `--execute` 才会创建独占备份并移除 v2 FTS。
 
-v0.8.0 开发候选发布状态：增加 FAQ 后台预热、首次命中直发和资料缺口聚合，尚未部署生产；仍使用 SQLite（含 FTS5/BM25）和 `hybrid-v4`，没有引入向量数据库。FAQ 仅保存经过 PII 过滤的归一化意图、安全答案和资料特征；report 与日志不输出员工身份、答案或来源。
+v0.9.0 开发候选发布状态：增加 IE UPPH、系列工时和料号工时精确查询，尚未部署生产；仍使用 SQLite（含 FTS5/BM25）和 `hybrid-v4`，没有引入向量数据库。FAQ 仅保存经过 PII 过滤的归一化意图、安全答案和资料特征；report 与日志不输出员工身份、答案或来源。
 
 长连接适配器依赖 `lark-oapi==1.7.3` 的私有 ACK 契约。升级 SDK 必须显式修改锁定版本，并通过 `tests/test_lark_sdk_contract.py` 的真实 SDK 合约测试后才能发布。
