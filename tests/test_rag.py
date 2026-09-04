@@ -921,6 +921,61 @@ def test_invalid_new_answer_decisions_are_rejected(
         RagService(RecordingStore([_result()]), FakeLLM(response)).answer("报销流程")
 
 
+def test_answer_prompt_defines_type_formats_and_new_json_contract() -> None:
+    llm = FakeLLM()
+
+    RagService(RecordingStore([_result()]), llm).answer("报销流程")
+
+    system_prompt = llm.calls[0][0]
+    assert "流程类" in system_prompt
+    assert "制度类" in system_prompt
+    assert "数据类" in system_prompt
+    assert "只追问一个最关键条件" in system_prompt
+    assert "status、answer、clarifying_question" in system_prompt
+    assert "不得自行计算" in system_prompt
+
+
+def test_answer_format_removes_trailing_spaces_and_excess_blank_lines() -> None:
+    llm = FakeLLM(
+        {
+            "status": "answerable",
+            "answer": "结论。   \n\n\n\n1. 第一步  \n2. 第二步",
+            "clarifying_question": "",
+        }
+    )
+
+    answer = RagService(RecordingStore([_result()]), llm).answer("流程是什么")
+
+    assert answer.text == "结论。\n\n1. 第一步\n2. 第二步"
+
+
+def test_clarifying_question_without_question_mark_gets_one() -> None:
+    llm = FakeLLM(
+        {
+            "status": "ambiguous",
+            "answer": "",
+            "clarifying_question": "请说明要查询的产品系列",
+        }
+    )
+
+    answer = RagService(RecordingStore([_result()]), llm).answer("工时是多少")
+
+    assert answer.text == "请说明要查询的产品系列？"
+
+
+def test_multiple_clarifying_questions_are_rejected() -> None:
+    llm = FakeLLM(
+        {
+            "status": "ambiguous",
+            "answer": "",
+            "clarifying_question": "请说明产品系列？还要查询哪个工序？",
+        }
+    )
+
+    with pytest.raises(RagResponseError, match="一个"):
+        RagService(RecordingStore([_result()]), llm).answer("工时是多少")
+
+
 class DeepSeekClientTests(unittest.TestCase):
     def test_posts_chat_completion_payload(self):
         seen = {}
