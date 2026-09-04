@@ -986,7 +986,18 @@ class StoreTests(unittest.TestCase):
                         "faq_aliases",
                         "faq_observation_daily",
                         "faq_metrics_daily",
+                        "faq_preheat_jobs",
+                        "faq_preheat_candidates",
                     }.issubset(table_names)
+                )
+                faq_columns = {
+                    row[1]
+                    for row in store.connection.execute(
+                        "PRAGMA table_info(faq_entries)"
+                    ).fetchall()
+                }
+                self.assertTrue(
+                    {"origin", "preheat_candidate_signature"}.issubset(faq_columns)
                 )
                 self.assertEqual(store.knowledge_revision(), 0)
                 self.assertEqual(
@@ -1647,7 +1658,11 @@ class StoreTests(unittest.TestCase):
                 )
                 with self.assertRaises(sqlite3.IntegrityError):
                     store.connection.execute(
-                        "INSERT INTO faq_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "INSERT INTO faq_entries("
+                        "id,intent_key,scope_key,canonical_question,answer,"
+                        "source_signature,source_ids_json,knowledge_revision,state,"
+                        "direct_hits,created_at,updated_at,last_hit_at"
+                        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             "faq-invalid-state", "intent-2", "scope-2", "问题",
                             "答案", "source", "[]", 0, "active", 0, 1.0, 1.0, None,
@@ -1655,7 +1670,11 @@ class StoreTests(unittest.TestCase):
                     )
                 with self.assertRaises(sqlite3.IntegrityError):
                     store.connection.execute(
-                        "INSERT INTO faq_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "INSERT INTO faq_entries("
+                        "id,intent_key,scope_key,canonical_question,answer,"
+                        "source_signature,source_ids_json,knowledge_revision,state,"
+                        "direct_hits,created_at,updated_at,last_hit_at"
+                        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             "faq-invalid-revision", "intent-3", "scope-3", "问题",
                             "答案", "source", "[]", -1, "enabled", 0, 1.0, 1.0, None,

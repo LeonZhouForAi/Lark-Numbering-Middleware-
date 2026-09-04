@@ -62,6 +62,10 @@ class Settings:
     rag_faq_window_days: int = 15
     rag_faq_min_text_similarity: float = 0.82
     rag_faq_min_source_overlap: float = 0.80
+    rag_faq_preheat_enabled: bool = True
+    rag_faq_preheat_max_per_space: int = 10
+    rag_faq_preheat_workers: int = 2
+    rag_faq_preheat_max_retries: int = 1
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "Settings":
@@ -160,6 +164,23 @@ class Settings:
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ConfigError(f"{name} 必须在 0 到 1 之间且为有限数字")
             faq_similarities[name] = value
+        faq_preheat_enabled = _as_bool(
+            env.get("RAG_FAQ_PREHEAT_ENABLED", "true"),
+            "RAG_FAQ_PREHEAT_ENABLED",
+        )
+        faq_preheat_values: dict[str, int] = {}
+        for name, default, minimum, maximum in (
+            ("RAG_FAQ_PREHEAT_MAX_PER_SPACE", "10", 1, 50),
+            ("RAG_FAQ_PREHEAT_WORKERS", "2", 1, 8),
+            ("RAG_FAQ_PREHEAT_MAX_RETRIES", "1", 0, 2),
+        ):
+            try:
+                value = int(env.get(name, default))
+            except ValueError as exc:
+                raise ConfigError(f"{name} 必须是 {minimum} 到 {maximum} 的整数") from exc
+            if not minimum <= value <= maximum:
+                raise ConfigError(f"{name} 必须在 {minimum} 到 {maximum} 之间")
+            faq_preheat_values[name] = value
         strategy_version = env.get("RAG_CHUNK_STRATEGY_VERSION", "hybrid-v4").strip()
         if not strategy_version:
             raise ConfigError("RAG_CHUNK_STRATEGY_VERSION 不能为空")
@@ -196,6 +217,14 @@ class Settings:
             rag_faq_window_days=faq_window_days,
             rag_faq_min_text_similarity=faq_similarities["RAG_FAQ_MIN_TEXT_SIMILARITY"],
             rag_faq_min_source_overlap=faq_similarities["RAG_FAQ_MIN_SOURCE_OVERLAP"],
+            rag_faq_preheat_enabled=faq_preheat_enabled,
+            rag_faq_preheat_max_per_space=faq_preheat_values[
+                "RAG_FAQ_PREHEAT_MAX_PER_SPACE"
+            ],
+            rag_faq_preheat_workers=faq_preheat_values["RAG_FAQ_PREHEAT_WORKERS"],
+            rag_faq_preheat_max_retries=faq_preheat_values[
+                "RAG_FAQ_PREHEAT_MAX_RETRIES"
+            ],
         )
 
     def __repr__(self) -> str:
@@ -223,5 +252,9 @@ class Settings:
             f"rag_faq_window_days={self.rag_faq_window_days!r}, "
             f"rag_faq_min_text_similarity={self.rag_faq_min_text_similarity!r}, "
             f"rag_faq_min_source_overlap={self.rag_faq_min_source_overlap!r}, "
+            f"rag_faq_preheat_enabled={self.rag_faq_preheat_enabled!r}, "
+            f"rag_faq_preheat_max_per_space={self.rag_faq_preheat_max_per_space!r}, "
+            f"rag_faq_preheat_workers={self.rag_faq_preheat_workers!r}, "
+            f"rag_faq_preheat_max_retries={self.rag_faq_preheat_max_retries!r}, "
             f"log_level={self.log_level!r})"
         )

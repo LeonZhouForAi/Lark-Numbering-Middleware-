@@ -59,3 +59,23 @@ class FaqObservation:
     source_signature: str
     knowledge_revision: int
     source_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PreheatJob:
+    id: str
+    scope_key: str
+    knowledge_revision: int
+    retry_count: int = 0
+
+
+@dataclass(frozen=True)
+class PreheatCandidate:
+    signature: str
+    scope_key: str
+    knowledge_revision: int
+    chunk_id: str
+    source_id: str
+    title: str
+    content: str
+    score: int

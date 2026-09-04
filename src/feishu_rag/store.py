@@ -289,6 +289,39 @@ class IndexStore:
                     updated_at REAL NOT NULL
                 )
                 """,
+                """
+                CREATE TABLE IF NOT EXISTS faq_preheat_jobs (
+                    id TEXT PRIMARY KEY,
+                    scope_key TEXT NOT NULL,
+                    knowledge_revision INTEGER NOT NULL CHECK(knowledge_revision >= 0),
+                    state TEXT NOT NULL CHECK(state IN ('queued','running','completed','failed')),
+                    retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count >= 0),
+                    max_retries INTEGER NOT NULL CHECK(max_retries BETWEEN 0 AND 2),
+                    created_at REAL NOT NULL CHECK(created_at >= 0),
+                    started_at REAL,
+                    lease_expires_at REAL,
+                    finished_at REAL,
+                    candidate_count INTEGER NOT NULL DEFAULT 0 CHECK(candidate_count >= 0),
+                    generated_count INTEGER NOT NULL DEFAULT 0 CHECK(generated_count >= 0),
+                    failed_count INTEGER NOT NULL DEFAULT 0 CHECK(failed_count >= 0),
+                    UNIQUE(scope_key, knowledge_revision)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS faq_preheat_candidates (
+                    candidate_signature TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL REFERENCES faq_preheat_jobs(id) ON DELETE CASCADE,
+                    scope_key TEXT NOT NULL,
+                    knowledge_revision INTEGER NOT NULL CHECK(knowledge_revision >= 0),
+                    chunk_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    score INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('selected','generated','rejected','failed')),
+                    faq_id TEXT,
+                    created_at REAL NOT NULL CHECK(created_at >= 0),
+                    updated_at REAL NOT NULL CHECK(updated_at >= 0)
+                )
+                """,
                 _FAQ_ENTRIES_SCHEMA,
                 _FAQ_ALIASES_SCHEMA,
                 _FAQ_OBSERVATION_SCHEMA,
@@ -330,6 +363,22 @@ class IndexStore:
                 )
             self._migrate_faq_entries_constraints()
             self._migrate_faq_observation_constraints()
+            faq_entry_columns = {
+                row[1]
+                for row in self.connection.execute(
+                    "PRAGMA table_info(faq_entries)"
+                ).fetchall()
+            }
+            if "origin" not in faq_entry_columns:
+                self.connection.execute(
+                    "ALTER TABLE faq_entries ADD COLUMN origin TEXT NOT NULL "
+                    "DEFAULT 'observed' CHECK(origin IN ('observed','preheated'))"
+                )
+            if "preheat_candidate_signature" not in faq_entry_columns:
+                self.connection.execute(
+                    "ALTER TABLE faq_entries ADD COLUMN preheat_candidate_signature "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
 
             document_columns = {
                 row[1]

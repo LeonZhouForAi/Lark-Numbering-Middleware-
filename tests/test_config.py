@@ -138,6 +138,47 @@ class SettingsTests(unittest.TestCase):
             self.assertIn(name, rendered)
         self.assertNotIn("deepseek-secret-value", rendered)
 
+    def test_faq_preheat_defaults(self):
+        with patch.dict(os.environ, self._base_env(), clear=True):
+            settings = Settings.from_env()
+        self.assertTrue(settings.rag_faq_preheat_enabled)
+        self.assertEqual(settings.rag_faq_preheat_max_per_space, 10)
+        self.assertEqual(settings.rag_faq_preheat_workers, 2)
+        self.assertEqual(settings.rag_faq_preheat_max_retries, 1)
+
+    def test_faq_preheat_values_are_configurable(self):
+        env = self._base_env()
+        env.update(
+            RAG_FAQ_PREHEAT_ENABLED="false",
+            RAG_FAQ_PREHEAT_MAX_PER_SPACE="25",
+            RAG_FAQ_PREHEAT_WORKERS="4",
+            RAG_FAQ_PREHEAT_MAX_RETRIES="2",
+        )
+        with patch.dict(os.environ, env, clear=True):
+            settings = Settings.from_env()
+        self.assertFalse(settings.rag_faq_preheat_enabled)
+        self.assertEqual(settings.rag_faq_preheat_max_per_space, 25)
+        self.assertEqual(settings.rag_faq_preheat_workers, 4)
+        self.assertEqual(settings.rag_faq_preheat_max_retries, 2)
+
+    def test_faq_preheat_rejects_invalid_values(self):
+        cases = [
+            ("RAG_FAQ_PREHEAT_ENABLED", "maybe"),
+            ("RAG_FAQ_PREHEAT_MAX_PER_SPACE", "0"),
+            ("RAG_FAQ_PREHEAT_MAX_PER_SPACE", "51"),
+            ("RAG_FAQ_PREHEAT_MAX_PER_SPACE", "x"),
+            ("RAG_FAQ_PREHEAT_WORKERS", "0"),
+            ("RAG_FAQ_PREHEAT_WORKERS", "9"),
+            ("RAG_FAQ_PREHEAT_MAX_RETRIES", "-1"),
+            ("RAG_FAQ_PREHEAT_MAX_RETRIES", "3"),
+        ]
+        for name, value in cases:
+            env = self._base_env()
+            env[name] = value
+            with self.subTest(name=name), patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(ConfigError, name):
+                    Settings.from_env()
+
     def test_question_max_chars_defaults_to_500(self):
         with patch.dict(os.environ, self._base_env(), clear=True):
             self.assertEqual(Settings.from_env().rag_question_max_chars, 500)
