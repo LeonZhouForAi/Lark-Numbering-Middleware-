@@ -100,13 +100,23 @@ DeepSeek 使用 OpenAI 兼容的 `/chat/completions` 接口，模型和价格以
 
 ### 索引本地文档
 
-把需要检索的 PDF、DOCX、Markdown、TXT 文件复制到 Ubuntu 的 `documents/`。`.doc` 和 `.wps` 请先转换为 `.docx`。扫描型 PDF 需要中文 OCR，Docker 镜像会安装 Poppler 和 Tesseract 中文语言包。
+把需要检索的 PDF、DOCX、XLSX、Markdown、TXT 文件复制到 Ubuntu 的 `documents/`。`.doc` 和 `.wps` 请先转换为 `.docx`，`.xls` 请先转换为 `.xlsx`。扫描型 PDF 需要中文 OCR，Docker 镜像会安装 Poppler 和 Tesseract 中文语言包。
 
 ```bash
 python scripts/index_local_documents.py documents --db data/rag.sqlite3
 ```
 
-索引过程在服务器本地解析和 OCR，先按结构初切，再将文档正文按批次发送给 DeepSeek 做语义分组。模型只返回段落编号和检索元数据，程序用原文重组切片。DOCX 会按文档顺序提取父页正文、表格和嵌套可见文本；混合 PDF 仅对没有原生文本的页面逐页 OCR。重复运行同一个文件会按内容、模型和策略签名跳过，不会产生重复片段；模型失败时自动退回本地切片。
+索引过程在服务器本地解析和 OCR，先按结构初切，再将文档正文按批次发送给 DeepSeek 做语义分组。模型只返回段落编号和检索元数据，程序用原文重组切片。DOCX 会按文档顺序提取父页正文、表格和嵌套可见文本；XLSX 会按工作表、合并表头和数据行生成可检索文本；混合 PDF 仅对没有原生文本的页面逐页 OCR。重复运行同一个文件会按内容、解析器、模型和策略签名跳过，不会产生重复片段；模型失败时自动退回本地切片。
+
+本地文件名形如 `HBW-OP-022 不合格品控制程序B1.docx` 时，索引会提取文件编号 `HBW-OP-022` 和版本 `B1`。同一编号且版本都能按“字母 + 数字”比较时，仅最高版本标记为现行，较低版本标记为旧版并退出检索；版本缺失、无法比较或最高版本重复时，相关文件标记为冲突并继续参与检索，避免资料意外消失。新文件解析失败时不会提交半成品快照，上一份成功索引保持可用。
+
+查看文档格式、现行、旧版和冲突数量：
+
+```bash
+python scripts/report_indexing.py --db data/rag.sqlite3
+```
+
+报告只读取文档元数据；冲突明细不包含制度正文。
 
 飞书同步只有在整个空间成功完成完整快照后，才会清理本次快照中已失效的索引；分页异常或同步失败不会触发删除。质量可用 `scripts/evaluate_chunking.py` 配合不含制度正文的金标 JSON/报告脱敏 CLI 验收（支持 `--cases`、`--retrieval-only` 和阈值参数）。
 
@@ -214,7 +224,7 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 - FAQ 为加速会存储经过 PII 过滤的归一化意图、答案和资料特征；报表和日志不输出问题、答案、来源或员工身份。员工可见回答会拦截密码、口令、密钥、API 密钥、访问令牌等中英文凭据标签和值，并返回固定安全提示。
 - Webhook 开启 Encrypt Key 后强制校验签名。
 - 语义切片开启时，完整文档会在索引阶段按批次发送给 DeepSeek；回答阶段只发送命中的原始片段。
-- 切片策略版本固定为 `hybrid-v4`；修改策略版本后应重新索引现有文档。
+- 切片策略版本固定为 `hybrid-v4`，解析器版本固定为 `parser-v2`；修改任一版本后应重新索引现有文档。
 - 当前飞书知识库按你的要求设置为企业全员可读；如果以后改为分部门权限，Webhook 需要增加按用户过滤召回结果的逻辑。
 
 ## 验收清单
@@ -227,6 +237,6 @@ python -m feishu_rag.sync --space-id 7678687286343273653 --db data/rag.sqlite3  
 - 缺少 API Key 时服务健康检查报配置不完整，且不会发起外部请求。
 - 回滚预检不修改数据库；带 `--execute` 才会创建独占备份并移除 v2 FTS。
 
-v0.5.1 开发候选发布状态：代码与测试已完成，尚未部署生产；仍使用 SQLite（含 FTS5/BM25）和 `hybrid-v4`，没有引入向量数据库。FAQ 仅保存经过 PII 过滤的归一化意图、安全答案和资料特征；report 与日志不输出员工身份、问题、答案或来源。
+v0.6.0 开发候选发布状态：增加 XLSX 原生解析和文档版本生命周期，尚未部署生产；仍使用 SQLite（含 FTS5/BM25）和 `hybrid-v4`，没有引入向量数据库。FAQ 仅保存经过 PII 过滤的归一化意图、安全答案和资料特征；report 与日志不输出员工身份、问题、答案或来源。
 
 长连接适配器依赖 `lark-oapi==1.7.3` 的私有 ACK 契约。升级 SDK 必须显式修改锁定版本，并通过 `tests/test_lark_sdk_contract.py` 的真实 SDK 合约测试后才能发布。
