@@ -119,6 +119,12 @@ class PreparedDocument:
     checksum: str
     chunks: tuple[Chunk, ...] | None
     space_id: str = ""
+    document_code: str = ""
+    document_version: str = ""
+    effective_date: str = ""
+    lifecycle_state: str = "current"
+    parser_version: str = ""
+    decision_reason: str = "unique-or-unversioned"
 
 
 def _normalize(text: str) -> str:
@@ -271,6 +277,18 @@ class IndexStore:
                     last_snapshot_at REAL NOT NULL
                 )
                 """,
+                """
+                CREATE TABLE IF NOT EXISTS document_versions (
+                    source_id TEXT PRIMARY KEY
+                        REFERENCES documents(source_id) ON DELETE CASCADE,
+                    document_code TEXT NOT NULL,
+                    document_version TEXT NOT NULL,
+                    lifecycle_state TEXT NOT NULL
+                        CHECK(lifecycle_state IN ('current','superseded','conflict')),
+                    decision_reason TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """,
                 _FAQ_ENTRIES_SCHEMA,
                 _FAQ_ALIASES_SCHEMA,
                 _FAQ_OBSERVATION_SCHEMA,
@@ -321,6 +339,25 @@ class IndexStore:
                 self.connection.execute(
                     "ALTER TABLE documents ADD COLUMN space_id TEXT NOT NULL DEFAULT ''"
                 )
+            document_column_migrations = {
+                "document_code": "TEXT NOT NULL DEFAULT ''",
+                "document_version": "TEXT NOT NULL DEFAULT ''",
+                "effective_date": "TEXT NOT NULL DEFAULT ''",
+                "lifecycle_state": "TEXT NOT NULL DEFAULT 'current'",
+                "parser_version": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, declaration in document_column_migrations.items():
+                if column not in document_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE documents ADD COLUMN {column} {declaration}"
+                    )
+            self.connection.execute(
+                "INSERT OR IGNORE INTO document_versions("
+                "source_id,document_code,document_version,lifecycle_state,"
+                "decision_reason,updated_at) "
+                "SELECT source_id,document_code,document_version,lifecycle_state,"
+                "'legacy-migration',updated_at FROM documents"
+            )
             legacy_space_updates = []
             for row in self.connection.execute(
                 "SELECT source_id,space_id FROM documents WHERE space_id = ''"
@@ -439,11 +476,28 @@ class IndexStore:
         chunks: Iterable[Chunk],
         *,
         space_id: str = "",
+        document_code: str = "",
+        document_version: str = "",
+        effective_date: str = "",
+        lifecycle_state: str = "current",
+        parser_version: str = "",
+        decision_reason: str = "unique-or-unversioned",
     ) -> None:
         chunk_list = list(chunks)
         with self.connection:
             self._upsert_document_in_transaction(
-                source_id, title, path, checksum, chunk_list, space_id=space_id
+                source_id,
+                title,
+                path,
+                checksum,
+                chunk_list,
+                space_id=space_id,
+                document_code=document_code,
+                document_version=document_version,
+                effective_date=effective_date,
+                lifecycle_state=lifecycle_state,
+                parser_version=parser_version,
+                decision_reason=decision_reason,
             )
 
     def _upsert_document_in_transaction(
@@ -455,6 +509,12 @@ class IndexStore:
         chunks: Iterable[Chunk],
         *,
         space_id: str = "",
+        document_code: str = "",
+        document_version: str = "",
+        effective_date: str = "",
+        lifecycle_state: str = "current",
+        parser_version: str = "",
+        decision_reason: str = "unique-or-unversioned",
     ) -> None:
         chunk_list = list(chunks)
         old_ids = [
@@ -468,10 +528,38 @@ class IndexStore:
                 "DELETE FROM chunks_fts WHERE chunk_id = ?", ((cid,) for cid in old_ids)
             )
         self.connection.execute("DELETE FROM documents WHERE source_id = ?", (source_id,))
+        timestamp = time.time()
         self.connection.execute(
-            "INSERT INTO documents(source_id,title,path,checksum,updated_at,space_id) "
-            "VALUES(?,?,?,?,?,?)",
-            (source_id, title, path, checksum, time.time(), space_id),
+            "INSERT INTO documents("
+            "source_id,title,path,checksum,updated_at,space_id,document_code,"
+            "document_version,effective_date,lifecycle_state,parser_version"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                source_id,
+                title,
+                path,
+                checksum,
+                timestamp,
+                space_id,
+                document_code,
+                document_version,
+                effective_date,
+                lifecycle_state,
+                parser_version,
+            ),
+        )
+        self.connection.execute(
+            "INSERT INTO document_versions("
+            "source_id,document_code,document_version,lifecycle_state,"
+            "decision_reason,updated_at) VALUES(?,?,?,?,?,?)",
+            (
+                source_id,
+                document_code,
+                document_version,
+                lifecycle_state,
+                decision_reason,
+                timestamp,
+            ),
         )
         self.connection.executemany(
             "INSERT INTO chunks(id,source_id,title,content,page,section,search_text) VALUES(?,?,?,?,?,?,?)",
@@ -501,6 +589,11 @@ class IndexStore:
         local_root: str | Path | None = None,
     ) -> tuple[int, int]:
         updates = tuple(prepared_updates)
+        for prepared in updates:
+            if prepared.lifecycle_state not in {"current", "superseded", "conflict"}:
+                raise ValueError(
+                    "lifecycle_state must be current, superseded or conflict"
+                )
         local_root_hash: str | None = None
         if local_root is not None:
             if prune_prefix is not None:
@@ -525,7 +618,11 @@ class IndexStore:
             updated = 0
             for prepared in updates:
                 row = self.connection.execute(
-                    "SELECT checksum,space_id FROM documents WHERE source_id = ?",
+                    "SELECT d.checksum,d.space_id,d.document_code,d.document_version,"
+                    "d.effective_date,d.lifecycle_state,d.parser_version,"
+                    "COALESCE(v.decision_reason,'') AS decision_reason "
+                    "FROM documents d LEFT JOIN document_versions v "
+                    "ON v.source_id=d.source_id WHERE d.source_id = ?",
                     (prepared.source_id,),
                 ).fetchone()
                 if row is not None and row[0] == prepared.checksum:
@@ -534,6 +631,43 @@ class IndexStore:
                             "UPDATE documents SET space_id = ? WHERE source_id = ?",
                             (prepared.space_id, prepared.source_id),
                         )
+                    stored_metadata = tuple(row[index] for index in range(2, 8))
+                    desired_metadata = (
+                        prepared.document_code,
+                        prepared.document_version,
+                        prepared.effective_date,
+                        prepared.lifecycle_state,
+                        prepared.parser_version,
+                        prepared.decision_reason,
+                    )
+                    if stored_metadata != desired_metadata:
+                        timestamp = time.time()
+                        self.connection.execute(
+                            "UPDATE documents SET document_code=?,document_version=?,"
+                            "effective_date=?,lifecycle_state=?,parser_version=?,"
+                            "updated_at=? WHERE source_id=?",
+                            (*desired_metadata[:5], timestamp, prepared.source_id),
+                        )
+                        self.connection.execute(
+                            "INSERT INTO document_versions("
+                            "source_id,document_code,document_version,lifecycle_state,"
+                            "decision_reason,updated_at) VALUES(?,?,?,?,?,?) "
+                            "ON CONFLICT(source_id) DO UPDATE SET "
+                            "document_code=excluded.document_code,"
+                            "document_version=excluded.document_version,"
+                            "lifecycle_state=excluded.lifecycle_state,"
+                            "decision_reason=excluded.decision_reason,"
+                            "updated_at=excluded.updated_at",
+                            (
+                                prepared.source_id,
+                                prepared.document_code,
+                                prepared.document_version,
+                                prepared.lifecycle_state,
+                                prepared.decision_reason,
+                                timestamp,
+                            ),
+                        )
+                        updated += 1
                     continue
                 if prepared.chunks is None:
                     raise ValueError("new or changed documents require chunks")
@@ -544,6 +678,12 @@ class IndexStore:
                     prepared.checksum,
                     prepared.chunks,
                     space_id=prepared.space_id,
+                    document_code=prepared.document_code,
+                    document_version=prepared.document_version,
+                    effective_date=prepared.effective_date,
+                    lifecycle_state=prepared.lifecycle_state,
+                    parser_version=prepared.parser_version,
+                    decision_reason=prepared.decision_reason,
                 )
                 updated += 1
 
@@ -640,11 +780,13 @@ class IndexStore:
             "chunks.page,chunks.section,chunks.search_text FROM chunks "
             "JOIN documents ON documents.source_id = chunks.source_id"
         )
+        conditions = ["documents.lifecycle_state != 'superseded'"]
         scope_parameters: tuple[str, ...] = ()
         if allowed_space_ids is not None:
             scope_parameters = tuple(sorted(allowed_space_ids))
             placeholders = ",".join("?" for _ in scope_parameters)
-            row_sql += f" WHERE documents.space_id IN ({placeholders})"
+            conditions.append(f"documents.space_id IN ({placeholders})")
+        row_sql += " WHERE " + " AND ".join(conditions)
         rows = self.connection.execute(row_sql, scope_parameters).fetchall()
 
         candidate_limit = top_k * 4
@@ -671,7 +813,8 @@ class IndexStore:
                     "SELECT chunks_fts.chunk_id FROM chunks_fts "
                     "JOIN chunks ON chunks.id = chunks_fts.chunk_id "
                     "JOIN documents ON documents.source_id = chunks.source_id "
-                    "WHERE chunks_fts MATCH ?"
+                    "WHERE chunks_fts MATCH ? "
+                    "AND documents.lifecycle_state != 'superseded'"
                 )
                 fts_parameters: tuple[object, ...] = (match_query,)
                 if allowed_space_ids is not None:

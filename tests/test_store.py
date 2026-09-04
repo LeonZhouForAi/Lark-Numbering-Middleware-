@@ -1044,6 +1044,161 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(store.count_chunks(), 1)
                 self.assertEqual(store.search("报销内容")[0].chunk.id, "legacy-chunk")
                 self.assertEqual(store.claim_message_state("om_legacy", retention_seconds=10**12), "completed")
+                document_columns = {
+                    row[1]
+                    for row in store.connection.execute(
+                        "PRAGMA table_info(documents)"
+                    ).fetchall()
+                }
+                self.assertTrue(
+                    {
+                        "document_code",
+                        "document_version",
+                        "effective_date",
+                        "lifecycle_state",
+                        "parser_version",
+                    }.issubset(document_columns)
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT lifecycle_state FROM documents "
+                        "WHERE source_id = 'legacy.txt'"
+                    ).fetchone()[0],
+                    "current",
+                )
+                self.assertIsNotNone(
+                    store.connection.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='document_versions'"
+                    ).fetchone()
+                )
+            finally:
+                store.close()
+
+    def test_search_excludes_superseded_but_keeps_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                documents = [
+                    PreparedDocument(
+                        "old",
+                        "旧版",
+                        "old.txt",
+                        "old-v1",
+                        (Chunk("old-chunk", "old", "旧版", "旧版处置规则"),),
+                        lifecycle_state="superseded",
+                        document_code="HBW-OP-022",
+                        document_version="A1",
+                        decision_reason="lower-revision",
+                    ),
+                    PreparedDocument(
+                        "current",
+                        "现行版",
+                        "current.txt",
+                        "current-v1",
+                        (
+                            Chunk(
+                                "current-chunk",
+                                "current",
+                                "现行版",
+                                "现行处置规则",
+                            ),
+                        ),
+                        lifecycle_state="current",
+                        document_code="HBW-OP-022",
+                        document_version="B1",
+                        decision_reason="highest-revision",
+                    ),
+                    PreparedDocument(
+                        "conflict",
+                        "待核版本",
+                        "conflict.txt",
+                        "conflict-v1",
+                        (
+                            Chunk(
+                                "conflict-chunk",
+                                "conflict",
+                                "待核版本",
+                                "待核版本处置规则",
+                            ),
+                        ),
+                        lifecycle_state="conflict",
+                        document_code="HBW-OP-023",
+                        decision_reason="uncomparable-revisions",
+                    ),
+                ]
+
+                self.assertEqual(store.apply_document_snapshot(documents), (3, 0))
+                self.assertEqual(store.search("旧版处置规则"), [])
+                self.assertEqual(
+                    store.search("现行处置规则")[0].chunk.source_id, "current"
+                )
+                self.assertEqual(
+                    store.search("待核版本处置规则")[0].chunk.source_id,
+                    "conflict",
+                )
+            finally:
+                store.close()
+
+    def test_same_checksum_lifecycle_change_updates_metadata_and_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                first = PreparedDocument(
+                    "policy",
+                    "制度",
+                    "policy.txt",
+                    "same-checksum",
+                    (Chunk("policy-chunk", "policy", "制度", "制度正文"),),
+                    lifecycle_state="current",
+                )
+                self.assertEqual(store.apply_document_snapshot([first]), (1, 0))
+                self.assertEqual(store.knowledge_revision(), 1)
+
+                changed = PreparedDocument(
+                    "policy",
+                    "制度",
+                    "policy.txt",
+                    "same-checksum",
+                    None,
+                    lifecycle_state="superseded",
+                    document_code="HBW-OP-001",
+                    document_version="A0",
+                    parser_version="parser-v2",
+                    decision_reason="lower-revision",
+                )
+                self.assertEqual(store.apply_document_snapshot([changed]), (1, 0))
+                self.assertEqual(store.knowledge_revision(), 2)
+                self.assertEqual(store.search("制度正文"), [])
+                self.assertEqual(store.count_chunks("policy"), 1)
+                self.assertEqual(
+                    tuple(
+                        store.connection.execute(
+                            "SELECT document_code,document_version,lifecycle_state,"
+                            "parser_version FROM documents WHERE source_id='policy'"
+                        ).fetchone()
+                    ),
+                    ("HBW-OP-001", "A0", "superseded", "parser-v2"),
+                )
+            finally:
+                store.close()
+
+    def test_invalid_lifecycle_is_rejected_without_partial_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = IndexStore(Path(tmp) / "rag.sqlite3")
+            try:
+                invalid = PreparedDocument(
+                    "policy",
+                    "制度",
+                    "policy.txt",
+                    "v1",
+                    (Chunk("policy-chunk", "policy", "制度", "正文"),),
+                    lifecycle_state="deleted",
+                )
+                with self.assertRaisesRegex(ValueError, "lifecycle"):
+                    store.apply_document_snapshot([invalid])
+                self.assertEqual(store.count_documents(), 0)
+                self.assertEqual(store.knowledge_revision(), 0)
             finally:
                 store.close()
 
