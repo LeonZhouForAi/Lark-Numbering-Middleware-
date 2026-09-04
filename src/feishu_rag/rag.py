@@ -89,6 +89,14 @@ class Citation:
 class RagAnswer:
     text: str
     citations: list[Citation]
+    status: str = "answerable"
+
+
+@dataclass(frozen=True)
+class AnswerDecision:
+    answer: str
+    status: str
+    clarifying_question: str = ""
 
 
 class RagService:
@@ -130,16 +138,44 @@ class RagService:
         return json.dumps({"documents": documents}, ensure_ascii=False, separators=(",", ":")), citations
 
     @staticmethod
-    def _validated_answer(response: object) -> tuple[str, bool]:
-        if not isinstance(response, dict) or set(response) != {"answer", "evidence_sufficient"}:
+    def _validated_answer(response: object) -> AnswerDecision:
+        if not isinstance(response, dict):
             raise RagResponseError("模型回答字段无效")
+        if set(response) == {"answer", "evidence_sufficient"}:
+            answer = response["answer"]
+            evidence_sufficient = response["evidence_sufficient"]
+            if not isinstance(answer, str) or not answer.strip():
+                raise RagResponseError("模型回答正文无效")
+            if type(evidence_sufficient) is not bool:
+                raise RagResponseError("模型证据判断无效")
+            return AnswerDecision(
+                answer=answer,
+                status="answerable" if evidence_sufficient else "insufficient",
+            )
+        if set(response) != {"status", "answer", "clarifying_question"}:
+            raise RagResponseError("模型回答字段无效")
+        status = response["status"]
         answer = response["answer"]
-        evidence_sufficient = response["evidence_sufficient"]
-        if not isinstance(answer, str) or not answer.strip():
-            raise RagResponseError("模型回答正文无效")
-        if type(evidence_sufficient) is not bool:
-            raise RagResponseError("模型证据判断无效")
-        return answer, evidence_sufficient
+        clarifying_question = response["clarifying_question"]
+        if not all(isinstance(value, str) for value in (status, answer, clarifying_question)):
+            raise RagResponseError("模型回答字段类型无效")
+        if status not in {"answerable", "ambiguous", "insufficient"}:
+            raise RagResponseError("模型回答状态无效")
+        if status == "answerable":
+            if not answer.strip() or clarifying_question.strip():
+                raise RagResponseError("可回答状态内容无效")
+        elif status == "ambiguous":
+            if answer.strip() or not clarifying_question.strip():
+                raise RagResponseError("歧义状态内容无效")
+            if len(clarifying_question.strip()) > 100:
+                raise RagResponseError("澄清问题过长")
+        elif clarifying_question.strip():
+            raise RagResponseError("证据不足状态不得追问")
+        return AnswerDecision(
+            answer=answer.strip(),
+            status=status,
+            clarifying_question=clarifying_question.strip(),
+        )
 
     @staticmethod
     def _has_unsafe_url(answer: str) -> bool:
@@ -232,7 +268,11 @@ class RagService:
                 scope=scope,
             )
             if not results:
-                return RagAnswer("知识库中暂无依据，请换一种问法或联系文控管理员。", [])
+                return RagAnswer(
+                    "知识库中暂无依据，请换一种问法或联系文控管理员。",
+                    [],
+                    "missing",
+                )
 
             observation = None
             match = None
@@ -287,7 +327,7 @@ class RagService:
                     self.faq_service.record_rag_answer(observation)
                 except Exception:
                     pass
-            generated, evidence_sufficient = self._validated_answer(
+            decision = self._validated_answer(
                 self.llm.complete_json(system_prompt, user_prompt, purpose="answer")
             )
             if revision_supported:
@@ -307,14 +347,16 @@ class RagService:
                     if attempt == 0:
                         continue
                     return RagAnswer(UPDATING_ANSWER, [])
-            if not evidence_sufficient:
+            if decision.status == "ambiguous":
+                return RagAnswer(decision.clarifying_question, [], "ambiguous")
+            if decision.status == "insufficient":
                 if faq_active and observation is not None:
                     try:
                         self.faq_service.record_rejected_answer(observation)
                     except Exception:
                         pass
-                return RagAnswer(INSUFFICIENT_ANSWER, citations)
-            cleaned = self._clean_answer(generated)
+                return RagAnswer(INSUFFICIENT_ANSWER, citations, "insufficient")
+            cleaned = self._clean_answer(decision.answer)
             if cleaned in {INSUFFICIENT_ANSWER, UNSAFE_ANSWER}:
                 if faq_active and observation is not None:
                     try:

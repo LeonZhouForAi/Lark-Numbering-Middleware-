@@ -849,6 +849,78 @@ def test_chinese_secret_labels_without_values_are_not_blocked(generated: str) ->
     assert answer.text == generated
 
 
+def test_no_results_returns_missing_status_without_llm_call() -> None:
+    llm = FakeLLM()
+
+    answer = RagService(RecordingStore([]), llm).answer("不存在的制度")
+
+    assert answer.status == "missing"
+    assert answer.text == "知识库中暂无依据，请换一种问法或联系文控管理员。"
+    assert llm.calls == []
+
+
+def test_ambiguous_response_returns_one_clarifying_question() -> None:
+    llm = FakeLLM(
+        {
+            "status": "ambiguous",
+            "answer": "",
+            "clarifying_question": "请问你要查询哪个产品系列？",
+        }
+    )
+
+    answer = RagService(RecordingStore([_result()]), llm).answer("工时是多少")
+
+    assert answer.status == "ambiguous"
+    assert answer.text == "请问你要查询哪个产品系列？"
+    assert answer.citations == []
+
+
+def test_new_insufficient_response_uses_fixed_answer() -> None:
+    llm = FakeLLM(
+        {
+            "status": "insufficient",
+            "answer": "模型猜测内容",
+            "clarifying_question": "",
+        }
+    )
+
+    answer = RagService(RecordingStore([_result()]), llm).answer("审批人是谁")
+
+    assert answer.status == "insufficient"
+    assert answer.text == INSUFFICIENT_ANSWER
+
+
+def test_legacy_two_field_response_maps_to_answerable_status() -> None:
+    answer = RagService(RecordingStore([_result()]), FakeLLM()).answer("报销流程")
+
+    assert answer.status == "answerable"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"status": "missing", "answer": "", "clarifying_question": ""},
+        {
+            "status": "ambiguous",
+            "answer": "不应回答",
+            "clarifying_question": "请明确？",
+        },
+        {"status": "ambiguous", "answer": "", "clarifying_question": ""},
+        {"status": "answerable", "answer": "", "clarifying_question": ""},
+        {
+            "status": "answerable",
+            "answer": "有效",
+            "clarifying_question": "多余问题？",
+        },
+    ],
+)
+def test_invalid_new_answer_decisions_are_rejected(
+    response: dict[str, object],
+) -> None:
+    with pytest.raises(RagResponseError):
+        RagService(RecordingStore([_result()]), FakeLLM(response)).answer("报销流程")
+
+
 class DeepSeekClientTests(unittest.TestCase):
     def test_posts_chat_completion_payload(self):
         seen = {}
