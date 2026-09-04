@@ -31,6 +31,7 @@ class EvaluationCase:
     category: str
     question: str
     answerable: bool
+    expected_status: str
     expected_titles: list[str]
     expected_source_ids: list[str]
     forbidden_titles: list[str]
@@ -48,6 +49,8 @@ class EvaluationResult:
     forbidden_title_evaluated: bool
     forbidden_title_hit: bool
     answer_evaluated: bool
+    actual_status: str
+    status_match: bool
     insufficient: bool
     answerable_insufficient: bool
     unanswerable_answer: bool
@@ -95,6 +98,16 @@ class EvaluationSummary:
     def source_leak_rate(self) -> float:
         return _average([float(result.source_leak) for result in self.results if result.answer_evaluated])
 
+    @property
+    def status_accuracy(self) -> float:
+        return _average(
+            [
+                float(result.status_match)
+                for result in self.results
+                if result.answer_evaluated
+            ]
+        )
+
     def to_report(self) -> dict[str, object]:
         return {
             "case_count": len(self.results),
@@ -104,6 +117,7 @@ class EvaluationSummary:
             "unanswerable_answer_rate": self.unanswerable_answer_rate,
             "forbidden_title_rate": self.forbidden_title_rate,
             "source_leak_rate": self.source_leak_rate,
+            "status_accuracy": self.status_accuracy,
             "results": [result.to_report() for result in self.results],
         }
 
@@ -113,6 +127,7 @@ _REQUIRED_FIELDS: dict[str, type[object]] = {
     "category": str,
     "question": str,
     "answerable": bool,
+    "expected_status": str,
     "expected_titles": list,
     "expected_source_ids": list,
     "forbidden_titles": list,
@@ -124,6 +139,7 @@ _INSUFFICIENT_RE = re.compile(
     re.IGNORECASE,
 )
 _SOURCE_LEAK_RE = re.compile(r"来源|参考资料|依据文档|引用|出处|资料来源|\[\s*\d+\s*\]", re.IGNORECASE)
+_ANSWER_STATUSES = frozenset({"answerable", "ambiguous", "insufficient", "missing"})
 
 
 def load_cases(path: str | Path) -> list[EvaluationCase]:
@@ -158,6 +174,8 @@ def load_cases(path: str | Path) -> list[EvaluationCase]:
             if expected_type is list and any(type(item) is not str or not item.strip() for item in field_value):
                 raise ValueError(f"case {index} field {field} must contain non-empty strings")
         case_id = value["id"]
+        if value["expected_status"] not in _ANSWER_STATUSES:
+            raise ValueError(f"case {index} field expected_status has invalid value")
         if case_id in seen_ids:
             raise ValueError(f"duplicate evaluation case id: {case_id}")
         seen_ids.add(case_id)
@@ -190,9 +208,12 @@ def evaluate_cases(
             _matches_title(_chunk_value(match, "title"), case.forbidden_titles) for match in matches
         )
         answer_text = ""
+        actual_status = ""
         answer_evaluated = rag is not None
         if rag is not None:
-            answer_text = str(rag.answer(case.question).text)
+            rag_answer = rag.answer(case.question)
+            answer_text = str(rag_answer.text)
+            actual_status = str(getattr(rag_answer, "status", "answerable"))
         insufficient = _is_insufficient(answer_text)
         expected_terms_hit = bool(case.expected_terms) and all(term in answer_text for term in case.expected_terms)
         forbidden_terms_hit = any(term in answer_text for term in case.forbidden_terms)
@@ -207,6 +228,8 @@ def evaluate_cases(
                 forbidden_title_evaluated=forbidden_title_evaluated,
                 forbidden_title_hit=forbidden_title_hit,
                 answer_evaluated=answer_evaluated,
+                actual_status=actual_status,
+                status_match=answer_evaluated and actual_status == case.expected_status,
                 insufficient=insufficient,
                 answerable_insufficient=answer_evaluated and case.answerable and insufficient,
                 unanswerable_answer=answer_evaluated and not case.answerable and bool(answer_text.strip()) and not insufficient,

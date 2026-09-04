@@ -27,12 +27,22 @@ class FakeStore:
 
 
 class FakeRag:
-    def __init__(self, answers: dict[str, str], top_k: int = 3) -> None:
+    def __init__(
+        self,
+        answers: dict[str, str],
+        top_k: int = 3,
+        statuses: dict[str, str] | None = None,
+    ) -> None:
         self.answers = answers
         self.top_k = top_k
+        self.statuses = statuses or {}
 
     def answer(self, question: str) -> RagAnswer:
-        return RagAnswer(self.answers[question], [])
+        return RagAnswer(
+            self.answers[question],
+            [],
+            self.statuses.get(question, "answerable"),
+        )
 
 
 def _result(title: str, source_id: str) -> SearchResult:
@@ -45,6 +55,7 @@ def _case(**overrides: object) -> EvaluationCase:
         "category": "财务",
         "question": "报销怎么弄",
         "answerable": True,
+        "expected_status": "answerable",
         "expected_titles": ["财务报销"],
         "expected_source_ids": [],
         "forbidden_titles": [],
@@ -52,6 +63,10 @@ def _case(**overrides: object) -> EvaluationCase:
         "forbidden_terms": [],
     }
     fields.update(overrides)
+    if "expected_status" not in overrides:
+        fields["expected_status"] = (
+            "answerable" if fields["answerable"] else "missing"
+        )
     return EvaluationCase(**fields)
 
 
@@ -173,3 +188,47 @@ def test_empty_answers_are_insufficient_for_answerable_cases_but_not_unanswerabl
 
     assert summary.answerable_insufficient_rate == 1.0
     assert summary.unanswerable_answer_rate == 0.0
+
+
+def test_evaluation_reports_answer_status_accuracy_without_answer_text() -> None:
+    cases = [
+        _case(id="answerable", question="可回答"),
+        _case(
+            id="ambiguous",
+            question="有歧义",
+            expected_status="ambiguous",
+        ),
+        _case(
+            id="missing",
+            question="无资料",
+            answerable=False,
+            expected_titles=[],
+            expected_terms=[],
+            expected_status="missing",
+        ),
+    ]
+    rag = FakeRag(
+        {"可回答": "有效答案", "有歧义": "请说明系列？", "无资料": "暂无依据"},
+        statuses={"可回答": "answerable", "有歧义": "ambiguous", "无资料": "insufficient"},
+    )
+
+    report = evaluate_cases(FakeStore([]), cases, rag).to_report()
+
+    assert report["status_accuracy"] == pytest.approx(2 / 3)
+    assert report["results"][0]["actual_status"] == "answerable"
+    assert report["results"][1]["status_match"] is True
+    assert report["results"][2]["status_match"] is False
+    report_text = json.dumps(report, ensure_ascii=False)
+    assert '"answer"' not in report_text
+    assert "有效答案" not in report_text
+
+
+@pytest.mark.parametrize("status", ["", "unknown", "ANSWERABLE", 1, None])
+def test_load_cases_rejects_invalid_expected_status(tmp_path, status: object) -> None:
+    path = tmp_path / "cases.json"
+    data = _case().__dict__.copy()
+    data["expected_status"] = status
+    path.write_text(json.dumps([data], ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="expected_status"):
+        load_cases(path)
