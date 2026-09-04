@@ -15,7 +15,7 @@ from typing import Any
 from .config import Settings
 from .feishu_client import FeishuClient
 from .chunker import chunk_text
-from .ingest import SUPPORTED_SUFFIXES, Section, extract_sections
+from .ingest import Section, extract_sections
 from .llm import DeepSeekClient
 from .logging_utils import configure_logging
 from .models import Chunk
@@ -25,6 +25,11 @@ from .store import IndexStore, PreparedDocument
 
 
 logger = logging.getLogger(__name__)
+
+
+FEISHU_ATTACHMENT_SUFFIXES = frozenset(
+    {".txt", ".md", ".markdown", ".pdf", ".docx"}
+)
 
 
 @dataclass(frozen=True)
@@ -196,7 +201,7 @@ def sync_wiki_space(
                     pending_parents.append(node_token)
                 if object_type == "file":
                     suffix = Path(title).suffix.lower()
-                    if suffix not in SUPPORTED_SUFFIXES:
+                    if suffix not in FEISHU_ATTACHMENT_SUFFIXES:
                         skipped += 1
                         continue
                     source_id = f"feishu:{space_id}:{node_token}"
