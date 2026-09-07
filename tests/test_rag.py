@@ -29,6 +29,26 @@ class FakeLLM:
         return self.response
 
 
+@pytest.mark.parametrize("question", ["你可以做什么", "你能做什么？", "你的作用是什么", "请问你有什么功能？", "怎么使用你", "你是谁"])
+def test_capability_guide_is_direct_and_has_examples(question):
+    store = RecordingStore([])
+    llm = FakeLLM()
+    answer = RagService(store, llm).answer(question)
+    assert "瀚邦为知识库助手" in answer.text
+    assert all(department in answer.text for department in ("财务", "采购", "行政", "品质", "IE"))
+    assert "费用报销流程是什么" in answer.text
+    assert answer.citations == []
+    assert store.calls == []
+    assert llm.calls == []
+
+
+def test_business_question_containing_role_is_not_capability_guide():
+    store = RecordingStore([])
+    answer = RagService(store, FakeLLM()).answer("品质部的作用是什么")
+    assert store.calls
+    assert "瀚邦为知识库助手" not in answer.text
+
+
 class RecordingStore:
     def __init__(self, results=None):
         self.calls = []

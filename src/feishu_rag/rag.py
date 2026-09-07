@@ -19,6 +19,28 @@ INSUFFICIENT_ANSWER = "现有资料不足，无法回答该问题。"
 UNSAFE_ANSWER = "回答包含不安全内容，已停止输出。"
 UPDATING_ANSWER = "资料正在更新，请稍后重试。"
 
+CAPABILITY_GUIDE = (
+    "我是瀚邦为知识库助手，帮你快速查询公司已收录的制度、流程和工作标准。\n\n"
+    "你可以问：\n"
+    "• 财务：费用报销、付款申请、审批权限。\n"
+    "• 采购：供应商开发与准入、采购管理流程。\n"
+    "• 行政人事：入离职、考勤、薪资制度。\n"
+    "• 品质：客户投诉、品质异常、IQC/IPQC/OQC 检验要求。\n"
+    "• IE：岗位产能标准、产品系列和料号的工段工时、提案改善。\n\n"
+    "直接用日常语言提问即可，例如：\n"
+    "“费用报销流程是什么？”\n"
+    "“供应商开发需要哪些步骤？”\n"
+    "“氧化物系列绑定工时是多少？”\n\n"
+    "查询数据时请写清产品系列、料号或工序；查询流程时请说明具体场景。"
+    "我会依据已收录资料回答，资料不足会说明，条件不清楚会请你补充。"
+)
+_CAPABILITY_QUERY_RE = re.compile(
+    r"(?:请问|请|你好)?(?:你(?:能|可以)(?:做什么|干什么|帮我做什么)"
+    r"|你(?:的)?(?:作用|功能|用途)(?:是什么|有哪些)?"
+    r"|你有什么(?:功能|作用)|你是(?:谁|做什么的)|(?:怎么|如何)使用你"
+    r"|介绍一下你自己|自我介绍|使用帮助|帮助)"
+)
+
 _SOURCE_HEADING_RE = re.compile(
     r"(?im)^[ ]*(?:(?:#{1,6}|>|[-+*])[ ]*|\d+(?:[.)、])[ ]*)*"
     r"(?:\*\*|__)?[ ]*(?:"
@@ -280,6 +302,9 @@ class RagService:
             return RagAnswer("请输入要查询的问题。", [])
         if len(question) > self.question_max_chars:
             return RagAnswer(f"问题过长，请精简到 {self.question_max_chars} 字以内。", [])
+        guide_query = re.sub(r"[\s，,。.!！?？]+", "", question)
+        if _CAPABILITY_QUERY_RE.fullmatch(guide_query):
+            return RagAnswer(CAPABILITY_GUIDE, [])
         if self.exact_query_service is not None:
             exact_answer = self.exact_query_service.answer(question)
             if exact_answer is not None:
