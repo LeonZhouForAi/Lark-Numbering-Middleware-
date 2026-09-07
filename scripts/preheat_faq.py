@@ -31,6 +31,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     store = IndexStore(args.db)
     try:
+        if callable(getattr(store, "enqueue_preheat_job", None)):
+            store.enqueue_preheat_job(
+                "global", store.knowledge_revision(),
+                max_retries=getattr(settings, "rag_faq_preheat_max_retries", 1),
+            )
         llm = DeepSeekClient(
             settings.deepseek_api_key,
             settings.deepseek_base_url,
