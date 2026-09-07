@@ -29,7 +29,7 @@ class FakeLLM:
         return self.response
 
 
-@pytest.mark.parametrize("question", ["你可以做什么", "你能做什么？", "你的作用是什么", "请问你有什么功能？", "怎么使用你", "你是谁"])
+@pytest.mark.parametrize("question", ["你可以做什么", "你能做什么？", "你的作用是什么", "请问你有什么功能？", "怎么使用你", "你是谁", "请问你会做什么", "你都会做些什么？", "你能干啥", "你有什么用", "请问你的作用"])
 def test_capability_guide_is_direct_and_has_examples(question):
     store = RecordingStore([])
     llm = FakeLLM()
