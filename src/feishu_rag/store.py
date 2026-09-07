@@ -1172,9 +1172,9 @@ class IndexStore:
         rows = self.connection.execute(
             "SELECT c.id,c.source_id,c.title,c.content,c.page,c.section,c.search_text "
             "FROM chunks c JOIN documents d ON d.source_id=c.source_id "
-            "WHERE d.space_id=? AND d.lifecycle_state!='superseded' "
+            "WHERE (?='global' OR d.space_id=?) AND d.lifecycle_state!='superseded' "
             "ORDER BY c.source_id,c.id",
-            (scope_key,),
+            (scope_key, scope_key),
         ).fetchall()
         return [
             Chunk(

@@ -19,6 +19,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="处理一个作业后退出")
     args = parser.parse_args(argv)
     settings = Settings.from_env()
+    if not getattr(settings, "rag_faq_preheat_enabled", True):
+        print("preheat_disabled=true")
+        return 0
+    def record_usage(*values, **options):
+        usage_store = IndexStore(args.db)
+        try:
+            usage_store.record_llm_usage(*values, **options)
+        finally:
+            usage_store.close()
+
     store = IndexStore(args.db)
     try:
         llm = DeepSeekClient(
@@ -29,7 +39,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_attempts=settings.api_retry_max_attempts,
                 base_delay=settings.api_retry_base_delay,
             ),
-            usage_sink=store,
+            usage_sink=record_usage,
         )
         worker = PreheatWorker(
             store,

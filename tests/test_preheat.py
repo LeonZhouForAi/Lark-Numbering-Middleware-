@@ -179,6 +179,24 @@ def test_stale_preheat_job_does_not_call_llm(tmp_path) -> None:
         store.close()
 
 
+def test_global_preheat_matches_unscoped_employee_questions(tmp_path):
+    store = IndexStore(tmp_path / "global.sqlite3")
+    chunk = _seed_preheat_job(store)
+    store.connection.execute("UPDATE faq_preheat_jobs SET scope_key='global'")
+    store.connection.commit()
+    llm = FakePreheatLLM({
+        "canonical_question": "供应商开发流程是什么？", "aliases": [],
+        "answer": "先审核资质，再完成现场认证并提交审批。", "evidence_sufficient": True,
+    })
+    try:
+        assert PreheatWorker(store, llm).run_once().generated == 1
+        assert FaqService(store, True, 3, 15, 0.6, 0.8).lookup(
+            "供应商开发流程是什么？", [SearchResult(chunk, 1.0)], None
+        ) is not None
+    finally:
+        store.close()
+
+
 def test_preheat_cli_outputs_counts_without_generated_content(
     monkeypatch, capsys, tmp_path
 ) -> None:

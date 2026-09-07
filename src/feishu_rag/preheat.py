@@ -228,7 +228,7 @@ class PreheatWorker:
                         if alias_normalized and alias_intent == intent_key:
                             normalized_aliases.append(alias_normalized)
                     faq_scope = FaqService._scope_key(
-                        RetrievalScope(frozenset({job.scope_key}))
+                        None if job.scope_key == "global" else RetrievalScope(frozenset({job.scope_key}))
                     )
                     source_ids = (candidate.source_id,)
                     observation = FaqObservation(
