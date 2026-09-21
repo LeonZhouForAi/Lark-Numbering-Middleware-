@@ -6,6 +6,8 @@
 
 ## 1. 当前任务和目标
 
+2026-09-21 问数助手追加迁移：独立项目 `/opt/feishu-e10-data-assistant` 的 API、Worker、PostgreSQL、Redis 已迁至同一新服务器 10.2.13.173。新机健康、飞书长连接、E10 MSSQL 只读连接检查均通过；旧机四个容器停止并禁用自动重启。操作入口为新机 `compose.migration.json`（含凭据，不入 Git），详情见 `docs/operations/2026-09-21-data-assistant-migration.md`。
+
 2026-09-21 迁移更新：用户指定新 Ubuntu 服务器 `10.2.13.173`，SSH 用户 `hbw`。旧服务器 `192.168.1.73` 的镜像、代码、受控配置、资料、数据库和四个 systemd 单元已迁移。旧服务停止、定时器禁用、旧容器 restart policy 改为 no；旧数据保留回滚。新机安装 Docker 与 Compose，应用路径保持不变。迁移快照为 58 份文档、359 个片段、2605 条结构化事实。具体检查结果见 `docs/operations/2026-09-21-server-migration.md`。密码不写入本文件。
 
 为公司全体员工提供飞书知识库问答机器人“瀚邦为知识库助手”。公司已有 Ubuntu 服务器和 DeepSeek API，采用自建 RAG 中间件，不依赖员工登录 Kimi。
