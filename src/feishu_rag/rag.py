@@ -211,6 +211,8 @@ class RagService:
                 answer=answer,
                 status="answerable" if evidence_sufficient else "insufficient",
             )
+        if set(response) == {"status", "answer"} and response.get("status") in {"answerable", "insufficient"}:
+            response = {**response, "clarifying_question": ""}
         if set(response) != {"status", "answer", "clarifying_question"}:
             raise RagResponseError("模型回答字段无效")
         status = response["status"]

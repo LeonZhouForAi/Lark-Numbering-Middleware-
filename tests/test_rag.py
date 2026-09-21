@@ -29,6 +29,18 @@ class FakeLLM:
         return self.response
 
 
+@pytest.mark.parametrize("status", ["answerable", "insufficient"])
+def test_optional_empty_clarification_in_non_ambiguous_answer(status):
+    llm = FakeLLM({"status": status, "answer": "请提交发票。"})
+    result = RagService(RecordingStore([_result()]), llm).answer("报销流程")
+    assert result.status == status
+
+
+def test_missing_clarification_still_rejected_for_ambiguous_answer():
+    with pytest.raises(RagResponseError):
+        RagService(RecordingStore([_result()]), FakeLLM({"status": "ambiguous", "answer": ""})).answer("报销流程")
+
+
 @pytest.mark.parametrize("question", ["你可以做什么", "你能做什么？", "你的作用是什么", "请问你有什么功能？", "怎么使用你", "你是谁", "请问你会做什么", "你都会做些什么？", "你能干啥", "你有什么用", "请问你的作用"])
 def test_capability_guide_is_direct_and_has_examples(question):
     store = RecordingStore([])
